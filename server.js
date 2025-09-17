@@ -199,7 +199,7 @@ function limitPerIp(minIntervalMs){
     next();
   };
 }
-const commentPerMinuteLimiter = limitPerIp(60_000);
+const commentPerMinuteLimiter = limitPerIp(30_000);
 const postLimiter = limitPerIp(3_000); // мягкий лимит для «чувствительных» POST
 
 /* API */

@@ -489,7 +489,7 @@ const App = {
       }catch(err){
         if (err?.message === 'rate_limited'){
           const sec = Math.max(1, Math.ceil((err.retry_after_ms ?? 60_000) / 1000));
-          alert(`Слишком часто. Можно не чаще 1 комментария в минуту.\nПопробуйте через ${sec} сек.`);
+          alert(`Слишком часто. \nПопробуйте через ${sec} сек.`);
         } else if (err?.message === 'profanity_forbidden') {
           alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
         } else {
