@@ -119,3 +119,24 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
   margin-top:14px; padding:12px; border:1px solid var(--border);
   background:#fff; border-radius:12px
 }
+
+/* --- Small UI helpers --- */
+.hr{height:1px;background:var(--border);margin:8px 0}
+
+/* --- Like/Dislike icon buttons --- */
+.iconbtn{border:1px solid var(--border);background:#fff;border-radius:999px;padding:6px 10px;font-weight:700;cursor:pointer}
+.iconbtn:hover{background:var(--blue-100)}
+.iconbtn.active{border-color:var(--blue-600);box-shadow:0 0 0 2px rgba(47,102,177,.12)}
+.iconbtn[disabled]{opacity:.5;cursor:not-allowed}
+
+/* --- User profile popover --- */
+.popover{
+  position:absolute; z-index:20; background:#fff; border:1px solid var(--border);
+  border-radius:12px; box-shadow:0 14px 32px rgba(0,0,0,.12); padding:8px; min-width:260px;
+}
+.popover .popover-inner{padding:4px 6px}
+.popover .tname{font-weight:800}
+.popover .badge{background:var(--blue-100);border:1px solid var(--border)}
+.popover .stats{padding-left:16px;margin:8px 0 6px}
+.popover .muted{color:var(--muted)}
+table th, table td { border-bottom:1px solid var(--border); padding:8px; text-align:left; font-size:14px }

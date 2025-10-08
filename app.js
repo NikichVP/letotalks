@@ -1,5 +1,6 @@
-// app.js — SPA с надёжной навигацией, мгновенным перерисованием после логина/логаута
-const APP_VERSION = '2025-09-14-final-2';
+// app.js — SPA с авторизацией по почте, лайками/дизлайками, статистикой, админкой и предмодерацией
+const APP_VERSION = '2025-10-04-admin-1';
+const EMAIL_DOMAIN = '@student.letovo.ru';
 
 const CHARACTERISTICS = [
   { key:'clarity',   name:'Понятно объясняет' },
@@ -17,54 +18,197 @@ function characteristicAvg(t,k){ const r=t.ratings?.[k]; return r&&r.count?(r.su
 function overall(t){ let tot=0,cnt=0; for(const c of CHARACTERISTICS){ const r=t.ratings?.[c.key]; if(r&&r.count){ tot+=r.sum/r.count; cnt++; } } return cnt?tot/cnt:0; }
 const collator = new Intl.Collator('ru',{sensitivity:'base'});
 
-// ---------- auth ----------
+function coinsOf(u){
+  // На клиенте для отображения: 5 за комментарий, 1 за каждую оценку критерия, +1 за полученный лайк, -1 за полученный дизлайк
+  const comments = Number(u?.comment_count||0);
+  const ratings  = Number(u?.rating_count||0);
+  const recLikes = Number(u?.received_likes||0);
+  const recDis   = Number(u?.received_dislikes||0);
+  return 5*comments + ratings + recLikes - recDis;
+}
+
+/* ---------- client-side предмодерация (минимальная, но умная) ---------- */
+const BW_STEMS = ['бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон','пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'];
+const LAT2CYR = { a:'а',b:'в',c:'с',e:'е',h:'н',k:'к',m:'м',o:'о',p:'р',t:'т',x:'х',y:'у' };
+const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
+function normBW(s){
+  let t = String(s||'').toLowerCase();
+  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch).replace(/[a-z]/g, ch => LAT2CYR[ch] || ch);
+  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g,'').replace(/(.)\1{2,}/g,'$1$1');
+  return t;
+}
+function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); }
+
+/* ---------- auth (server-backed) ---------- */
 const Auth = {
   key: 'letotalks:auth',
-  get(){ return JSON.parse(localStorage.getItem(this.key) || 'null'); },
-  set(o){ localStorage.setItem(this.key, JSON.stringify(o)); this.render(); },
-  async login(){
-    const email = 'student@student.letovo.ru';
-    this.set({loggedIn:true,email});
-    try{ await fetch('/api/auth/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'login',email})}); }catch{}
-    // ВАЖНО: мгновенно перерисовываем текущую страницу
-    window.Router?.match();
+  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false },
+
+  get(){ return this._state; },
+  set(o){
+    this._state = { ...this._state, ...o };
+    try{ localStorage.setItem(this.key, JSON.stringify({ email: this._state.email })); }catch{}
+    this.render();
+    this.renderProfilePopover(); // обновление поповера
   },
+
+  async me(){
+    try{
+      const r = await fetch('/api/auth/me');
+      const j = await r.json();
+      if (j.loggedIn){
+        this.set({
+          loggedIn:true,
+          id: j.user.id,
+          email: j.user.email,
+          username: j.user.username,
+          comment_count: j.user.comment_count,
+          rating_count: j.user.rating_count,
+          cast_likes: j.user.cast_likes||0,
+          cast_dislikes: j.user.cast_dislikes||0,
+          received_likes: j.user.received_likes||0,
+          received_dislikes: j.user.received_dislikes||0,
+          _isAdmin: !!j.user.is_admin,
+          _isBanned: !!j.user.is_banned
+        });
+      }else{
+        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false });
+      }
+    }catch{
+      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false });
+    }
+  },
+
+  login(){ Router.go('/login'); },
+
   async logout(){
-    const email = this.get()?.email || 'student@student.letovo.ru';
-    this.set({loggedIn:false,email:null});
-    try{ await fetch('/api/auth/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'logout',email})}); }catch{}
+    try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
+    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false });
     window.Router?.match();
   },
-  isLogged(){ const a=this.get(); return a&&a.loggedIn; },
+
+  isLogged(){ return !!this._state.loggedIn; },
+
   render(){
     const loginBtn=$('#loginBtn'), userBadge=$('#userBadge'), logoutBtn=$('#logoutBtn');
+    const adminLink=$('#adminLink');
     if(this.isLogged()){
       loginBtn?.classList.add('hidden');
       userBadge?.classList.remove('hidden');
       logoutBtn?.classList.remove('hidden');
-      if (userBadge) userBadge.textContent='Student';
+      if (userBadge){
+        const nick = (this._state.username || this._state.email || 'Student').split('@')[0] || 'Student';
+        userBadge.textContent = nick;
+      }
+      if (this._state._isAdmin) adminLink?.classList.remove('hidden');
+      else adminLink?.classList.add('hidden');
     }else{
       loginBtn?.classList.remove('hidden');
       userBadge?.classList.add('hidden');
       logoutBtn?.classList.add('hidden');
+      adminLink?.classList.add('hidden');
     }
   },
-  async ensureSessionLoginLog(){
-    if (!this.isLogged()) return;
-    if (sessionStorage.getItem('letotalks:session-login-logged')==='1') return;
-    const email = this.get()?.email || 'student@student.letovo.ru';
-    try{
-      await fetch('/api/auth/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'login',email})});
-      sessionStorage.setItem('letotalks:session-login-logged','1');
-    }catch{}
-  },
+
   migrate(){
     const vkey='letotalks:version'; const old=localStorage.getItem(vkey);
     if (old!==APP_VERSION){ localStorage.setItem(vkey, APP_VERSION); }
+  },
+
+  async refreshStatsAndPopover(){
+    if (!this.isLogged()) return;
+    try{
+      const r = await fetch('/api/user/stats');
+      const j = await r.json();
+      if (j.ok){
+        this.set({
+          comment_count: j.user.comment_count,
+          rating_count: j.user.rating_count,
+          cast_likes: j.user.cast_likes,
+          cast_dislikes: j.user.cast_dislikes,
+          received_likes: j.user.received_likes,
+          received_dislikes: j.user.received_dislikes
+        });
+      }
+    }catch{}
+  },
+
+  // --- поповер профиля при ховере на бейдже
+  renderProfilePopover(){
+    const badge = $('#userBadge');
+    let pop = $('#userPopover');
+    if (!badge) return;
+    if (!pop){
+      pop = document.createElement('div');
+      pop.id = 'userPopover';
+      pop.className = 'popover hidden';
+      document.body.appendChild(pop);
+    }
+    const updateContent = ()=>{
+      const u = this._state;
+      const nick = (u.username||u.email||'Student').split('@')[0]||'Student';
+      const coins = coinsOf(u);
+      pop.innerHTML = `
+        <div class="popover-inner">
+          <div class="row space-between" style="margin-bottom:6px">
+            <div class="tname">@${nick}</div>
+            <div class="badge">${coins} coins</div>
+          </div>
+          <div class="muted" style="margin-bottom:6px">${u.email || ''}</div>
+          <div class="hr"></div>
+          <ul class="stats">
+            <li>Комментарии: <b>${u.comment_count||0}</b> (×5 coins)</li>
+            <li>Оценки по критериям: <b>${u.rating_count||0}</b> (×1 coin)</li>
+            <li>Поставил лайков: <b>${u.cast_likes||0}</b>, дизлайков: <b>${u.cast_dislikes||0}</b></li>
+            <li>Получил на своих комментариях: 👍 <b>${u.received_likes||0}</b>, 👎 <b>${u.received_dislikes||0}</b></li>
+          </ul>
+          <div class="hr"></div>
+          <div class="muted" style="font-size:12px">Лайки/дизлайки учитываются только на ваших комментариях.</div>
+        </div>
+      `;
+    };
+    updateContent();
+
+    let hover = false;
+    let hideTimer = null;
+
+    function positionPopover(){
+      const r = badge.getBoundingClientRect();
+      pop.style.minWidth = '280px';
+      pop.style.left = Math.round(window.scrollX + r.left) + 'px';
+      pop.style.top  = Math.round(window.scrollY + r.bottom + 8) + 'px';
+    }
+    function show(){
+      if (!Auth.isLogged()) return;
+      updateContent();
+      positionPopover();
+      pop.classList.remove('hidden');
+    }
+    function scheduleHide(){
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(()=>{ if(!hover) pop.classList.add('hidden'); }, 140);
+    }
+
+    badge.onmouseenter = async ()=>{
+      await Auth.refreshStatsAndPopover();
+      positionPopover();
+      hover = true; show();
+    };
+    badge.onmouseleave = ()=>{
+      hover = false; scheduleHide();
+    };
+    pop.onmouseenter = ()=>{
+      hover = true; if (hideTimer) clearTimeout(hideTimer);
+    };
+    pop.onmouseleave = ()=>{
+      hover = false; scheduleHide();
+    };
+    window.addEventListener('scroll', ()=>{ if(!pop.classList.contains('hidden')) positionPopover(); }, {passive:true});
+    window.addEventListener('resize', ()=>{ if(!pop.classList.contains('hidden')) positionPopover(); });
   }
 };
 
-// ---------- api ----------
+/* ---------- api ---------- */
 const API = {
   async departments(){ const r=await fetch('/api/departments'); return (await r.json()).departments; },
   async teachers(){ const r=await fetch('/api/teachers'); return (await r.json()).teachers; },
@@ -79,28 +223,42 @@ const API = {
       try { payload = await r.json(); } catch {}
       const err = new Error(payload?.error || 'publish_failed');
       if (payload?.retry_after_ms != null) err.retry_after_ms = payload.retry_after_ms;
+      if (payload?.message) err.message = payload.message; // e.g. commenting_banned
       throw err;
     }
     return await r.json();
-  }
+  },
+  async voteComment({commentId, vote}){ // vote: 'like' | 'dislike' | 'none'
+    const r = await fetch('/api/comment/vote', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ commentId, vote })
+    });
+    return await r.json();
+  },
+  async myStats(){ const r = await fetch('/api/user/stats'); return await r.json(); },
+
+  // --- admin ---
+  async adminComments(limit=100){ const r=await fetch(`/api/admin/comments?limit=${limit}`); return await r.json(); },
+  async adminDeleteComment(id){ const r=await fetch('/api/admin/comment/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({commentId:id})}); return await r.json(); },
+  async adminFindUser(email){ const r=await fetch('/api/admin/user/find?email='+encodeURIComponent(email)); return await r.json(); },
+  async adminBanUser({email,userId,banned,reason}){ const r=await fetch('/api/admin/user/ban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,userId,banned,reason})}); return await r.json(); },
+  async adminTeachers(){ const r=await fetch('/api/admin/teachers'); return await r.json(); },
+  async adminUpsertTeacher(payload){ const r=await fetch('/api/admin/teacher/upsert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); return await r.json(); },
+  async adminDeleteTeacher(id){ const r=await fetch('/api/admin/teacher/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); return await r.json(); },
 };
 
-// ---------- router ----------
+/* ---------- router ---------- */
 const Router = {
   routes: [],
   add(p,h){ this.routes.push({pattern:p, handler:h}); },
-
-  // 👇 добавить:
   scrollTop(){
     try { window.scrollTo({ top: 0, left: 0, behavior: 'auto' }); }
     catch { window.scrollTo(0,0); }
-    // на всякий случай прокручиваем контейнер приложения
     document.getElementById('app')?.scrollIntoView({ block: 'start' });
   },
-
   go(p){
     if (location.hash.slice(1) !== p) location.hash = p;
-    this.scrollTop();               // 👈 добавить
+    this.scrollTop();
     this.match();
   },
   goHome(){ this.go('/'); },
@@ -115,15 +273,15 @@ const Router = {
   },
   init(){
     addEventListener('hashchange', ()=>{
-      this.scrollTop();            // 👈 добавить
+      this.scrollTop();
       this.match();
     });
-    this.scrollTop();              // 👈 добавить
+    this.scrollTop();
     this.match();
   }
 };
 
-// ---------- app ----------
+/* ---------- app ---------- */
 const App = {
   ALL_TEACHERS: [],
 
@@ -399,9 +557,12 @@ const App = {
   resetPending(tid){ this.pendingRatings[tid]={}; },
 
   async teacherProfile(_, tid){
-    const t = await API.teacher(tid);
-    if(!t || t.error){ Router.go('/'); return; }
+    const data = await API.teacher(tid);
+    if(!data || data.error){ Router.go('/'); return; }
     await this.mountNavbar();
+
+    const t = data; // содержит comments с like/dislike агрегацией и myVote/own (+author_email для админов)
+    const amAdmin = !!Auth._state._isAdmin;
 
     const charCards = CHARACTERISTICS.map(c=>{
       const cur = characteristicAvg(t,c.key);
@@ -421,11 +582,24 @@ const App = {
 
     const commentsHtml = (t.comments&&t.comments.length)
       ? t.comments.slice().reverse().map(c=>html`
-        <div class="comment">
-          <div class="meta">Аноним · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}</div>
-          <div>${String(c.text).replace(/</g,'&lt;')}</div>
+        <div class="comment" data-cid="${c.id}">
+          <div class="meta">
+            Аноним · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
+            ${amAdmin && (c.author_email||c.author_uid) ? html`
+              <span class="badge" title="Видно только администраторам" style="margin-left:8px">
+                ${c.author_email || c.author_uid}
+              </span>` : ''}
+          </div>
+          <div class="ctext">${String(c.text||'').replace(/</g,'&lt;')}</div>
+          <div class="cactions" style="display:flex;gap:8px;align-items:center">
+            <button class="iconbtn like ${c.myVote===1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👍 <span class="cnt">${c.likes||0}</span></button>
+            <button class="iconbtn dislike ${c.myVote===-1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👎 <span class="cnt">${c.dislikes||0}</span></button>
+            ${amAdmin ? html`<button class="btn small outline del-comment">Удалить</button>`:''}
+          </div>
         </div>`).join('')
       : '<div class="empty">Комментариев пока нет</div>';
+
+    const banned = !!Auth._state._isBanned;
 
     $('#app').innerHTML = html`
       <section class="section">
@@ -455,12 +629,13 @@ const App = {
               <h3 style="margin:6px 0 8px;color:var(--blue-700)">Оставить комментарий</h3>
               ${Auth.isLogged()
                 ? html`
-                    <textarea id="commentText" placeholder="Напишите анонимный отзыв…"></textarea>
+                    ${banned ? html`<div class="empty">У вашего аккаунта запрещены <b>текстовые</b> комментарии. Вы всё ещё можете отправлять <b>только оценки</b> без текста.</div>`:''}
+                    <textarea id="commentText" placeholder="${banned ? 'Текст сейчас отправить нельзя (бан на комментарии). Можно выставить оценки выше и нажать «Опубликовать» без текста.' : 'Напишите анонимный отзыв… (можно пусто — тогда отправятся только оценки)'}" ${banned?'':''}></textarea>
                     <div class="row" style="margin-top:8px;justify-content:space-between">
-                      <div class="muted">Оценки отправятся вместе с комментарием. Не выбранные характеристики не изменяются.</div>
+                      <div class="muted">Оценки отправятся вместе с комментарием. Можно отправить только оценки без текста.</div>
                       <button class="btn primary" id="publishBtn" data-tid="${t.id}">Опубликовать</button>
                     </div>`
-                : html`<div class="empty">Чтобы оставить комментарий и оценку, нажмите «Залогиниться» сверху.</div>`
+                : html`<div class="empty">Чтобы оставить комментарий и оценку, нажмите «Войти» сверху.</div>`
               }
             </div>
 
@@ -481,26 +656,391 @@ const App = {
       const tid = e.currentTarget.dataset.tid;
       if(!Auth.isLogged()) return alert('Нужно войти.');
       const text=$('#commentText').value.trim();
-      if(!text) return alert('Комментарий пуст.');
       const ratings={...App.getPending(tid)};
+      const hasRatings = Object.keys(ratings).length>0;
+
+      // клиентская предмодерация
+      if (text && hasBW(text)) {
+        return alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст.');
+      }
+      if (Auth._state._isBanned && text){
+        return alert('У вашего аккаунта запрещено оставлять текстовые комментарии. Можно отправить только оценки без текста.');
+      }
+
+      if(!text && !hasRatings){
+        return alert('Нужно написать комментарий или выбрать хотя бы одну оценку.');
+      }
       try{
         await API.publish({ teacherId:tid, text, ratings, author:'Student' });
         App.resetPending(tid); await App.teacherProfile(null,tid);
+        Auth.refreshStatsAndPopover();
       }catch(err){
         if (err?.message === 'rate_limited'){
           const sec = Math.max(1, Math.ceil((err.retry_after_ms ?? 60_000) / 1000));
           alert(`Слишком часто. \nПопробуйте через ${sec} сек.`);
         } else if (err?.message === 'profanity_forbidden') {
           alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
+        } else if (err?.message === 'commenting_banned' || err?.message === 'banned') {
+          alert('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.');
         } else {
           alert('Не удалось опубликовать :(');
         }
       }
     });
+
+    // лайки/дизлайки + удаление коммента (админ)
+    $('#comments')?.addEventListener('click', async (e)=>{
+      const delBtn = e.target.closest('.del-comment');
+      if (delBtn && Auth._state._isAdmin) {
+        const commentEl = e.target.closest('.comment');
+        const cid = commentEl?.dataset?.cid;
+        if (!cid) return;
+        if (!confirm('Удалить комментарий?')) return;
+        try{
+          const r = await API.adminDeleteComment(cid);
+          if (r.ok) commentEl.remove();
+          else alert('Не удалось удалить комментарий.');
+        }catch{
+          alert('Ошибка сети.');
+        }
+        return;
+      }
+
+      const likeBtn = e.target.closest('.iconbtn.like');
+      const dislikeBtn = e.target.closest('.iconbtn.dislike');
+      if (!likeBtn && !dislikeBtn) return;
+
+      const commentEl = e.target.closest('.comment');
+      const cid = commentEl?.dataset?.cid;
+      if (!cid) return;
+
+      const isLike = !!likeBtn;
+      const btn = isLike ? likeBtn : dislikeBtn;
+      if (btn.disabled) return;
+
+      const isActive = btn.classList.contains('active');
+      const vote = isActive ? 'none' : (isLike ? 'like' : 'dislike');
+
+      try{
+        const res = await API.voteComment({ commentId: cid, vote });
+        if (res.ok){
+          // обновим счётчики в DOM
+          const likeEl = commentEl.querySelector('.iconbtn.like');
+          const dislikeEl = commentEl.querySelector('.iconbtn.dislike');
+          if (likeEl) {
+            likeEl.querySelector('.cnt').textContent = res.likes || 0;
+            likeEl.classList.toggle('active', res.myVote===1);
+          }
+          if (dislikeEl){
+            dislikeEl.querySelector('.cnt').textContent = res.dislikes || 0;
+            dislikeEl.classList.toggle('active', res.myVote===-1);
+          }
+          // обновим поповер/статы
+          Auth.refreshStatsAndPopover();
+        }else if (res.error === 'forbidden'){
+          alert('Нельзя голосовать за свой комментарий.');
+        }else if (res.error === 'unauthorized'){
+          alert('Нужно войти.');
+        }else{
+          alert('Не удалось выполнить действие.');
+        }
+      }catch{
+        alert('Ошибка сети.');
+      }
+    });
+  },
+
+  // --- экран логина
+  async viewLogin(){
+    await this.mountNavbar();
+
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Вход по школьной почте</h2>
+          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        </div>
+
+        <div class="kv" id="loginBox">
+          <p>Чтобы войти, отправьте письмо <strong>со своей школьной почты (${EMAIL_DOMAIN})</strong> на сгенерированный ниже адрес с <strong>6-значным кодом</strong> в теме или тексте.</p>
+
+          <div id="stageIdle">
+            <button id="genBtn" class="btn primary">Сгенерировать адрес и код</button>
+          </div>
+
+          <div id="stageActive" class="hidden">
+            <div class="row wrap" style="gap:12px; align-items:flex-start">
+              <div>
+                <div class="muted">Временный адрес</div>
+                <div id="tmpEmail" class="badge" style="user-select:all"></div>
+              </div>
+              <div>
+                <div class="muted">Ваш код</div>
+                <div id="tmpCode" class="badge" style="user-select:all"></div>
+              </div>
+              <button id="copyAll" class="btn small outline">Скопировать адрес и код</button>
+            </div>
+
+            <div class="empty" id="statusLine" style="margin-top:10px">Ждём письмо…</div>
+            <div class="muted" id="hintLine">Отправьте письмо со своей почты, оканчивающейся на ${EMAIL_DOMAIN}.</div>
+
+            <div class="row" style="margin-top:10px">
+              <button id="cancelBtn" class="btn outline">Сбросить</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    `;
+
+    let sessionId = null;
+    let pollTimer = null;
+    const $email = $('#tmpEmail');
+    const $code  = $('#tmpCode');
+    const $status= $('#statusLine');
+    const $stageIdle = $('#stageIdle');
+    const $stageActive = $('#stageActive');
+
+    function setActive(on){
+      $stageIdle.classList.toggle('hidden', !!on);
+      $stageActive.classList.toggle('hidden', !on);
+    }
+
+    $('#genBtn')?.addEventListener('click', async ()=>{
+      try{
+        const r = await fetch('/api/auth/request',{method:'POST'});
+        const j = await r.json();
+        if (!j.ok) throw new Error('request_failed');
+        sessionId = j.session_id;
+        $email.textContent = j.email;
+        $code.textContent  = j.code;
+        setActive(true);
+        $status.textContent = 'Ждём письмо…';
+
+        const interval = Math.max(1000, Number(j.check_every_ms||5000));
+        pollTimer = setInterval(async ()=>{
+          try{
+            const r2 = await fetch(`/api/auth/poll?session_id=${encodeURIComponent(sessionId)}`);
+            const p = await r2.json();
+            if (p.ok){
+              clearInterval(pollTimer); pollTimer=null;
+              Auth.set({
+                loggedIn:true,
+                id: p.user.id,
+                email: p.user.email,
+                username: p.user.username,
+                comment_count: p.user.comment_count,
+                rating_count: p.user.rating_count,
+                cast_likes: p.user.cast_likes||0,
+                cast_dislikes: p.user.cast_dislikes||0,
+                received_likes: p.user.received_likes||0,
+                received_dislikes: p.user.received_dislikes||0,
+                _isAdmin: !!p.user.is_admin,
+                _isBanned: !!p.user.is_banned
+              });
+              Router.go('/');
+            } else if (p.status === 'wrong_domain'){
+              $status.textContent = `Получено письмо с ${p.sender_email}, но требуется ${p.required_domain}`;
+            } else if (p.error === 'expired'){
+              clearInterval(pollTimer); pollTimer=null;
+              $status.textContent = 'Истёк срок ожидания. Сгенерируйте новый адрес и код.';
+            } else {
+              // pending
+            }
+          }catch{}
+        }, interval);
+      }catch{
+        alert('Не удалось сгенерировать временный адрес. Попробуйте позже.');
+      }
+    });
+
+    $('#cancelBtn')?.addEventListener('click', ()=>{
+      if (pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+      setActive(false);
+      sessionId = null; $email.textContent=''; $code.textContent='';
+    });
+
+    $('#copyAll')?.addEventListener('click', async ()=>{
+      try{
+        await navigator.clipboard.writeText(`Временный адрес: ${$email.textContent}\nКод: ${$code.textContent}`);
+        $status.textContent = 'Скопировано!';
+        setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
+      }catch{}
+    });
+  },
+
+  // --- админ-панель
+  async viewAdmin(){
+    await this.mountNavbar();
+    if (!Auth.isLogged() || !Auth._state._isAdmin) {
+      $('#app').innerHTML = `<section class="section"><div class="empty">Требуются права администратора.</div></section>`;
+      return;
+    }
+
+    // подгружаем данные
+    let comments = [];
+    let teachers = [];
+    try { const c = await API.adminComments(100); comments = c.comments || []; } catch {}
+    try { const t = await API.adminTeachers(); teachers = t.teachers || []; } catch {}
+
+    const commentsList = comments.map(c=>html`
+      <div class="comment">
+        <div class="meta">
+          ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
+          · <b>${c.author_email || c.author_uid || '—'}</b>
+          · <span class="muted">teacherId: ${c.teacherId}</span>
+        </div>
+        <div class="ctext" style="margin:6px 0">${String(c.text||'').replace(/</g,'&lt;')}</div>
+        <button class="btn small outline" data-del-cid="${c.id}">Удалить</button>
+      </div>
+    `).join('') || '<div class="empty">Нет комментариев</div>';
+
+    const teacherRows = teachers.map(t=>html`
+      <tr>
+        <td>${t.id}</td>
+        <td>${[t.lastName,t.firstName].filter(Boolean).join(' ')}</td>
+        <td>${t.department||''}</td>
+        <td>${(t.subjects||[]).join(', ')}</td>
+        <td><button class="btn small outline" data-edit-tid="${t.id}">Редактировать</button>
+            <button class="btn small outline" data-del-tid="${t.id}">Удалить</button></td>
+      </tr>
+    `).join('');
+
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Админ-панель</h2>
+          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        </div>
+
+        <div class="grid">
+          <div class="card">
+            <h3 style="margin:0 0 8px">Быстрая модерация комментариев</h3>
+            <div id="admComments">${commentsList}</div>
+          </div>
+
+          <div class="card">
+            <h3 style="margin:0 0 8px">Бан/разбан комментирования</h3>
+            <div class="row" style="gap:8px; align-items:flex-end">
+              <div>
+                <div class="muted">Email пользователя</div>
+                <input id="banEmail" type="email" placeholder="user@student.letovo.ru" style="padding:8px;border:1px solid var(--border);border-radius:10px">
+              </div>
+              <button id="banFind" class="btn outline">Проверить</button>
+              <button id="banToggle" class="btn primary hidden">Переключить бан</button>
+            </div>
+            <div id="banResult" class="muted" style="margin-top:8px"></div>
+          </div>
+
+          <div class="card" style="grid-column:1/-1">
+            <div class="row space-between wrap">
+              <h3 style="margin:0 0 8px">Учителя — список</h3>
+              <button id="tAdd" class="btn primary">Добавить учителя</button>
+            </div>
+            <div style="overflow:auto">
+              <table style="width:100%; border-collapse:collapse">
+                <thead><tr><th>ID</th><th>ФИО</th><th>Кафедра</th><th>Предметы</th><th></th></tr></thead>
+                <tbody id="tBody">${teacherRows}</tbody>
+              </table>
+            </div>
+            <div class="hr"></div>
+            <div id="tFormWrap"></div>
+          </div>
+        </div>
+      </section>
+    `;
+
+    // Удаление комментария
+    $('#admComments')?.addEventListener('click', async (e)=>{
+      const btn = e.target.closest('[data-del-cid]');
+      if (!btn) return;
+      const cid = btn.getAttribute('data-del-cid');
+      if (!confirm('Удалить комментарий?')) return;
+      const r = await API.adminDeleteComment(cid);
+      if (r.ok) { btn.closest('.comment')?.remove(); } else alert('Не удалось удалить');
+    });
+
+    // Бан/разбан
+    let foundUser = null;
+    $('#banFind')?.addEventListener('click', async ()=>{
+      const email = String($('#banEmail').value||'').trim().toLowerCase();
+      if (!email) return;
+      const r = await API.adminFindUser(email);
+      if (!r.ok) { $('#banResult').textContent = 'Пользователь не найден'; $('#banToggle').classList.add('hidden'); foundUser=null; return; }
+      foundUser = r.user;
+      $('#banResult').textContent = `Найден: ${foundUser.email} · banned=${foundUser.is_banned?'да':'нет'}`;
+      $('#banToggle').textContent = foundUser.is_banned ? 'Снять бан' : 'Забанить';
+      $('#banToggle').classList.remove('hidden');
+    });
+    $('#banToggle')?.addEventListener('click', async ()=>{
+      if (!foundUser) return;
+      const willBan = !foundUser.is_banned;
+      const reason = willBan ? prompt('Причина бана (необязательно):','') : '';
+      const r = await API.adminBanUser({ userId: foundUser.id, banned: willBan, reason });
+      if (r.ok) {
+        foundUser.is_banned = willBan;
+        $('#banResult').textContent = `Найден: ${foundUser.email} · banned=${foundUser.is_banned?'да':'нет'}`;
+        $('#banToggle').textContent = foundUser.is_banned ? 'Снять бан' : 'Забанить';
+        alert('Готово');
+      } else alert('Не удалось переключить бан');
+    });
+
+    // Форма учителя (add/edit)
+    function renderTeacherForm(values={}){
+      $('#tFormWrap').innerHTML = html`
+        <div class="kv">
+          <h4 style="margin:0 0 10px">${values.id?'Редактирование':'Добавление'} учителя</h4>
+          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
+            <div><div class="muted">ID (необязательно для нового)</div><input id="fId" value="${values.id||''}" placeholder="t-ivanov-ivan" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Фамилия</div><input id="fLast" value="${values.lastName||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Имя</div><input id="fFirst" value="${values.firstName||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Отчество</div><input id="fPatr" value="${values.patronymic||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Кафедра</div><input id="fDept" value="${values.department||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Предметы (через |)</div><input id="fSubj" value="${(values.subjects||[]).join('|')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Фото (имя файла в /photos)</div><input id="fPhoto" value="${(values.photo||'').replace(/^\/?photo\//,'')}" placeholder="ivanov.jpg" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button id="fSave" class="btn primary">Сохранить</button>
+            <button id="fCancel" class="btn outline">Отмена</button>
+          </div>
+        </div>
+      `;
+      $('#fCancel')?.addEventListener('click', ()=>$('#tFormWrap').innerHTML='');
+      $('#fSave')?.addEventListener('click', async ()=>{
+        const payload = {
+          id: String($('#fId').value||'').trim() || undefined,
+          lastName: $('#fLast').value||'',
+          firstName: $('#fFirst').value||'',
+          patronymic: $('#fPatr').value||'',
+          department: $('#fDept').value||'',
+          subjects: String($('#fSubj').value||'').split('|').map(s=>s.trim()).filter(Boolean),
+          photo: $('#fPhoto').value||''
+        };
+        const r = await API.adminUpsertTeacher(payload);
+        if (r.ok) { alert('Сохранено'); Router.go('/admin'); } else alert('Не удалось сохранить');
+      });
+    }
+
+    $('#tAdd')?.addEventListener('click', ()=>renderTeacherForm({}));
+
+    $('#tBody')?.addEventListener('click', async (e)=>{
+      const ed = e.target.closest('[data-edit-tid]');
+      const del = e.target.closest('[data-del-tid]');
+      if (ed){
+        const id = ed.getAttribute('data-edit-tid');
+        const t = teachers.find(x=>x.id===id);
+        renderTeacherForm(t||{id});
+      }
+      if (del){
+        const id = del.getAttribute('data-del-tid');
+        if (!confirm('Удалить карточку учителя? Все его комментарии и рейтинги тоже будут удалены.')) return;
+        const r = await API.adminDeleteTeacher(id);
+        if (r.ok) { alert('Удалено'); Router.go('/admin'); } else alert('Не удалось удалить');
+      }
+    });
   },
 };
 
-// ---------- routes (обёртки не ломают this) ----------
+/* ---------- routes ---------- */
 Router.add(/^\/$/, ()=>App.viewHome());
 Router.add(/^\/teachers$/, (...a)=>App.listAll(...a));
 Router.add(/^\/top\/([a-z]+)$/, (...a)=>App.listByCharacteristic(...a));
@@ -508,14 +1048,15 @@ Router.add(/^\/department\/(.+)$/, (...a)=>App.listByDepartment(...a));
 Router.add(/^\/search\?q=(.*)$/, (...a)=>App.listBySearch(...a));
 Router.add(/^\/teacher\/(t[\w\-]+)$/, (...a)=>App.teacherProfile(...a));
 Router.add(/^\/policy$/, (...a)=>App.viewPolicy(...a));
+Router.add(/^\/login$/, (...a)=>App.viewLogin(...a));
+Router.add(/^\/admin$/, (...a)=>App.viewAdmin(...a));
 
-
-// ---------- boot ----------
+/* ---------- boot ---------- */
 window.App=App; window.Router=Router; window.Auth=Auth;
 
 addEventListener('DOMContentLoaded', ()=>{
   Auth.migrate();
-  $('#loginBtn')?.addEventListener('click', ()=>Auth.login());
+  $('#loginBtn')?.addEventListener('click', ()=>Router.go('/login'));
   $('#logoutBtn')?.addEventListener('click', ()=>Auth.logout());
   $('#searchBtn')?.addEventListener('click', ()=>App.search());
   $('#searchInput')?.addEventListener('keydown', e=>{ if(e.key==='Enter') App.search(); });
@@ -529,5 +1070,7 @@ addEventListener('DOMContentLoaded', ()=>{
   $('#year').textContent = new Date().getFullYear();
   Auth.render();
   Router.init();
-  Auth.ensureSessionLoginLog();
+
+  // Узнаём состояние по cookie-сессии
+  Auth.me();
 });
