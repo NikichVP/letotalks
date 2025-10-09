@@ -22,6 +22,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const ROOT_DIR    = __dirname;
+const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const DATA_DIR    = path.join(ROOT_DIR, 'data');
 const PHOTO_DIR   = path.join(ROOT_DIR, 'photos');
 
@@ -42,7 +43,7 @@ const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут
 const AUTH_CHECK_INTERVAL_MS = 5000;
 
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(ROOT_DIR));
+app.use(express.static(PUBLIC_DIR));
 app.use('/photo', express.static(PHOTO_DIR));
 
 function ensureDirsAndFiles() {
@@ -510,6 +511,47 @@ const postLimiter = limitPerIp(3_000);
 const authRequestLimiter = limitPerIp(10_000);
 const authPollLimiter    = limitPerIp(1_000);
 
+function createSlidingWindowLimiter({ windowMs, maxRequests }) {
+  const buckets = new Map();
+
+  function pruneOldEntries(now) {
+    for (const [ip, state] of buckets.entries()) {
+      if (now - state.windowStart > windowMs * 2) {
+        buckets.delete(ip);
+      }
+    }
+  }
+
+  return function(req, res, next) {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    let state = buckets.get(ip);
+    if (!state || now - state.windowStart >= windowMs) {
+      state = { windowStart: now, count: 0 };
+    }
+    state.count += 1;
+    state.windowStart = state.windowStart ?? now;
+    buckets.set(ip, state);
+
+    if (state.count > maxRequests) {
+      const retryMs = windowMs - (now - state.windowStart);
+      const retrySec = Math.max(1, Math.ceil(retryMs / 1000));
+      res.setHeader('Retry-After', retrySec);
+      return res.status(429).json({
+        error: 'rate_limited',
+        message: 'Слишком много запросов. Попробуйте немного позже.',
+        retry_after_ms: Math.max(0, retryMs)
+      });
+    }
+
+    if (buckets.size > 1000) pruneOldEntries(now);
+    next();
+  };
+}
+
+const apiRateLimiter = createSlidingWindowLimiter({ windowMs: 60_000, maxRequests: 120 });
+app.use('/api', apiRateLimiter);
+
 /* GuerrillaMail helpers (Node 18: fetch встроен) */
 async function gmGetEmailAddress(){
   const url = 'https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=ru';
@@ -801,7 +843,92 @@ function deleteCommentById(commentId){
 }
 
 /* --- Admin API --- */
-// последние N комментариев (для модерации)
+// пользователи, оставлявшие комментарии
+app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
+  const comments = readCommentsAll();
+  const counts = {};
+  const lastTs = {};
+  for (const c of comments) {
+    const uid = String(c.author_uid||'').trim();
+    if (!uid) continue;
+    counts[uid] = (counts[uid]||0) + 1;
+    lastTs[uid] = Math.max(lastTs[uid]||0, Number(c.ts)||0);
+  }
+
+  const users = readUsersRows();
+  const out = [];
+  for (const u of users) {
+    const uid = String(u.id||'');
+    const cnt = counts[uid] || Number(u.comment_count||0) || 0;
+    if (!cnt) continue;
+    out.push({
+      id: uid,
+      email: u.email || '',
+      username: u.username || '',
+      comment_count: cnt,
+      is_banned: isUserBanned(uid),
+      last_comment_ts: lastTs[uid] || 0
+    });
+  }
+
+  out.sort((a,b)=>{
+    if (b.comment_count !== a.comment_count) return b.comment_count - a.comment_count;
+    return (b.last_comment_ts||0) - (a.last_comment_ts||0);
+  });
+
+  res.json({ ok:true, users: out });
+});
+
+// комментарии конкретного пользователя
+app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
+  const userId = String(req.query.userId||'').trim();
+  if (!userId) return res.status(400).json({ error:'bad_request' });
+
+  const all = readCommentsAll().filter(c=>String(c.author_uid||'')===userId).sort((a,b)=>b.ts-a.ts);
+  const teacherMap = new Map(TEACHERS.map(t=>[t.id, t]));
+  const user = findUserById(userId);
+
+  const comments = all.map(c=>{
+    const teacher = teacherMap.get(c.teacherId);
+    const fio = teacher ? [teacher.lastName, teacher.firstName, teacher.patronymic].filter(Boolean).join(' ') : '';
+    return {
+      id: c.id,
+      teacherId: c.teacherId,
+      teacher_name: fio,
+      ts: c.ts,
+      ts_iso: c.ts_iso,
+      text: c.text || ''
+    };
+  });
+
+  res.json({
+    ok: true,
+    user: user ? {
+      id: user.id,
+      email: user.email || '',
+      username: user.username || '',
+      is_banned: isUserBanned(user.id)
+    } : { id: userId, email: '', username: '', is_banned: isUserBanned(userId) },
+    comments
+  });
+});
+
+// полный список пользователей с флагом бана
+app.get('/api/admin/users', requireAdmin, (req,res)=>{
+  const users = readUsersRows();
+  const collator = new Intl.Collator('ru', { sensitivity:'base' });
+  const out = users.map(u=>({
+    id: u.id,
+    email: u.email || '',
+    username: u.username || '',
+    comment_count: Number(u.comment_count||0) || 0,
+    rating_count: Number(u.rating_count||0) || 0,
+    is_banned: isUserBanned(u.id)
+  })).sort((a,b)=>collator.compare(a.email||'', b.email||''));
+  res.json({ ok:true, users: out });
+});
+
+// последние N комментариев (для модерации, быстрый просмотр)
 app.get('/api/admin/comments', requireAdmin, (req,res)=>{
   const limit = Math.max(1, Math.min(500, Number(req.query.limit||100)));
   const all = readCommentsAll().sort((a,b)=>b.ts-a.ts).slice(0,limit);
@@ -1056,6 +1183,10 @@ app.get('/api/user/stats', (req,res)=>{
 
 /* Cache */
 let TEACHERS = readTeachers();
+
+app.get(/^\/(?!.*\.).*$/, (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
 
 app.listen(PORT, ()=>{
   console.log(`Server on http://localhost:${PORT}`);

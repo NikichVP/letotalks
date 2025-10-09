@@ -1,5 +1,5 @@
 // app.js — SPA с авторизацией по почте, лайками/дизлайками, статистикой, админкой и предмодерацией
-const APP_VERSION = '2025-10-04-admin-1';
+const APP_VERSION = '2025-10-04-admin-2';
 const EMAIL_DOMAIN = '@student.letovo.ru';
 
 const CHARACTERISTICS = [
@@ -239,8 +239,11 @@ const API = {
 
   // --- admin ---
   async adminComments(limit=100){ const r=await fetch(`/api/admin/comments?limit=${limit}`); return await r.json(); },
+  async adminCommenters(){ const r=await fetch('/api/admin/commenters'); return await r.json(); },
+  async adminCommentsByUser(userId){ const r=await fetch('/api/admin/comments/by-user?userId='+encodeURIComponent(userId)); return await r.json(); },
   async adminDeleteComment(id){ const r=await fetch('/api/admin/comment/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({commentId:id})}); return await r.json(); },
   async adminFindUser(email){ const r=await fetch('/api/admin/user/find?email='+encodeURIComponent(email)); return await r.json(); },
+  async adminUsers(){ const r=await fetch('/api/admin/users'); return await r.json(); },
   async adminBanUser({email,userId,banned,reason}){ const r=await fetch('/api/admin/user/ban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,userId,banned,reason})}); return await r.json(); },
   async adminTeachers(){ const r=await fetch('/api/admin/teachers'); return await r.json(); },
   async adminUpsertTeacher(payload){ const r=await fetch('/api/admin/teacher/upsert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); return await r.json(); },
@@ -869,174 +872,451 @@ const App = {
   },
 
   // --- админ-панель
-  async viewAdmin(){
+  async ensureAdmin(){
     await this.mountNavbar();
     if (!Auth.isLogged() || !Auth._state._isAdmin) {
       $('#app').innerHTML = `<section class="section"><div class="empty">Требуются права администратора.</div></section>`;
-      return;
+      return false;
     }
+    return true;
+  },
 
-    // подгружаем данные
-    let comments = [];
-    let teachers = [];
-    try { const c = await API.adminComments(100); comments = c.comments || []; } catch {}
-    try { const t = await API.adminTeachers(); teachers = t.teachers || []; } catch {}
+  adminTabs(active){
+      const tabs = [
+        { id:'moderation', title:'Модерация комментариев', route:'/admin/moderation' },
+        { id:'bans', title:'Бан/разбан комментирования', route:'/admin/bans' },
+        { id:'teachers', title:'Изменения базы учителей', route:'/admin/teachers' }
+      ];
+      return html`<div class="admin-tabs">${tabs.map(t=>html`<a class="admin-tab ${active===t.id?'active':''}" href="#${t.route}">${t.title}</a>`).join('')}</div>`;
+    },
 
-    const commentsList = comments.map(c=>html`
-      <div class="comment">
-        <div class="meta">
-          ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
-          · <b>${c.author_email || c.author_uid || '—'}</b>
-          · <span class="muted">teacherId: ${c.teacherId}</span>
-        </div>
-        <div class="ctext" style="margin:6px 0">${String(c.text||'').replace(/</g,'&lt;')}</div>
-        <button class="btn small outline" data-del-cid="${c.id}">Удалить</button>
-      </div>
-    `).join('') || '<div class="empty">Нет комментариев</div>';
-
-    const teacherRows = teachers.map(t=>html`
-      <tr>
-        <td>${t.id}</td>
-        <td>${[t.lastName,t.firstName].filter(Boolean).join(' ')}</td>
-        <td>${t.department||''}</td>
-        <td>${(t.subjects||[]).join(', ')}</td>
-        <td><button class="btn small outline" data-edit-tid="${t.id}">Редактировать</button>
-            <button class="btn small outline" data-del-tid="${t.id}">Удалить</button></td>
-      </tr>
-    `).join('');
-
+  async viewAdminHome(){
+    if (!(await this.ensureAdmin())) return;
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
           <h2>Админ-панель</h2>
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
-
-        <div class="grid">
-          <div class="card">
-            <h3 style="margin:0 0 8px">Быстрая модерация комментариев</h3>
-            <div id="admComments">${commentsList}</div>
+        <div class="admin-dashboard">
+          <div class="card admin-card">
+            <h3>Модерация комментариев</h3>
+            <p class="muted">Просмотр всех авторов и удаление их комментариев.</p>
+            <button class="btn primary" data-route="/admin/moderation">Перейти</button>
           </div>
-
-          <div class="card">
-            <h3 style="margin:0 0 8px">Бан/разбан комментирования</h3>
-            <div class="row" style="gap:8px; align-items:flex-end">
-              <div>
-                <div class="muted">Email пользователя</div>
-                <input id="banEmail" type="email" placeholder="user@student.letovo.ru" style="padding:8px;border:1px solid var(--border);border-radius:10px">
-              </div>
-              <button id="banFind" class="btn outline">Проверить</button>
-              <button id="banToggle" class="btn primary hidden">Переключить бан</button>
-            </div>
-            <div id="banResult" class="muted" style="margin-top:8px"></div>
+          <div class="card admin-card">
+            <h3>Бан/Разбан комментирования</h3>
+            <p class="muted">Управление правами на публикацию комментариев.</p>
+            <button class="btn primary" data-route="/admin/bans">Перейти</button>
           </div>
-
-          <div class="card" style="grid-column:1/-1">
-            <div class="row space-between wrap">
-              <h3 style="margin:0 0 8px">Учителя — список</h3>
-              <button id="tAdd" class="btn primary">Добавить учителя</button>
-            </div>
-            <div style="overflow:auto">
-              <table style="width:100%; border-collapse:collapse">
-                <thead><tr><th>ID</th><th>ФИО</th><th>Кафедра</th><th>Предметы</th><th></th></tr></thead>
-                <tbody id="tBody">${teacherRows}</tbody>
-              </table>
-            </div>
-            <div class="hr"></div>
-            <div id="tFormWrap"></div>
+          <div class="card admin-card">
+            <h3>Изменения базы учителей</h3>
+            <p class="muted">Добавление, редактирование и удаление карточек учителей.</p>
+            <button class="btn primary" data-route="/admin/teachers">Перейти</button>
           </div>
         </div>
       </section>
     `;
 
-    // Удаление комментария
-    $('#admComments')?.addEventListener('click', async (e)=>{
-      const btn = e.target.closest('[data-del-cid]');
-      if (!btn) return;
-      const cid = btn.getAttribute('data-del-cid');
-      if (!confirm('Удалить комментарий?')) return;
-      const r = await API.adminDeleteComment(cid);
-      if (r.ok) { btn.closest('.comment')?.remove(); } else alert('Не удалось удалить');
+    $('#app').querySelectorAll('[data-route]')?.forEach(btn=>{
+      btn.addEventListener('click', (e)=>{
+        const route = e.currentTarget.getAttribute('data-route');
+        if (route) Router.go(route);
+      });
     });
+  },
 
-    // Бан/разбан
-    let foundUser = null;
-    $('#banFind')?.addEventListener('click', async ()=>{
-      const email = String($('#banEmail').value||'').trim().toLowerCase();
-      if (!email) return;
-      const r = await API.adminFindUser(email);
-      if (!r.ok) { $('#banResult').textContent = 'Пользователь не найден'; $('#banToggle').classList.add('hidden'); foundUser=null; return; }
-      foundUser = r.user;
-      $('#banResult').textContent = `Найден: ${foundUser.email} · banned=${foundUser.is_banned?'да':'нет'}`;
-      $('#banToggle').textContent = foundUser.is_banned ? 'Снять бан' : 'Забанить';
-      $('#banToggle').classList.remove('hidden');
-    });
-    $('#banToggle')?.addEventListener('click', async ()=>{
-      if (!foundUser) return;
-      const willBan = !foundUser.is_banned;
-      const reason = willBan ? prompt('Причина бана (необязательно):','') : '';
-      const r = await API.adminBanUser({ userId: foundUser.id, banned: willBan, reason });
-      if (r.ok) {
-        foundUser.is_banned = willBan;
-        $('#banResult').textContent = `Найден: ${foundUser.email} · banned=${foundUser.is_banned?'да':'нет'}`;
-        $('#banToggle').textContent = foundUser.is_banned ? 'Снять бан' : 'Забанить';
-        alert('Готово');
-      } else alert('Не удалось переключить бан');
-    });
+  async viewAdminModeration(){
+    if (!(await this.ensureAdmin())) return;
 
-    // Форма учителя (add/edit)
-    function renderTeacherForm(values={}){
-      $('#tFormWrap').innerHTML = html`
-        <div class="kv">
-          <h4 style="margin:0 0 10px">${values.id?'Редактирование':'Добавление'} учителя</h4>
-          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
-            <div><div class="muted">ID (необязательно для нового)</div><input id="fId" value="${values.id||''}" placeholder="t-ivanov-ivan" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Фамилия</div><input id="fLast" value="${values.lastName||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Имя</div><input id="fFirst" value="${values.firstName||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Отчество</div><input id="fPatr" value="${values.patronymic||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Кафедра</div><input id="fDept" value="${values.department||''}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Предметы (через |)</div><input id="fSubj" value="${(values.subjects||[]).join('|')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Фото (имя файла в /photos)</div><input id="fPhoto" value="${(values.photo||'').replace(/^\/?photo\//,'')}" placeholder="ivanov.jpg" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+    let commenters = [];
+    try { const r = await API.adminCommenters(); if (r.ok) commenters = r.users || []; } catch {}
+
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Модерация комментариев</h2>
+          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        </div>
+        ${this.adminTabs('moderation')}
+        <div class="admin-split">
+          <div class="kv admin-pane">
+            <h3 style="margin-top:0">Пользователи</h3>
+            <div id="commenterList" class="admin-list"></div>
           </div>
-          <div class="row" style="margin-top:10px">
-            <button id="fSave" class="btn primary">Сохранить</button>
-            <button id="fCancel" class="btn outline">Отмена</button>
+          <div class="kv admin-pane" id="commenterDetail">
+            <div class="empty">Выберите пользователя, чтобы увидеть комментарии.</div>
           </div>
         </div>
-      `;
-      $('#fCancel')?.addEventListener('click', ()=>$('#tFormWrap').innerHTML='');
-      $('#fSave')?.addEventListener('click', async ()=>{
-        const payload = {
-          id: String($('#fId').value||'').trim() || undefined,
-          lastName: $('#fLast').value||'',
-          firstName: $('#fFirst').value||'',
-          patronymic: $('#fPatr').value||'',
-          department: $('#fDept').value||'',
-          subjects: String($('#fSubj').value||'').split('|').map(s=>s.trim()).filter(Boolean),
-          photo: $('#fPhoto').value||''
-        };
-        const r = await API.adminUpsertTeacher(payload);
-        if (r.ok) { alert('Сохранено'); Router.go('/admin'); } else alert('Не удалось сохранить');
-      });
+      </section>
+    `;
+
+    const listEl = $('#commenterList');
+    const detailEl = $('#commenterDetail');
+    const commentCache = new Map();
+    const userMeta = new Map();
+    let activeUserId = null;
+    let loading = false;
+
+    function renderList(){
+      if (!commenters.length) {
+        listEl.innerHTML = '<div class="empty">Нет пользователей с комментариями</div>';
+        return;
+      }
+      listEl.innerHTML = commenters.map(u=>html`
+        <button type="button" class="admin-list-item ${u.id===activeUserId?'active':''}" data-user="${u.id}">
+          <span class="admin-list-primary">${u.email || u.username || u.id}</span>
+          <span class="admin-list-meta">Комментарии: ${u.comment_count}</span>
+          ${u.is_banned ? '<span class="badge danger">Забанен</span>' : ''}
+        </button>
+      `).join('');
     }
 
-    $('#tAdd')?.addEventListener('click', ()=>renderTeacherForm({}));
-
-    $('#tBody')?.addEventListener('click', async (e)=>{
-      const ed = e.target.closest('[data-edit-tid]');
-      const del = e.target.closest('[data-del-tid]');
-      if (ed){
-        const id = ed.getAttribute('data-edit-tid');
-        const t = teachers.find(x=>x.id===id);
-        renderTeacherForm(t||{id});
+    function renderDetail(){
+      if (!activeUserId) {
+        detailEl.innerHTML = '<div class="empty">Выберите пользователя, чтобы увидеть комментарии.</div>';
+        return;
       }
-      if (del){
-        const id = del.getAttribute('data-del-tid');
+      if (loading) {
+        detailEl.innerHTML = '<div class="muted">Загружаем комментарии…</div>';
+        return;
+      }
+      const comments = commentCache.get(activeUserId) || [];
+      const selected = commenters.find(u=>u.id===activeUserId) || {};
+      const meta = userMeta.get(activeUserId) || {};
+      const identity = meta.email || selected.email || meta.username || selected.username || selected.id || '—';
+      const commentCount = selected.comment_count ?? comments.length;
+      const banned = meta.is_banned ?? selected.is_banned;
+      const fmtDate = (ts)=>{
+        const num = Number(ts||0);
+        if (!Number.isFinite(num)) return '';
+        try { return new Date(num).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'}); }
+        catch { return new Date(num).toISOString(); }
+      };
+      detailEl.innerHTML = html`
+        <div class="admin-detail-head">
+          <div>
+            <div class="tname">${identity}</div>
+            <div class="muted">Комментариев: ${commentCount}</div>
+            ${banned ? '<div class="badge danger" style="margin-top:6px">Забанен</div>' : ''}
+          </div>
+          <button class="btn small outline" data-open-bans>Бан/разбан</button>
+        </div>
+        <div class="hr"></div>
+        <div id="userCommentsWrap" class="admin-comments">
+          ${comments.length ? comments.map(c=>html`
+            <div class="comment" data-comment-id="${c.id}">
+              <div class="meta">${fmtDate(c.ts)} · ${c.teacher_name || ('teacherId: '+c.teacherId)}</div>
+              <div class="ctext" style="margin:6px 0">${String(c.text||'').replace(/</g,'&lt;')}</div>
+              <button class="btn small outline" data-del-cid="${c.id}">Удалить</button>
+            </div>
+          `).join('') : '<div class="empty">Нет комментариев</div>'}
+        </div>
+      `;
+    }
+
+    renderList();
+
+    listEl.addEventListener('click', async (e)=>{
+      const btn = e.target.closest('[data-user]');
+      if (!btn) return;
+      const uid = btn.getAttribute('data-user');
+      if (!uid) return;
+      if (uid !== activeUserId) {
+        activeUserId = uid;
+        renderList();
+      }
+      if (!commentCache.has(uid)) {
+        loading = true;
+        renderDetail();
+        try {
+          const resp = await API.adminCommentsByUser(uid);
+          if (resp.ok) {
+            commentCache.set(uid, resp.comments || []);
+            const entry = commenters.find(u=>u.id===uid);
+            if (entry) {
+              if (resp.user?.email) entry.email = resp.user.email;
+              if (resp.user?.username) entry.username = resp.user.username;
+              if (typeof resp.user?.is_banned === 'boolean') entry.is_banned = resp.user.is_banned;
+            }
+            userMeta.set(uid, { ...resp.user, comment_count: entry?.comment_count ?? (resp.comments?.length || 0) });
+          } else {
+            commentCache.set(uid, []);
+          }
+        } catch {
+          commentCache.set(uid, []);
+        }
+        loading = false;
+      }
+      renderDetail();
+    });
+
+    detailEl.addEventListener('click', async (e)=>{
+      if (e.target.closest('[data-open-bans]')) {
+        Router.go('/admin/bans');
+        return;
+      }
+      const delBtn = e.target.closest('[data-del-cid]');
+      if (!delBtn) return;
+      const cid = delBtn.getAttribute('data-del-cid');
+      if (!cid) return;
+      if (!confirm('Удалить комментарий?')) return;
+      delBtn.disabled = true;
+      const resp = await API.adminDeleteComment(cid);
+      delBtn.disabled = false;
+      if (!resp.ok) {
+        alert('Не удалось удалить комментарий');
+        return;
+      }
+      const arr = commentCache.get(activeUserId) || [];
+      const ix = arr.findIndex(c=>String(c.id)===String(cid));
+      if (ix>=0) arr.splice(ix,1);
+      commentCache.set(activeUserId, arr);
+      const entry = commenters.find(u=>u.id===activeUserId);
+      if (entry) {
+        entry.comment_count = Math.max(0, (entry.comment_count||0) - 1);
+        if (!entry.comment_count) {
+          commenters = commenters.filter(u=>u.id!==entry.id);
+          commentCache.delete(entry.id);
+          userMeta.delete(entry.id);
+          activeUserId = null;
+        }
+      }
+      if (activeUserId && userMeta.has(activeUserId)) {
+        userMeta.get(activeUserId).comment_count = arr.length;
+      }
+      renderList();
+      renderDetail();
+    });
+  },
+
+    async viewAdminBans(){
+    if (!(await this.ensureAdmin())) return;
+
+    let users = [];
+    try { const r = await API.adminUsers(); if (r.ok) users = r.users || []; } catch {}
+
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Бан/Разбан комментирования</h2>
+          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        </div>
+        ${this.adminTabs('bans')}
+        <div class="admin-split">
+          <div class="kv admin-pane">
+            <h3 style="margin-top:0">Могут комментировать</h3>
+            <div id="adminUsersAllowed" class="admin-user-column"></div>
+          </div>
+          <div class="kv admin-pane">
+            <h3 style="margin-top:0">Заблокированы</h3>
+            <div id="adminUsersBanned" class="admin-user-column"></div>
+          </div>
+        </div>
+      </section>
+    `;
+
+    const allowedEl = $('#adminUsersAllowed');
+    const bannedEl = $('#adminUsersBanned');
+
+    function renderColumns(){
+      const allowed = users.filter(u=>!u.is_banned);
+      const banned = users.filter(u=>u.is_banned);
+      const renderList = (arr, action)=>{
+        if (!arr.length) return '<div class="empty">Нет пользователей</div>';
+        return arr.map(u=>html`
+          <div class="admin-user-card">
+            <div class="admin-list-primary">${u.email || u.username || u.id}</div>
+            <div class="admin-list-meta">Комментарии: ${u.comment_count}</div>
+            <button class="btn small outline" data-user="${u.id}" data-action="${action}">${action==='ban'?'Забанить':'Разбанить'}</button>
+          </div>
+        `).join('');
+      };
+      allowedEl.innerHTML = renderList(allowed, 'ban');
+      bannedEl.innerHTML = renderList(banned, 'unban');
+    }
+
+    renderColumns();
+
+    const bansWrap = $('#app').querySelector('.admin-split');
+    bansWrap?.addEventListener('click', async (e)=>{
+      const btn = e.target.closest('[data-user][data-action]');
+      if (!btn) return;
+      const id = btn.getAttribute('data-user');
+      const action = btn.getAttribute('data-action');
+      if (!id || !action) return;
+      const willBan = action === 'ban';
+      let reason = '';
+      if (willBan) {
+        reason = prompt('Причина бана (необязательно):','') || '';
+      }
+      btn.disabled = true;
+      const resp = await API.adminBanUser({ userId: id, banned: willBan, reason });
+      btn.disabled = false;
+      if (!resp.ok) {
+        alert('Не удалось обновить статус пользователя');
+        return;
+      }
+      const user = users.find(u=>u.id===id);
+      if (user) {
+        user.is_banned = willBan;
+      }
+      renderColumns();
+    });
+  },
+
+  async viewAdminTeachersList(){
+    if (!(await this.ensureAdmin())) return;
+
+    let teachers = [];
+    try { const r = await API.adminTeachers(); if (r.ok) teachers = r.teachers || []; } catch {}
+
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Изменения базы учителей</h2>
+          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        </div>
+        ${this.adminTabs('teachers')}
+        <div class="row wrap" style="margin:12px 0">
+          <button id="teacherAddBtn" class="btn primary">Добавить учителя</button>
+        </div>
+        <div class="kv" style="padding:0; overflow:auto">
+          <table style="width:100%; border-collapse:collapse">
+            <thead><tr><th>ID</th><th>ФИО</th><th>Кафедра</th><th>Предметы</th><th></th></tr></thead>
+            <tbody id="teachersTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    `;
+
+    const tbody = $('#teachersTableBody');
+
+    function renderRows(){
+      if (!teachers.length) {
+        tbody.innerHTML = '<tr><td colspan="5"><div class="empty">Список учителей пуст</div></td></tr>';
+        return;
+      }
+      tbody.innerHTML = teachers.map(t=>html`
+        <tr data-teacher="${t.id}">
+          <td>${t.id}</td>
+          <td>${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</td>
+          <td>${t.department||''}</td>
+          <td>${(t.subjects||[]).join(', ')}</td>
+          <td>
+            <button class="btn small outline" data-edit="${t.id}">Редактировать</button>
+            <button class="btn small outline" data-delete="${t.id}">Удалить</button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    renderRows();
+
+    $('#teacherAddBtn')?.addEventListener('click', ()=>Router.go('/admin/teachers/new'));
+
+    tbody.addEventListener('click', async (e)=>{
+      const edit = e.target.closest('[data-edit]');
+      const del = e.target.closest('[data-delete]');
+      if (edit) {
+        const id = edit.getAttribute('data-edit');
+        if (id) Router.go('/admin/teachers/edit/'+encodeURIComponent(id));
+        return;
+      }
+      if (del) {
+        const id = del.getAttribute('data-delete');
+        if (!id) return;
         if (!confirm('Удалить карточку учителя? Все его комментарии и рейтинги тоже будут удалены.')) return;
-        const r = await API.adminDeleteTeacher(id);
-        if (r.ok) { alert('Удалено'); Router.go('/admin'); } else alert('Не удалось удалить');
+        del.disabled = true;
+        const resp = await API.adminDeleteTeacher(id);
+        del.disabled = false;
+        if (!resp.ok) {
+          alert('Не удалось удалить учителя');
+          return;
+        }
+        teachers = teachers.filter(t=>t.id!==id);
+        renderRows();
       }
     });
+  },
+
+  renderTeacherForm({ teacher={}, isNew=false }){
+    const escapeAttr = (v)=>String(v??'').replace(/"/g,'&quot;');
+    const subjects = Array.isArray(teacher.subjects) ? teacher.subjects : [];
+    const photo = (teacher.photo||'').replace(/^\/?photo\//,'');
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>${isNew ? 'Добавить учителя' : 'Редактировать учителя'}</h2>
+          <div class="list-controls"><a class="link" href="#/admin/teachers">← Назад к списку</a></div>
+        </div>
+        ${this.adminTabs('teachers')}
+        <div class="kv admin-form">
+          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
+            <div><div class="muted">ID</div><input id="teacherId" value="${escapeAttr(teacher.id||'')}" placeholder="t-ivanov-ivan" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Фамилия</div><input id="teacherLastName" value="${escapeAttr(teacher.lastName||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Имя</div><input id="teacherFirstName" value="${escapeAttr(teacher.firstName||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Отчество</div><input id="teacherPatronymic" value="${escapeAttr(teacher.patronymic||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Кафедра</div><input id="teacherDepartment" value="${escapeAttr(teacher.department||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Предметы (через |)</div><input id="teacherSubjects" value="${escapeAttr(subjects.join('|'))}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+            <div><div class="muted">Фото (имя файла в /photos)</div><input id="teacherPhoto" value="${escapeAttr(photo)}" placeholder="ivanov.jpg" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <button id="teacherFormSave" class="btn primary">Сохранить</button>
+            <button id="teacherFormCancel" class="btn outline">Отмена</button>
+          </div>
+        </div>
+      </section>
+    `;
+
+    $('#teacherFormCancel')?.addEventListener('click', ()=>Router.go('/admin/teachers'));
+    $('#teacherFormSave')?.addEventListener('click', async ()=>{
+      const payload = {
+        id: String($('#teacherId').value||'').trim() || (isNew ? undefined : teacher.id),
+        lastName: $('#teacherLastName').value||'',
+        firstName: $('#teacherFirstName').value||'',
+        patronymic: $('#teacherPatronymic').value||'',
+        department: $('#teacherDepartment').value||'',
+        subjects: String($('#teacherSubjects').value||'').split('|').map(s=>s.trim()).filter(Boolean),
+        photo: $('#teacherPhoto').value||''
+      };
+      const resp = await API.adminUpsertTeacher(payload);
+      if (resp.ok) {
+        alert('Сохранено');
+        Router.go('/admin/teachers');
+      } else {
+        alert('Не удалось сохранить');
+      }
+    });
+  },
+
+  async viewAdminTeacherNew(){
+    if (!(await this.ensureAdmin())) return;
+    this.renderTeacherForm({ teacher:{}, isNew:true });
+  },
+
+  async viewAdminTeacherEdit(_, encodedId){
+    if (!(await this.ensureAdmin())) return;
+    const teacherId = decodeURIComponent(encodedId);
+    let teacher = null;
+    try {
+      const r = await API.adminTeachers();
+      if (r.ok) teacher = (r.teachers || []).find(t=>t.id===teacherId) || null;
+    } catch {}
+    if (!teacher) {
+      $('#app').innerHTML = html`
+        <section class="section">
+          <div class="row space-between wrap">
+            <h2>Изменения базы учителей</h2>
+            <div class="list-controls"><a class="link" href="#/admin/teachers">← Назад к списку</a></div>
+          </div>
+          ${this.adminTabs('teachers')}
+          <div class="empty">Учитель с ID ${teacherId} не найден.</div>
+        </section>
+      `;
+      return;
+    }
+    this.renderTeacherForm({ teacher, isNew:false });
   },
 };
 
@@ -1049,7 +1329,12 @@ Router.add(/^\/search\?q=(.*)$/, (...a)=>App.listBySearch(...a));
 Router.add(/^\/teacher\/(t[\w\-]+)$/, (...a)=>App.teacherProfile(...a));
 Router.add(/^\/policy$/, (...a)=>App.viewPolicy(...a));
 Router.add(/^\/login$/, (...a)=>App.viewLogin(...a));
-Router.add(/^\/admin$/, (...a)=>App.viewAdmin(...a));
+Router.add(/^\/admin\/teachers\/edit\/(.+)$/, (...a)=>App.viewAdminTeacherEdit(...a));
+Router.add(/^\/admin\/teachers\/new$/, (...a)=>App.viewAdminTeacherNew(...a));
+Router.add(/^\/admin\/teachers$/, (...a)=>App.viewAdminTeachersList(...a));
+Router.add(/^\/admin\/bans$/, (...a)=>App.viewAdminBans(...a));
+Router.add(/^\/admin\/moderation$/, (...a)=>App.viewAdminModeration(...a));
+Router.add(/^\/admin$/, (...a)=>App.viewAdminHome(...a));
 
 /* ---------- boot ---------- */
 window.App=App; window.Router=Router; window.Auth=Auth;
