@@ -141,6 +141,21 @@ function ensureCommentsSchema() {
 ensureUsersCsvSchema();
 ensureCommentsSchema();
 
+/* --- In-memory caches --- */
+let TEACHERS = [];
+let RATINGS_CACHE = {};
+let COMMENTS_CACHE = [];
+let COMMENTS_BY_TEACHER = new Map();
+let COMMENTS_BY_ID = new Map();
+let COMMENT_MAX_ID = 0;
+let VOTE_ROWS_CACHE = [];
+let VOTE_LOOKUP = new Map();
+let VOTE_COUNTS = new Map();
+let USERS_CACHE = [];
+let USERS_BY_ID = new Map();
+let USERS_BY_EMAIL = new Map();
+let BANS = {};
+
 /* Teachers */
 function slugify(s) {
   const map={'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'E','Ж':'Zh','З':'Z','И':'I','Й':'i','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'Kh','Ц':'Ts','Ч':'Ch','Ш':'Sh','Щ':'Shch','Ы':'Y','Э':'E','Ю':'Yu','Я':'Ya','Ъ':'','Ь':''};
@@ -148,7 +163,7 @@ function slugify(s) {
   return t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
 }
 function pick(obj,...names){ for(const n of names){ if(obj[n]!=null && String(obj[n]).trim()!=='') return String(obj[n]).trim(); } return ''; }
-function readTeachers(){
+function loadTeachersFromDisk(){
   if (!fs.existsSync(TEACHERS_CSV)) return [];
   const rows=parseCSV(fs.readFileSync(TEACHERS_CSV,'utf-8'));
   if (rows.length===0) return [];
@@ -184,31 +199,47 @@ function readTeachers(){
   return out;
 }
 function writeTeachers(all) {
+  const normalized = all.map(t => ({
+    id: String(t.id || '').trim() || ('t-'+Date.now().toString(36)),
+    lastName: t.lastName||'',
+    firstName: t.firstName||'',
+    patronymic: t.patronymic||'',
+    department: t.department||'',
+    subjects: Array.isArray(t.subjects)
+      ? t.subjects.map(s=>String(s||'').trim()).filter(Boolean)
+      : String(t.subjects||'').split('|').map(s=>s.trim()).filter(Boolean),
+    photo: t.photo ? `/photo/${t.photo.replace(/^\/?photo\//,'')}` : (t.photo===null ? null : '')
+  }));
+
   const header = ['id','last_name','first_name','patronymic','department','subjects','photo'];
   let out = header.join(',')+'\n';
-  for (const t of all) {
-    const subjectsStr = Array.isArray(t.subjects) ? t.subjects.join('|') : (t.subjects || '');
-    const photo = (t.photo||'').replace(/^\/?photo\//,''); // храним имя файла
-    out += toCSVRow([t.id, t.lastName||'', t.firstName||'', t.patronymic||'', t.department||'', subjectsStr||'', photo||'']);
+  for (const t of normalized) {
+    const subjectsStr = t.subjects.length ? t.subjects.join('|') : '';
+    const photo = (t.photo||'').replace(/^\/?photo\//,'');
+    out += toCSVRow([t.id, t.lastName, t.firstName, t.patronymic, t.department, subjectsStr, photo]);
   }
   fs.writeFileSync(TEACHERS_CSV, out, 'utf-8');
+  TEACHERS = normalized.map(t => ({
+    ...t,
+    photo: t.photo ? t.photo : null
+  }));
 }
 function upsertTeacher(row) {
   const id = String(row.id || '').trim();
-  let all = readTeachers();
   if (id) {
-    const ix = all.findIndex(x=>x.id===id);
+    const ix = TEACHERS.findIndex(x=>x.id===id);
     if (ix>=0) {
-      all[ix] = { ...all[ix],
+      TEACHERS[ix] = {
+        ...TEACHERS[ix],
         lastName: row.lastName||'',
         firstName: row.firstName||'',
         patronymic: row.patronymic||'',
         department: row.department||'',
         subjects: Array.isArray(row.subjects)?row.subjects:(String(row.subjects||'').split('|').map(s=>s.trim()).filter(Boolean)),
-        photo: row.photo ? `/photo/${row.photo.replace(/^\/?photo\//,'')}` : (all[ix].photo||null)
+        photo: row.photo ? `/photo/${row.photo.replace(/^\/?photo\//,'')}` : (TEACHERS[ix].photo||null)
       };
     } else {
-      all.push({
+      TEACHERS.push({
         id,
         lastName: row.lastName||'',
         firstName: row.firstName||'',
@@ -220,7 +251,7 @@ function upsertTeacher(row) {
     }
   } else {
     const newId = 't-' + slugify(`${row.lastName||''}-${row.firstName||''}-${row.patronymic||''}`) || ('t-'+Date.now().toString(36));
-    all.push({
+    TEACHERS.push({
       id: newId,
       lastName: row.lastName||'',
       firstName: row.firstName||'',
@@ -230,31 +261,27 @@ function upsertTeacher(row) {
       photo: row.photo ? `/photo/${row.photo.replace(/^\/?photo\//,'')}` : null
     });
   }
-  writeTeachers(all);
-  TEACHERS = readTeachers();
+  writeTeachers(TEACHERS);
 }
 function deleteTeacherById(id) {
-  const all = readTeachers();
-  const filtered = all.filter(t=>t.id!==id);
-  writeTeachers(filtered);
+  TEACHERS = TEACHERS.filter(t=>t.id!==id);
+  writeTeachers(TEACHERS);
   // зачистим рейтинги и комменты по учителю
   const ratings = readRatingsMap();
   if (ratings[id]) { delete ratings[id]; writeRatingsMap(ratings); }
   const commentsAll = readCommentsAll().filter(c=>c.teacherId!==id);
-  let out='id,teacherId,ts,ts_iso,author,text,author_uid\n';
-  for (const c of commentsAll) out+=toCSVRow([c.id,c.teacherId,c.ts,c.ts_iso,c.author,c.text,c.author_uid||'']);
-  fs.writeFileSync(COMMENTS_CSV,out,'utf-8');
+  rebuildCommentsCache(commentsAll);
+  flushCommentsFile();
   // голоса по удалённым комментариям — удалим «мусор»
   const remainingIds = new Set(commentsAll.map(c=>String(c.id)));
   const votes = readVotesRows().filter(v => remainingIds.has(String(v.commentId)));
   writeVotesRows(votes);
-  TEACHERS = readTeachers();
 }
 
 /* Ratings/Comments */
 const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 
-function readRatingsMap(){
+function loadRatingsMapFromDisk(){
   const map={}; if(!fs.existsSync(RATINGS_CSV)) return map;
   const rows=parseCSV(fs.readFileSync(RATINGS_CSV,'utf-8'));
   if(!rows.length) return map;
@@ -265,7 +292,11 @@ function readRatingsMap(){
   }
   return map;
 }
+function readRatingsMap(){
+  return RATINGS_CACHE;
+}
 function writeRatingsMap(map){
+  RATINGS_CACHE = map;
   let out='teacherId,key,sum,count\n';
   for(const tid of Object.keys(map)) for(const key of Object.keys(map[tid])){
     const {sum,count}=map[tid][key] || {sum:0,count:0}; out += toCSVRow([tid,key,sum,count]);
@@ -273,7 +304,7 @@ function writeRatingsMap(map){
   fs.writeFileSync(RATINGS_CSV,out,'utf-8');
 }
 
-function readCommentsAll(){
+function loadCommentsFromDisk(){
   if(!fs.existsSync(COMMENTS_CSV)) return [];
   const rows=parseCSV(fs.readFileSync(COMMENTS_CSV,'utf-8'));
   if(!rows.length) return [];
@@ -282,42 +313,91 @@ function readCommentsAll(){
   for(let i=start;i<rows.length;i++){
     const [id,teacherId,ts,ts_iso,author,text,author_uid]=rows[i];
     if(!id) continue;
-    out.push({id:Number(id),teacherId,ts:Number(ts),ts_iso,author,text,author_uid:author_uid||''});
+    const numId = Number(id);
+    const numTs = Number(ts);
+    out.push({
+      id: Number.isFinite(numId) ? numId : 0,
+      teacherId: String(teacherId||''),
+      ts: Number.isFinite(numTs) ? numTs : 0,
+      ts_iso: ts_iso || new Date(Number.isFinite(numTs) ? numTs : Date.now()).toISOString(),
+      author: author || 'Аноним',
+      text: text || '',
+      author_uid: author_uid || ''
+    });
   }
   return out;
 }
+function rebuildCommentsCache(rows){
+  COMMENTS_CACHE = rows.map(r => ({
+    id: Number(r.id) || 0,
+    teacherId: String(r.teacherId||''),
+    ts: Number(r.ts) || 0,
+    ts_iso: r.ts_iso || new Date(Number(r.ts)||Date.now()).toISOString(),
+    author: r.author || 'Аноним',
+    text: r.text || '',
+    author_uid: r.author_uid || ''
+  }));
+  COMMENTS_BY_TEACHER = new Map();
+  COMMENTS_BY_ID = new Map();
+  COMMENT_MAX_ID = 0;
+  for (const c of COMMENTS_CACHE) {
+    const key = String(c.teacherId||'');
+    if (!COMMENTS_BY_TEACHER.has(key)) COMMENTS_BY_TEACHER.set(key, []);
+    COMMENTS_BY_TEACHER.get(key).push(c);
+    COMMENTS_BY_ID.set(String(c.id), c);
+    if (Number.isFinite(c.id)) COMMENT_MAX_ID = Math.max(COMMENT_MAX_ID, Number(c.id));
+  }
+}
+function flushCommentsFile(){
+  let out='id,teacherId,ts,ts_iso,author,text,author_uid\n';
+  for (const c of COMMENTS_CACHE) {
+    out += toCSVRow([c.id,c.teacherId,c.ts,c.ts_iso,c.author,c.text,c.author_uid||'']);
+  }
+  fs.writeFileSync(COMMENTS_CSV,out,'utf-8');
+}
+function readCommentsAll(){
+  return COMMENTS_CACHE.map(c=>({...c}));
+}
 function readCommentsFor(tid){
-  return readCommentsAll().filter(c=>c.teacherId===tid);
+  const list = COMMENTS_BY_TEACHER.get(String(tid)) || [];
+  return list.map(c=>({...c}));
 }
 function getCommentById(cid){
-  const all = readCommentsAll();
-  return all.find(c=>String(c.id)===String(cid)) || null;
+  const c = COMMENTS_BY_ID.get(String(cid));
+  return c ? {...c} : null;
 }
 function nextCommentId(){
-  if(!fs.existsSync(COMMENTS_CSV)) return 1;
-  const rows=parseCSV(fs.readFileSync(COMMENTS_CSV,'utf-8'));
-  if(!rows.length) return 1;
-  const start = dataStartIndex(rows, ['id,teacherid','id,teacher_id','teacherid,ts','teacher_id,ts']);
-  let maxId = 0;
-  for(let i=start;i<rows.length;i++){
-    const n = Number(rows[i][0]);
-    if (Number.isFinite(n)) maxId = Math.max(maxId, n);
-  }
-  return maxId + 1;
+  return COMMENT_MAX_ID + 1;
 }
 function appendCommentRow({teacherId,author='Аноним',text,author_uid=''}){
-  const ts=Date.now(); const id = nextCommentId();
-  fs.appendFileSync(COMMENTS_CSV,toCSVRow([id,teacherId,ts,new Date(ts).toISOString(),author,text,author_uid]),'utf-8');
+  const ts=Date.now();
+  const id = nextCommentId();
+  const entry = {
+    id,
+    teacherId: String(teacherId||''),
+    ts,
+    ts_iso: new Date(ts).toISOString(),
+    author: author || 'Аноним',
+    text: text || '',
+    author_uid: author_uid || ''
+  };
+  COMMENTS_CACHE.push(entry);
+  COMMENT_MAX_ID = id;
+  const key = entry.teacherId;
+  if (!COMMENTS_BY_TEACHER.has(key)) COMMENTS_BY_TEACHER.set(key, []);
+  COMMENTS_BY_TEACHER.get(key).push(entry);
+  COMMENTS_BY_ID.set(String(id), entry);
+  fs.appendFileSync(COMMENTS_CSV,toCSVRow([entry.id,entry.teacherId,entry.ts,entry.ts_iso,entry.author,entry.text,entry.author_uid]),'utf-8');
   return id;
 }
 function overall(r){ let tot=0,cnt=0; for(const k of CHARACTERISTICS_KEYS){ const v=r[k]; if(v&&v.count){ tot+=v.sum/v.count; cnt++; } } return cnt?tot/cnt:0; }
 
 /* Votes (likes/dislikes) */
-function readVotesRows(){
+function loadVotesRowsFromDisk(){
   if(!fs.existsSync(VOTES_CSV)) return [];
   const rows=parseCSV(fs.readFileSync(VOTES_CSV,'utf-8'));
   if(!rows.length) return [];
-  const start = dataStartIndex(rows, ['commentid,userid','commentid,userId']);
+  const start = dataStartIndex(rows, ['commentid,userid','commentid,userid,vote','commentid,userid,vote,ts']);
   const out=[];
   for(let i=start;i<rows.length;i++){
     const [commentId,userId,vote,ts]=rows[i];
@@ -328,38 +408,98 @@ function readVotesRows(){
   }
   return out;
 }
-function writeVotesRows(rows){
+function rebuildVotesCache(rows){
+  VOTE_ROWS_CACHE = rows.map(r => ({
+    commentId: String(r.commentId||''),
+    userId: String(r.userId||''),
+    vote: Number(r.vote||0),
+    ts: Number(r.ts||0) || Date.now()
+  }));
+  VOTE_LOOKUP = new Map();
+  VOTE_COUNTS = new Map();
+  for (const row of VOTE_ROWS_CACHE) {
+    const key = `${row.commentId}__${row.userId}`;
+    VOTE_LOOKUP.set(key, row);
+    let cnt = VOTE_COUNTS.get(row.commentId);
+    if (!cnt) {
+      cnt = { likes:0, dislikes:0 };
+      VOTE_COUNTS.set(row.commentId, cnt);
+    }
+    if (row.vote === 1) cnt.likes++;
+    else if (row.vote === -1) cnt.dislikes++;
+  }
+}
+function flushVotesFile(){
   let out='commentId,userId,vote,ts\n';
-  for(const r of rows){
+  for(const r of VOTE_ROWS_CACHE){
     out += toCSVRow([r.commentId, r.userId, r.vote, r.ts||Date.now()]);
   }
   fs.writeFileSync(VOTES_CSV, out, 'utf-8');
 }
-function getUserVote(commentId, userId){
-  const rows = readVotesRows();
-  const it = rows.find(r=>r.commentId===String(commentId) && r.userId===String(userId));
-  return it ? it.vote : 0;
+function readVotesRows(){
+  return VOTE_ROWS_CACHE.map(r=>({...r}));
 }
-function setUserVote(commentId, userId, newVote){
-  const rows = readVotesRows();
-  const ix = rows.findIndex(r=>r.commentId===String(commentId) && r.userId===String(userId));
-  if (newVote===0){
-    if (ix>=0){ rows.splice(ix,1); writeVotesRows(rows); }
-  }else{
-    if (ix>=0){ rows[ix].vote=newVote; rows[ix].ts=Date.now(); }
-    else rows.push({commentId:String(commentId), userId:String(userId), vote:newVote, ts:Date.now()});
-    writeVotesRows(rows);
+function writeVotesRows(rows){
+  rebuildVotesCache(rows);
+  flushVotesFile();
+}
+function adjustVoteCounts(commentId, prevVote, newVote){
+  const key = String(commentId);
+  let cnt = VOTE_COUNTS.get(key);
+  if (!cnt) {
+    cnt = { likes:0, dislikes:0 };
+    VOTE_COUNTS.set(key, cnt);
+  }
+  if (prevVote === 1) cnt.likes = Math.max(0, (cnt.likes||0) - 1);
+  else if (prevVote === -1) cnt.dislikes = Math.max(0, (cnt.dislikes||0) - 1);
+  if (newVote === 1) cnt.likes = (cnt.likes||0) + 1;
+  else if (newVote === -1) cnt.dislikes = (cnt.dislikes||0) + 1;
+  if (!cnt.likes && !cnt.dislikes) {
+    VOTE_COUNTS.delete(key);
+  } else {
+    VOTE_COUNTS.set(key, cnt);
   }
 }
+function getUserVote(commentId, userId){
+  const row = VOTE_LOOKUP.get(`${String(commentId)}__${String(userId)}`);
+  return row ? row.vote : 0;
+}
+function setUserVote(commentId, userId, newVote){
+  const key = `${String(commentId)}__${String(userId)}`;
+  const existing = VOTE_LOOKUP.get(key);
+  if (newVote === 0){
+    if (!existing) return;
+    adjustVoteCounts(existing.commentId, existing.vote, 0);
+    VOTE_LOOKUP.delete(key);
+    const ix = VOTE_ROWS_CACHE.indexOf(existing);
+    if (ix>=0) VOTE_ROWS_CACHE.splice(ix,1);
+  } else {
+    if (existing){
+      if (existing.vote !== newVote){
+        adjustVoteCounts(existing.commentId, existing.vote, newVote);
+        existing.vote = newVote;
+      }
+      existing.ts = Date.now();
+    } else {
+      const row = { commentId:String(commentId), userId:String(userId), vote:newVote, ts:Date.now() };
+      VOTE_ROWS_CACHE.push(row);
+      VOTE_LOOKUP.set(key, row);
+      adjustVoteCounts(row.commentId, 0, newVote);
+    }
+  }
+  flushVotesFile();
+}
 function countVotesForCommentBulk(commentIds, myUserId=null){
-  const set = new Set(commentIds.map(String));
-  const rows = readVotesRows().filter(r=>set.has(r.commentId));
   const counts = {}; const myVotes = {};
-  for(const r of rows){
-    const c = (counts[r.commentId] ||= {likes:0,dislikes:0});
-    if (r.vote===1) c.likes++;
-    else if (r.vote===-1) c.dislikes++;
-    if (myUserId && r.userId===String(myUserId)) myVotes[r.commentId] = r.vote;
+  const userIdStr = myUserId ? String(myUserId) : null;
+  for (const cid of commentIds) {
+    const key = String(cid);
+    const cnt = VOTE_COUNTS.get(key);
+    counts[key] = { likes: cnt?.likes || 0, dislikes: cnt?.dislikes || 0 };
+    if (userIdStr) {
+      const row = VOTE_LOOKUP.get(`${key}__${userIdStr}`);
+      if (row) myVotes[key] = row.vote;
+    }
   }
   return {counts, myVotes};
 }
@@ -375,7 +515,7 @@ function parseCookies(req){
   });
   return out;
 }
-function readUsersRows(){
+function loadUsersRowsFromDisk(){
   if (!fs.existsSync(USERS_CSV)) return [];
   const rows = parseCSV(fs.readFileSync(USERS_CSV,'utf-8'));
   if (!rows.length) return [];
@@ -388,29 +528,57 @@ function readUsersRows(){
   }
   return out;
 }
-function writeUsersRows(rows){
+function rebuildUsersCache(rows){
+  const normalized = rows.map(r => ({
+    id: String(r.id||''),
+    email: r.email || '',
+    username: r.username || '',
+    created_ts: String(r.created_ts||''),
+    last_login_ts: String(r.last_login_ts||''),
+    login_count: String(r.login_count||'0'),
+    comment_count: String(r.comment_count||'0'),
+    rating_count: String(r.rating_count||'0'),
+    cast_likes: String(r.cast_likes||'0'),
+    cast_dislikes: String(r.cast_dislikes||'0'),
+    received_likes: String(r.received_likes||'0'),
+    received_dislikes: String(r.received_dislikes||'0')
+  }));
+  USERS_CACHE = normalized;
+  USERS_BY_ID = new Map();
+  USERS_BY_EMAIL = new Map();
+  for (const u of USERS_CACHE) {
+    USERS_BY_ID.set(String(u.id), u);
+    USERS_BY_EMAIL.set(String(u.email||'').toLowerCase(), u);
+  }
+}
+function flushUsersFile(){
   const header = ['id','email','username','created_ts','last_login_ts','login_count','comment_count','rating_count','cast_likes','cast_dislikes','received_likes','received_dislikes'];
   let out = header.join(',')+'\n';
-  for(const r of rows){
+  for(const r of USERS_CACHE){
     out += toCSVRow(header.map(h=>r[h] ?? ''));
   }
   fs.writeFileSync(USERS_CSV, out, 'utf-8');
 }
+function readUsersRows(){
+  return USERS_CACHE.map(r=>({...r}));
+}
+function writeUsersRows(rows){
+  rebuildUsersCache(rows);
+  flushUsersFile();
+}
 function findUserByEmail(email){
-  const rows = readUsersRows();
-  const lower = String(email||'').toLowerCase();
-  return rows.find(r=>String(r.email||'').toLowerCase()===lower) || null;
+  const user = USERS_BY_EMAIL.get(String(email||'').toLowerCase());
+  return user ? {...user} : null;
 }
 function findUserById(uid){
-  const rows = readUsersRows();
-  return rows.find(r=>r.id===uid) || null;
+  const user = USERS_BY_ID.get(String(uid));
+  return user ? {...user} : null;
 }
 function upsertUserOnLogin(email){
   const now = Date.now();
   const username = String(email).split('@')[0];
-  const rows = readUsersRows();
   const lower = String(email||'').toLowerCase();
-  let found = rows.find(r=>String(r.email||'').toLowerCase()===lower);
+  let found = USERS_BY_EMAIL.get(lower);
   if (!found){
     found = {
       id: 'u-' + crypto.randomBytes(8).toString('hex'),
@@ -426,7 +594,9 @@ function upsertUserOnLogin(email){
       received_likes: '0',
       received_dislikes: '0'
     };
-    rows.push(found);
+    USERS_CACHE.push(found);
+    USERS_BY_ID.set(found.id, found);
+    USERS_BY_EMAIL.set(lower, found);
   } else {
     found.username = username;
     found.last_login_ts = String(now);
@@ -436,21 +606,19 @@ function upsertUserOnLogin(email){
     found.received_likes = String(Number(found.received_likes||0));
     found.received_dislikes = String(Number(found.received_dislikes||0));
   }
-  writeUsersRows(rows);
-  return found;
+  flushUsersFile();
+  return {...found};
 }
 function incUserStats(uid, {comments=0, ratings=0, cast_like=0, cast_dislike=0, recv_like=0, recv_dislike=0}={}){
-  const rows = readUsersRows();
-  const ix = rows.findIndex(r=>r.id===uid);
-  if (ix<0) return;
-  const r = rows[ix];
-  r.comment_count = String(Number(r.comment_count||0) + comments);
-  r.rating_count  = String(Number(r.rating_count||0)  + ratings);
-  r.cast_likes    = String(Number(r.cast_likes||0)    + cast_like);
-  r.cast_dislikes = String(Number(r.cast_dislikes||0) + cast_dislike);
-  r.received_likes    = String(Number(r.received_likes||0)    + recv_like);
-  r.received_dislikes = String(Number(r.received_dislikes||0) + recv_dislike);
-  writeUsersRows(rows);
+  const user = USERS_BY_ID.get(String(uid));
+  if (!user) return;
+  user.comment_count = String(Number(user.comment_count||0) + comments);
+  user.rating_count  = String(Number(user.rating_count||0)  + ratings);
+  user.cast_likes    = String(Number(user.cast_likes||0)    + cast_like);
+  user.cast_dislikes = String(Number(user.cast_dislikes||0) + cast_dislike);
+  user.received_likes    = String(Number(user.received_likes||0)    + recv_like);
+  user.received_dislikes = String(Number(user.received_dislikes||0) + recv_dislike);
+  flushUsersFile();
 }
 
 const SESSIONS = new Map();     // token -> { userId, created, ip, ua }
@@ -605,7 +773,7 @@ function isAdminUser(u) {
   return ADMIN_EMAILS.has(email);
 }
 
-function readBansMap() {
+function loadBansMapFromDisk() {
   const map = {};
   if (!fs.existsSync(BANS_CSV)) return map;
   const rows = parseCSV(fs.readFileSync(BANS_CSV, 'utf-8'));
@@ -619,6 +787,7 @@ function readBansMap() {
   return map;
 }
 function writeBansMap(map) {
+  BANS = map;
   let out = 'userId,is_banned,reason,ts\n';
   for (const uid of Object.keys(map)) {
     const r = map[uid] || { is_banned:false, reason:'', ts: Date.now() };
@@ -626,8 +795,17 @@ function writeBansMap(map) {
   }
   fs.writeFileSync(BANS_CSV, out, 'utf-8');
 }
-let BANS = readBansMap();
 function isUserBanned(userId) { return !!(userId && BANS[String(userId)]?.is_banned); }
+
+function initializeCaches(){
+  TEACHERS = loadTeachersFromDisk();
+  RATINGS_CACHE = loadRatingsMapFromDisk();
+  rebuildCommentsCache(loadCommentsFromDisk());
+  rebuildVotesCache(loadVotesRowsFromDisk());
+  rebuildUsersCache(loadUsersRowsFromDisk());
+  BANS = loadBansMapFromDisk();
+}
+initializeCaches();
 
 /* API — публичные */
 app.get('/api/departments',(req,res)=>{
@@ -810,8 +988,7 @@ function requireAdmin(req,res,next){
 }
 
 function deleteCommentById(commentId){
-  const all = readCommentsAll();
-  const target = all.find(c => String(c.id)===String(commentId));
+  const target = COMMENTS_BY_ID.get(String(commentId));
   if (!target) return { ok:false, error:'not_found' };
 
   // считаем лайки/дизлайки по комменту для корректировки стат
@@ -827,13 +1004,9 @@ function deleteCommentById(commentId){
     });
   }
 
-  // сохраняем comments.csv без этого комментария
-  let out = 'id,teacherId,ts,ts_iso,author,text,author_uid\n';
-  for (const c of all) {
-    if (String(c.id)===String(commentId)) continue;
-    out += toCSVRow([c.id,c.teacherId,c.ts,c.ts_iso,c.author,c.text,c.author_uid||'']);
-  }
-  fs.writeFileSync(COMMENTS_CSV, out, 'utf-8');
+  const remaining = COMMENTS_CACHE.filter(c => String(c.id) !== String(commentId));
+  rebuildCommentsCache(remaining);
+  flushCommentsFile();
 
   // чистим голоса по нему
   const votes = readVotesRows().filter(v => String(v.commentId)!==String(commentId));
@@ -969,9 +1142,9 @@ app.post('/api/admin/user/ban', requireAdmin, express.json(), (req,res)=>{
   if (!u && email) u = findUserByEmail(String(email).toLowerCase());
   if (!u) return res.status(404).json({ error:'user_not_found' });
 
-  BANS = readBansMap();
-  BANS[String(u.id)] = { is_banned: !!banned, reason: String(reason||''), ts: Date.now() };
-  writeBansMap(BANS);
+  const updated = { ...BANS };
+  updated[String(u.id)] = { is_banned: !!banned, reason: String(reason||''), ts: Date.now() };
+  writeBansMap(updated);
   return res.json({ ok:true, user: { id:u.id, email:u.email, is_banned: !!banned } });
 });
 
@@ -1180,9 +1353,6 @@ app.get('/api/user/stats', (req,res)=>{
     }
   });
 });
-
-/* Cache */
-let TEACHERS = readTeachers();
 
 app.get(/^\/(?!.*\.).*$/, (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
