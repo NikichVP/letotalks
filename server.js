@@ -637,19 +637,27 @@ function setSessionCookie(res, token){
 function clearSessionCookie(res){
   res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
 }
-function createSession(userId, req){
-  const token = 'st-' + crypto.randomBytes(18).toString('hex');
-  SESSIONS.set(token, { userId, created:Date.now(), ip:getClientIp(req), ua:req.headers['user-agent']||'' });
-  return token;
+function createSession(userId, req) {
+    const token = 'st-' + crypto.randomBytes(18).toString('hex');
+    const ip = getClientIp(req);
+    const ua = req.headers['user-agent'] || '';
+    SESSIONS.set(token, { userId, created: Date.now(), ip, ua });
+    return token;
 }
-function getUserFromRequest(req){
-  const cookies = parseCookies(req);
-  const token = cookies[SESSION_COOKIE];
-  if (!token) return null;
-  const s = SESSIONS.get(token);
-  if (!s) return null;
-  const u = findUserById(s.userId);
-  return u || null;
+
+
+function getUserFromRequest(req) {
+    const cookies = parseCookies(req);
+    const token = cookies[SESSION_COOKIE];
+    if (!token) return null;
+    const session = SESSIONS.get(token);
+    if (!session) return null;
+    const ip = getClientIp(req);
+    const ua = req.headers['user-agent'] || '';
+    // простая проверка: ip и ua должны совпадать с сохранёнными
+    if (session.ip !== ip || session.ua !== ua) return null;
+    const user = findUserById(session.userId);
+    return user || null;
 }
 
 /* Anti-abuse limiters */
