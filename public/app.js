@@ -864,7 +864,7 @@ const App = {
 
     $('#copyAll')?.addEventListener('click', async ()=>{
       try{
-        await navigator.clipboard.writeText(`Временный адрес: ${$email.textContent}\nКод: ${$code.textContent}`);
+        await navigator.clipboard.writeText(`${$email.textContent} ${$code.textContent}`);
         $status.textContent = 'Скопировано!';
         setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
       }catch{}
