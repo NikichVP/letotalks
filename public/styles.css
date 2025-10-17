@@ -294,7 +294,17 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .section{margin-bottom:28px}
 .section h2{margin:0 0 12px;font-size:22px;color:var(--blue-700)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.card{background:#fff;border:1px solid var(--border);border-radius:18px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.card {
+  background: #fff;
+  border-radius: 18px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  border: 1px solid var(--border);
+  padding: 16px;
+  min-width: 230px;
+  max-width: 100%;
+  box-sizing: border-box;
+  /* НЕ position: absolute; */
+}
 .card:hover{box-shadow:0 6px 16px rgba(0,0,0,.08);transform:translateY(-1px);transition:.2s}
 
 /* admin */
@@ -417,3 +427,95 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .popover .stats{padding-left:16px;margin:8px 0 6px}
 .popover .muted{color:var(--muted)}
 table th, table td { border-bottom:1px solid var(--border); padding:8px; text-align:left; font-size:14px }
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 220px;
+  padding: 10px;
+  background: var(--card, #fff);
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+}
+
+/* Заголовок + кнопка */
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+/* Контейнер учителя */
+.teacher-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+/* Инфо о преподавателе */
+.teacher-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tname {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.tdept {
+  color: var(--muted, #64748b);
+  font-size: 13px;
+}
+
+/* Рейтинг: звёздочка + число */
+.rating {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 15px;
+}
+
+.rating .star {
+  color: var(--gold-500, #ffc237);
+  margin-right: 1px;
+  font-size: 1.2em;
+}
+
+/* Кнопка */
+.btn.small {
+  min-width: 98px;
+  white-space: nowrap;
+}
+
+/* Адаптив для мобильных */
+@media (max-width: 600px) {
+  .grid, .faculty-grid, .section.grid {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+}
+
+.faculty-grid, .section.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+  align-items: stretch;
+  margin-bottom: 28px;
+}
+
+/* для универсальности можно сделать так: */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+  align-items: stretch;
+}
