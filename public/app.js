@@ -343,61 +343,65 @@ const App = {
     });
   },
 
-  async viewHome(){
-    await this.mountNavbar();
-    this.ALL_TEACHERS = await API.teachers();
+async viewHome(){
+  await this.mountNavbar();
+  this.ALL_TEACHERS = await API.teachers();
 
-    const charCards = CHARACTERISTICS.map(c=>{
-      const sorted = this.sortByValueThenAlpha([...this.ALL_TEACHERS], t=>characteristicAvg(t,c.key)).slice(0,3);
-      const preview = sorted.map(t=>html`
-        <div class="row" style="gap:10px;padding:8px 0">
-          <div class="portrait"><img src="${t.photo||''}" alt=""></div>
-          <div style="flex:1">
-            <div class="tname">${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</div>
-            <div class="tdept">${t.department}</div>
-          </div>
-          <div>${fmtStars(characteristicAvg(t,c.key))}</div>
-        </div>`).join('');
-      return html`
-        <div class="card">
-          <div class="row space-between">
-            <h3 style="margin:0">${c.name}</h3>
-            <a class="btn small primary" href="#/top/${c.key}">Смотреть всех</a>
-          </div>
+  const charCards = CHARACTERISTICS.map(c=>{
+    const sorted = this.sortByValueThenAlpha([...this.ALL_TEACHERS], t=>characteristicAvg(t,c.key)).slice(0,3);
+    const preview = sorted.map(t=>html`
+      <div class="row" style="gap:10px;padding:8px 0">
+        <div class="portrait"><img src="${t.photo||''}" alt=""></div>
+        <div style="flex:1">
+          <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+          <div class="tdept">${t.department}</div>
+        </div>
+        <div>${fmtStars(characteristicAvg(t,c.key))}</div>
+      </div>`).join('');
+    return html`
+      <div class="card">
+        <div class="card-header">
+          <h3>${c.name}</h3>
+          <a class="btn small primary" href="#/top/${c.key}">Смотреть всех</a>
+        </div>
+        <div class="card-content">
           <div class="hr"></div>
           ${preview || '<div class="empty">Пока нет данных</div>'}
-        </div>`;
-    }).join('');
+        </div>
+      </div>`;
+  }).join('');
 
-    const deps = await API.departments();
-    const deptCards = deps.map(d=>{
-      const list = this.sortByValueThenAlpha(this.ALL_TEACHERS.filter(t=>t.department===d), t=>overall(t)).slice(0,3);
-      if (!list.length) return '';
-      const preview = list.map(t=>html`
-        <div class="row" style="gap:10px;padding:8px 0">
-          <div class="portrait"><img src="${t.photo||''}" alt=""></div>
-          <div style="flex:1">
-            <div class="tname">${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</div>
-            <div class="tdept">${t.department}</div>
-          </div>
-          <div>${fmtStars(overall(t))}</div>
-        </div>`).join('');
-      return html`
-        <div class="card">
-          <div class="row space-between">
-            <h3 style="margin:0">${d}</h3>
-            <a class="btn small primary" href="#/department/${encodeURIComponent(d)}">Все учителя</a>
-          </div>
+  const deps = await API.departments();
+  const deptCards = deps.map(d=>{
+    const list = this.sortByValueThenAlpha(this.ALL_TEACHERS.filter(t=>t.department===d), t=>overall(t)).slice(0,3);
+    if (!list.length) return '';
+    const preview = list.map(t=>html`
+      <div class="row" style="gap:10px;padding:8px 0">
+        <div class="portrait"><img src="${t.photo||''}" alt=""></div>
+        <div style="flex:1">
+          <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+          <div class="tdept">${t.department}</div>
+        </div>
+        <div>${fmtStars(overall(t))}</div>
+      </div>`).join('');
+    return html`
+      <div class="card">
+        <div class="card-header">
+          <h3>${d}</h3>
+          <a class="btn small primary" href="#/department/${encodeURIComponent(d)}">Все учителя</a>
+        </div>
+        <div class="card-content">
           <div class="hr"></div>
           ${preview}
-        </div>`;
-    }).join('');
+        </div>
+      </div>`;
+  }).join('');
 
-    $('#app').innerHTML = html`
-      <section class="section"><h2>Топ по характеристикам</h2><div class="grid">${charCards}</div></section>
-      <section class="section"><h2>По кафедрам</h2><div class="grid">${deptCards}</div></section>
-    `;
-  },
+  $('#app').innerHTML = html`
+    <section class="section"><h2>Топ по характеристикам</h2><div class="grid">${charCards}</div></section>
+    <section class="section"><h2>По кафедрам</h2><div class="grid">${deptCards}</div></section>
+  `;
+},
 
   async listAll(){
     await this.mountNavbar();
