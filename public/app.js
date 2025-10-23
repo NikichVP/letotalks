@@ -353,7 +353,7 @@ const App = {
         <div class="row" style="gap:10px;padding:8px 0">
           <div class="portrait"><img src="${t.photo||''}" alt=""></div>
           <div style="flex:1">
-            <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+            <div class="tname">${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</div>
             <div class="tdept">${t.department}</div>
           </div>
           <div>${fmtStars(characteristicAvg(t,c.key))}</div>
@@ -377,7 +377,7 @@ const App = {
         <div class="row" style="gap:10px;padding:8px 0">
           <div class="portrait"><img src="${t.photo||''}" alt=""></div>
           <div style="flex:1">
-            <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+            <div class="tname">${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</div>
             <div class="tdept">${t.department}</div>
           </div>
           <div>${fmtStars(overall(t))}</div>
@@ -864,7 +864,7 @@ const App = {
 
     $('#copyAll')?.addEventListener('click', async ()=>{
       try{
-        await navigator.clipboard.writeText(`${$email.textContent} ${$code.textContent}`);
+        await navigator.clipboard.writeText(`Временный адрес: ${$email.textContent}\nКод: ${$code.textContent}`);
         $status.textContent = 'Скопировано!';
         setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
       }catch{}
