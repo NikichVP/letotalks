@@ -1,510 +1,435 @@
-// server.js — Node 18+ : npm i express
+// server.js — Node 18+ : npm i express better-sqlite3 bcrypt helmet express-rate-limit
 // http://localhost:3000
 //
-// CSV:
-//  data/letovo_teachers.csv
-//  data/comments.csv          (может быть БЕЗ заголовка; поддерживает author_uid)
-//  data/ratings.csv
-//  data/login_events.csv
-//  data/users.csv             ← учёт пользователей/статистики (+полученные/поставленные лайки/дизлайки)
-//  data/comment_votes.csv     ← голосования по комментариям (commentId,userId,vote)
-//  data/admins.csv            ← список админов (email[,role]) — неизменяемый во время работы сервера
-//  data/banned_users.csv      ← баны на текстовые комментарии (userId,is_banned,reason,ts)
-//
+// SQLite Database: letotalks.db
 // Фото: photos/  -> /photo/<file>
 
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcrypt');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 const ROOT_DIR    = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const DATA_DIR    = path.join(ROOT_DIR, 'data');
 const PHOTO_DIR   = path.join(ROOT_DIR, 'photos');
-
-const TEACHERS_CSV = path.join(DATA_DIR, 'letovo_teachers.csv');
-const COMMENTS_CSV = path.join(DATA_DIR, 'comments.csv');
-const RATINGS_CSV  = path.join(DATA_DIR, 'ratings.csv');
-const LOGIN_CSV    = path.join(DATA_DIR, 'login_events.csv');
-const USERS_CSV    = path.join(DATA_DIR, 'users.csv');
-const VOTES_CSV    = path.join(DATA_DIR, 'comment_votes.csv');
-
-const ADMINS_CSV   = path.join(DATA_DIR, 'admins.csv');
-const BANS_CSV     = path.join(DATA_DIR, 'banned_users.csv');
+const DB_PATH     = path.join(ROOT_DIR, 'letotalks.db');
 
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
 const SESSION_COOKIE = 'lt_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 дней
 const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут
 const AUTH_CHECK_INTERVAL_MS = 5000;
+const MAX_SESSIONS_PER_USER = 5; // Максимум одновременных сессий
+const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый час
+const BCRYPT_ROUNDS = 12;
+const MAX_LOGIN_ATTEMPTS = 10; // За час
+const SECURITY_HEADERS_ENABLED = true;
 
+// === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
+if (SECURITY_HEADERS_ENABLED) {
+  app.use(helmet({
+    contentSecurityPolicy: false, // Отключаем CSP, чтобы стили работали
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true
+    },
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+  }));
+}
+
+// === БЕЗОПАСНОСТЬ: Rate Limiting ===
+// Оставляем только для авторизации - защита от брутфорса
+const authLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 час
+  max: MAX_LOGIN_ATTEMPTS,
+  message: 'Слишком много попыток входа, попробуйте через час',
+  skipSuccessfulRequests: true,
+  trustProxy: false
+});
+
+// Глобальный rate limiter убран - не мешает нормальной работе API
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(PUBLIC_DIR));
 app.use('/photo', express.static(PHOTO_DIR));
 
-function ensureDirsAndFiles() {
+// Проверка и инициализация
+function ensureDirsAndDb() {
   if (!fs.existsSync(DATA_DIR))  fs.mkdirSync(DATA_DIR, {recursive:true});
   if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR, {recursive:true});
-  if (!fs.existsSync(COMMENTS_CSV)) fs.writeFileSync(COMMENTS_CSV, 'id,teacherId,ts,ts_iso,author,text,author_uid\n');
-  if (!fs.existsSync(RATINGS_CSV))  fs.writeFileSync(RATINGS_CSV,  'teacherId,key,sum,count\n');
-  if (!fs.existsSync(LOGIN_CSV))    fs.writeFileSync(LOGIN_CSV,    'ts,ts_iso,action,email,ip,ua\n');
-  if (!fs.existsSync(USERS_CSV))    fs.writeFileSync(USERS_CSV,
-    'id,email,username,created_ts,last_login_ts,login_count,comment_count,rating_count,cast_likes,cast_dislikes,received_likes,received_dislikes\n'
-  );
-  if (!fs.existsSync(VOTES_CSV))    fs.writeFileSync(VOTES_CSV,    'commentId,userId,vote,ts\n');
-  if (!fs.existsSync(ADMINS_CSV))   fs.writeFileSync(ADMINS_CSV,   'email,role\n', 'utf-8'); // создаём пустой список
-  if (!fs.existsSync(BANS_CSV))     fs.writeFileSync(BANS_CSV,     'userId,is_banned,reason,ts\n', 'utf-8');
+  
+  if (!fs.existsSync(DB_PATH)) {
+    console.error('❌ База данных не найдена!');
+    console.log('Запустите миграцию: npm run migrate');
+    process.exit(1);
+  }
 }
-ensureDirsAndFiles();
+ensureDirsAndDb();
 
-/* --- CSV utils & migrations --- */
-function parseCSV(text) {
-  const rows = []; let row=[], field='', inQ=false;
-  for (let i=0;i<text.length;i++){
-    const ch=text[i], nx=text[i+1];
-    if(inQ){
-      if(ch==='"' && nx==='"'){ field+='"'; i++; }
-      else if(ch==='"'){ inQ=false; }
-      else { field+=ch; }
-    }else{
-      if(ch==='"'){ inQ=true; }
-      else if(ch===','){ row.push(field); field=''; }
-      else if(ch==='\n'){ row.push(field); rows.push(row.map(x=>x.trim())); row=[]; field=''; }
-      else if(ch!=='\r'){ field+=ch; }
-    }
-  }
-  if (field.length || row.length){ row.push(field); rows.push(row.map(x=>x.trim())); }
-  return rows;
-}
-function toCSVRow(vals){
-  return vals.map(v=>{ const s=String(v??''); return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s; }).join(',')+'\n';
-}
-function dataStartIndex(rows, headerHints){
-  if (!rows.length) return 0;
-  const joined = rows[0].map(x=>String(x||'').toLowerCase()).join(',');
-  for (const h of headerHints){
-    if (joined.includes(h)) return 1;
-  }
-  return 0;
+// Подключаемся к БД
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+console.log('⚡ Инициализация сервера...');
+console.log('✅ База данных подключена');
+
+// === БЕЗОПАСНОСТЬ: Создание таблиц для сессий и логов ===
+function initSecurityTables() {
+  // Таблица сессий
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_id TEXT NOT NULL,
+      created_ts INTEGER NOT NULL,
+      last_activity_ts INTEGER NOT NULL,
+      expires_ts INTEGER NOT NULL,
+      ip TEXT,
+      user_agent TEXT,
+      is_active INTEGER DEFAULT 1,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_ts)`);
+  
+  // Таблица логов безопасности
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS security_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      ts_iso TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      user_id TEXT,
+      email TEXT,
+      ip TEXT,
+      user_agent TEXT,
+      details TEXT,
+      severity TEXT DEFAULT 'info'
+    )
+  `);
+  
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_ts ON security_log(ts)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_user ON security_log(user_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_type ON security_log(event_type)`);
+  
+  // Таблица попыток входа (для защиты от брутфорса)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS login_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      success INTEGER DEFAULT 0
+    )
+  `);
+  
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email, ts)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, ts)`);
 }
 
-function ensureUsersCsvSchema() {
-  const wantedHeader = ['id','email','username','created_ts','last_login_ts','login_count','comment_count','rating_count','cast_likes','cast_dislikes','received_likes','received_dislikes'];
-  if (!fs.existsSync(USERS_CSV)) {
-    fs.writeFileSync(USERS_CSV, wantedHeader.join(',')+'\n');
-    return;
-  }
-  const text = fs.readFileSync(USERS_CSV, 'utf-8');
-  const rows = parseCSV(text);
-  if (!rows.length) {
-    fs.writeFileSync(USERS_CSV, wantedHeader.join(',')+'\n');
-    return;
-  }
-  const header = rows[0];
-  const haveAll = wantedHeader.every(h=>header.includes(h));
-  if (haveAll) return;
+initSecurityTables();
 
-  const idx = Object.fromEntries(header.map((h,i)=>[h,i]));
-  let out = wantedHeader.join(',')+'\n';
-  for (let i=1;i<rows.length;i++){
-    const r = rows[i] || [];
-    out += toCSVRow([
-      r[idx.id]||'', r[idx.email]||'', r[idx.username]||'',
-      r[idx.created_ts]||'', r[idx.last_login_ts]||'', r[idx.login_count]||'0',
-      r[idx.comment_count]||'0', r[idx.rating_count]||'0',
-      '0','0','0','0'
-    ]);
-  }
-  fs.writeFileSync(USERS_CSV, out, 'utf-8');
+// === БЕЗОПАСНОСТЬ: Функции для работы с хешированными токенами ===
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function ensureCommentsSchema() {
-  if (!fs.existsSync(COMMENTS_CSV)) return;
-  const text = fs.readFileSync(COMMENTS_CSV, 'utf-8');
-  const rows = parseCSV(text);
-  if (!rows.length) return;
-  const header = rows[0];
-  if (header.includes('author_uid')) return;
-  // upgrade: append empty author_uid column
-  const newHeader = [...header, 'author_uid'];
-  let out = newHeader.join(',')+'\n';
-  for (let i=1;i<rows.length;i++){
-    const r = rows[i] || [];
-    out += toCSVRow([...r, '']);
-  }
-  fs.writeFileSync(COMMENTS_CSV, out, 'utf-8');
+function generateSecureToken() {
+  return crypto.randomBytes(32).toString('base64url');
 }
-ensureUsersCsvSchema();
-ensureCommentsSchema();
+
+function logSecurityEvent(eventType, details = {}) {
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO security_log (ts, ts_iso, event_type, user_id, email, ip, user_agent, details, severity)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      Date.now(),
+      new Date().toISOString(),
+      eventType,
+      details.userId || null,
+      details.email || null,
+      details.ip || null,
+      details.userAgent || null,
+      JSON.stringify(details),
+      details.severity || 'info'
+    );
+  } catch (err) {
+    console.error('Ошибка записи security log:', err);
+  }
+}
+
+function recordLoginAttempt(email, ip, success) {
+  try {
+    const stmt = db.prepare('INSERT INTO login_attempts (email, ip, ts, success) VALUES (?, ?, ?, ?)');
+    stmt.run(email, ip, Date.now(), success ? 1 : 0);
+  } catch (err) {
+    console.error('Ошибка записи login attempt:', err);
+  }
+}
+
+function getRecentLoginAttempts(email, ip, windowMs = 3600000) {
+  const cutoff = Date.now() - windowMs;
+  const stmt = db.prepare(`
+    SELECT COUNT(*) as count, SUM(success) as successful
+    FROM login_attempts
+    WHERE (email = ? OR ip = ?) AND ts > ?
+  `);
+  return stmt.get(email, ip, cutoff) || { count: 0, successful: 0 };
+}
 
 /* --- In-memory caches --- */
-let TEACHERS = [];
-let RATINGS_CACHE = {};
-let COMMENTS_CACHE = [];
-let COMMENTS_BY_TEACHER = new Map();
-let COMMENTS_BY_ID = new Map();
-let COMMENT_MAX_ID = 0;
-let VOTE_ROWS_CACHE = [];
-let VOTE_LOOKUP = new Map();
-let VOTE_COUNTS = new Map();
-let USERS_CACHE = [];
-let USERS_BY_ID = new Map();
-let USERS_BY_EMAIL = new Map();
-let BANS = {};
+let ADMIN_EMAILS = new Set();
+const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
 
 /* Teachers */
-function slugify(s) {
-  const map={'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'E','Ж':'Zh','З':'Z','И':'I','Й':'i','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'Kh','Ц':'Ts','Ч':'Ch','Ш':'Sh','Щ':'Shch','Ы':'Y','Э':'E','Ю':'Yu','Я':'Ya','Ъ':'','Ь':''};
-  const t=s.replace(/[А-ЯЁ]/g,m=>map[m]??m).replace(/[а-яё]/g,m=>(map[m.toUpperCase()]??m).toLowerCase());
-  return t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+function loadAdminEmails() {
+  const stmt = db.prepare('SELECT email FROM admins');
+  const rows = stmt.all();
+  ADMIN_EMAILS = new Set(rows.map(r => r.email.toLowerCase()));
 }
-function pick(obj,...names){ for(const n of names){ if(obj[n]!=null && String(obj[n]).trim()!=='') return String(obj[n]).trim(); } return ''; }
-function loadTeachersFromDisk(){
-  if (!fs.existsSync(TEACHERS_CSV)) return [];
-  const rows=parseCSV(fs.readFileSync(TEACHERS_CSV,'utf-8'));
-  if (rows.length===0) return [];
-  const header=rows[0].map(h=>h.trim());
+loadAdminEmails();
 
-  const out=[];
-  for(let i=1;i<rows.length;i++){
-    const r=rows[i]; if(!r||r.length===0) continue;
-    const rowObj=Object.fromEntries(header.map((h,ix)=>[h, r[ix]??'']));
-
-    let fullName = pick(rowObj,'full_name','fullName','ФИО');
-    let lastName = pick(rowObj,'last_name','lastName','фамилия');
-    let firstName= pick(rowObj,'first_name','firstName','имя');
-    let patronymic=pick(rowObj,'patronymic','middle_name','отчество');
-
-    if (fullName && (!lastName || !firstName)){
-      const parts=fullName.split(/\s+/).filter(Boolean);
-      if (parts.length>=2){ lastName=lastName||parts[0]; firstName=firstName||parts[1]; patronymic=patronymic||parts.slice(2).join(' '); }
-    }
-
-    const department = pick(rowObj,'department','кафедра');
-    const subjects = (pick(rowObj,'subjects','предметы')||'').split('|').map(s=>s.trim()).filter(Boolean);
-
-    let photo = pick(rowObj,'photo_file','photo','фото');
-    if (photo) photo = photo.replace(/^photos?\//i,'');
-    const photoUrl = photo ? `/photo/${photo}` : null;
-
-    const explicitId = pick(rowObj,'id','teacher_id');
-    let id = explicitId || ('t-' + slugify(`${lastName}-${firstName}-${patronymic}`) || ('t-'+Date.now().toString(36)));
-
-    out.push({ id, lastName, firstName, patronymic, department, subjects, photo: photoUrl });
-  }
-  return out;
-}
-function writeTeachers(all) {
-  const normalized = all.map(t => ({
-    id: String(t.id || '').trim() || ('t-'+Date.now().toString(36)),
-    lastName: t.lastName||'',
-    firstName: t.firstName||'',
-    patronymic: t.patronymic||'',
-    department: t.department||'',
-    subjects: Array.isArray(t.subjects)
-      ? t.subjects.map(s=>String(s||'').trim()).filter(Boolean)
-      : String(t.subjects||'').split('|').map(s=>s.trim()).filter(Boolean),
-    photo: t.photo ? `/photo/${t.photo.replace(/^\/?photo\//,'')}` : (t.photo===null ? null : '')
-  }));
-
-  const header = ['id','last_name','first_name','patronymic','department','subjects','photo'];
-  let out = header.join(',')+'\n';
-  for (const t of normalized) {
-    const subjectsStr = t.subjects.length ? t.subjects.join('|') : '';
-    const photo = (t.photo||'').replace(/^\/?photo\//,'');
-    out += toCSVRow([t.id, t.lastName, t.firstName, t.patronymic, t.department, subjectsStr, photo]);
-  }
-  fs.writeFileSync(TEACHERS_CSV, out, 'utf-8');
-  TEACHERS = normalized.map(t => ({
-    ...t,
-    photo: t.photo ? t.photo : null
-  }));
-}
-function upsertTeacher(row) {
-  const id = String(row.id || '').trim();
-  if (id) {
-    const ix = TEACHERS.findIndex(x=>x.id===id);
-    if (ix>=0) {
-      TEACHERS[ix] = {
-        ...TEACHERS[ix],
-        lastName: row.lastName||'',
-        firstName: row.firstName||'',
-        patronymic: row.patronymic||'',
-        department: row.department||'',
-        subjects: Array.isArray(row.subjects)?row.subjects:(String(row.subjects||'').split('|').map(s=>s.trim()).filter(Boolean)),
-        photo: row.photo ? `/photo/${row.photo.replace(/^\/?photo\//,'')}` : (TEACHERS[ix].photo||null)
-      };
-    } else {
-      TEACHERS.push({
-        id,
-        lastName: row.lastName||'',
-        firstName: row.firstName||'',
-        patronymic: row.patronymic||'',
-        department: row.department||'',
-        subjects: Array.isArray(row.subjects)?row.subjects:(String(row.subjects||'').split('|').map(s=>s.trim()).filter(Boolean)),
-        photo: row.photo ? `/photo/${row.photo.replace(/^\/?photo\//,'')}` : null
-      });
-    }
-  } else {
-    const newId = 't-' + slugify(`${row.lastName||''}-${row.firstName||''}-${row.patronymic||''}`) || ('t-'+Date.now().toString(36));
-    TEACHERS.push({
-      id: newId,
-      lastName: row.lastName||'',
-      firstName: row.firstName||'',
-      patronymic: row.patronymic||'',
-      department: row.department||'',
-      subjects: Array.isArray(row.subjects)?row.subjects:(String(row.subjects||'').split('|').map(s=>s.trim()).filter(Boolean)),
-      photo: row.photo ? `/photo/${row.photo.replace(/^\/?photo\//,'')}` : null
-    });
-  }
-  writeTeachers(TEACHERS);
-}
-function deleteTeacherById(id) {
-  TEACHERS = TEACHERS.filter(t=>t.id!==id);
-  writeTeachers(TEACHERS);
-  // зачистим рейтинги и комменты по учителю
-  const ratings = readRatingsMap();
-  if (ratings[id]) { delete ratings[id]; writeRatingsMap(ratings); }
-  const commentsAll = readCommentsAll().filter(c=>c.teacherId!==id);
-  rebuildCommentsCache(commentsAll);
-  flushCommentsFile();
-  // голоса по удалённым комментариям — удалим «мусор»
-  const remainingIds = new Set(commentsAll.map(c=>String(c.id)));
-  const votes = readVotesRows().filter(v => remainingIds.has(String(v.commentId)));
-  writeVotesRows(votes);
+function isAdminUser(u) {
+  const email = String(u?.email || '').toLowerCase();
+  return ADMIN_EMAILS.has(email);
 }
 
-/* Ratings/Comments */
 const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 
-function loadRatingsMapFromDisk(){
-  const map={}; if(!fs.existsSync(RATINGS_CSV)) return map;
-  const rows=parseCSV(fs.readFileSync(RATINGS_CSV,'utf-8'));
-  if(!rows.length) return map;
-  const start = dataStartIndex(rows, ['teacherid','teacher_id,key']);
-  for(let i=start;i<rows.length;i++){
-    const [tid,key,sum,count]=rows[i]; if(!tid||!key) continue;
-    (map[tid] ||= {})[key] = {sum:Number(sum||0), count:Number(count||0)};
+function overall(r){ 
+  let tot=0,cnt=0; 
+  for(const k of CHARACTERISTICS_KEYS){ 
+    const v=r[k]; 
+    if(v&&v.count){ tot+=v.sum/v.count; cnt++; } 
+  } 
+  return cnt?tot/cnt:0; 
+}
+
+/* API helper functions */
+
+function getAllTeachers() {
+  const stmt = db.prepare('SELECT * FROM teachers ORDER BY last_name, first_name');
+  return stmt.all();
+}
+
+function getTeacherById(id) {
+  const stmt = db.prepare('SELECT * FROM teachers WHERE id = ?');
+  return stmt.get(id);
+}
+
+function getRatingsForTeacher(teacherId) {
+  const stmt = db.prepare('SELECT key, sum, count FROM ratings WHERE teacher_id = ?');
+  const rows = stmt.all(teacherId);
+  const result = {};
+  for (const k of CHARACTERISTICS_KEYS) {
+    result[k] = { sum: 0, count: 0 };
+  }
+  for (const row of rows) {
+    if (CHARACTERISTICS_KEYS.includes(row.key)) {
+      result[row.key] = { sum: row.sum, count: row.count };
+    }
+  }
+  return result;
+}
+
+function getAllRatings() {
+  const stmt = db.prepare('SELECT teacher_id, key, sum, count FROM ratings');
+  const rows = stmt.all();
+  const map = {};
+  for (const row of rows) {
+    if (!map[row.teacher_id]) map[row.teacher_id] = {};
+    map[row.teacher_id][row.key] = { sum: row.sum, count: row.count };
   }
   return map;
 }
-function readRatingsMap(){
-  return RATINGS_CACHE;
-}
-function writeRatingsMap(map){
-  RATINGS_CACHE = map;
-  let out='teacherId,key,sum,count\n';
-  for(const tid of Object.keys(map)) for(const key of Object.keys(map[tid])){
-    const {sum,count}=map[tid][key] || {sum:0,count:0}; out += toCSVRow([tid,key,sum,count]);
-  }
-  fs.writeFileSync(RATINGS_CSV,out,'utf-8');
+
+function getCommentsForTeacher(teacherId) {
+  const stmt = db.prepare('SELECT * FROM comments WHERE teacher_id = ? ORDER BY ts DESC');
+  return stmt.all(teacherId);
 }
 
-function loadCommentsFromDisk(){
-  if(!fs.existsSync(COMMENTS_CSV)) return [];
-  const rows=parseCSV(fs.readFileSync(COMMENTS_CSV,'utf-8'));
-  if(!rows.length) return [];
-  const start = dataStartIndex(rows, ['id,teacherid','id,teacher_id','teacherid,ts','teacher_id,ts']);
-  const out=[];
-  for(let i=start;i<rows.length;i++){
-    const [id,teacherId,ts,ts_iso,author,text,author_uid]=rows[i];
-    if(!id) continue;
-    const numId = Number(id);
-    const numTs = Number(ts);
-    out.push({
-      id: Number.isFinite(numId) ? numId : 0,
-      teacherId: String(teacherId||''),
-      ts: Number.isFinite(numTs) ? numTs : 0,
-      ts_iso: ts_iso || new Date(Number.isFinite(numTs) ? numTs : Date.now()).toISOString(),
-      author: author || 'Аноним',
-      text: text || '',
-      author_uid: author_uid || ''
-    });
-  }
-  return out;
+function getAllComments() {
+  const stmt = db.prepare('SELECT * FROM comments ORDER BY ts DESC');
+  return stmt.all();
 }
-function rebuildCommentsCache(rows){
-  COMMENTS_CACHE = rows.map(r => ({
-    id: Number(r.id) || 0,
-    teacherId: String(r.teacherId||''),
-    ts: Number(r.ts) || 0,
-    ts_iso: r.ts_iso || new Date(Number(r.ts)||Date.now()).toISOString(),
-    author: r.author || 'Аноним',
-    text: r.text || '',
-    author_uid: r.author_uid || ''
-  }));
-  COMMENTS_BY_TEACHER = new Map();
-  COMMENTS_BY_ID = new Map();
-  COMMENT_MAX_ID = 0;
-  for (const c of COMMENTS_CACHE) {
-    const key = String(c.teacherId||'');
-    if (!COMMENTS_BY_TEACHER.has(key)) COMMENTS_BY_TEACHER.set(key, []);
-    COMMENTS_BY_TEACHER.get(key).push(c);
-    COMMENTS_BY_ID.set(String(c.id), c);
-    if (Number.isFinite(c.id)) COMMENT_MAX_ID = Math.max(COMMENT_MAX_ID, Number(c.id));
-  }
+
+function getCommentById(commentId) {
+  const stmt = db.prepare('SELECT * FROM comments WHERE id = ?');
+  return stmt.get(commentId);
 }
-function flushCommentsFile(){
-  let out='id,teacherId,ts,ts_iso,author,text,author_uid\n';
-  for (const c of COMMENTS_CACHE) {
-    out += toCSVRow([c.id,c.teacherId,c.ts,c.ts_iso,c.author,c.text,c.author_uid||'']);
-  }
-  fs.writeFileSync(COMMENTS_CSV,out,'utf-8');
+
+function getNextCommentId() {
+  const stmt = db.prepare('SELECT MAX(id) as maxId FROM comments');
+  const row = stmt.get();
+  return (row.maxId || 0) + 1;
 }
-function readCommentsAll(){
-  return COMMENTS_CACHE.map(c=>({...c}));
-}
-function readCommentsFor(tid){
-  const list = COMMENTS_BY_TEACHER.get(String(tid)) || [];
-  return list.map(c=>({...c}));
-}
-function getCommentById(cid){
-  const c = COMMENTS_BY_ID.get(String(cid));
-  return c ? {...c} : null;
-}
-function nextCommentId(){
-  return COMMENT_MAX_ID + 1;
-}
-function appendCommentRow({teacherId,author='Аноним',text,author_uid=''}){
-  const ts=Date.now();
-  const id = nextCommentId();
-  const entry = {
-    id,
-    teacherId: String(teacherId||''),
-    ts,
-    ts_iso: new Date(ts).toISOString(),
-    author: author || 'Аноним',
-    text: text || '',
-    author_uid: author_uid || ''
-  };
-  COMMENTS_CACHE.push(entry);
-  COMMENT_MAX_ID = id;
-  const key = entry.teacherId;
-  if (!COMMENTS_BY_TEACHER.has(key)) COMMENTS_BY_TEACHER.set(key, []);
-  COMMENTS_BY_TEACHER.get(key).push(entry);
-  COMMENTS_BY_ID.set(String(id), entry);
-  fs.appendFileSync(COMMENTS_CSV,toCSVRow([entry.id,entry.teacherId,entry.ts,entry.ts_iso,entry.author,entry.text,entry.author_uid]),'utf-8');
+
+function addComment({ teacherId, author = 'Аноним', text, author_uid = '' }) {
+  const ts = Date.now();
+  const id = getNextCommentId();
+  const stmt = db.prepare('INSERT INTO comments (id, teacher_id, ts, ts_iso, author, text, author_uid) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  stmt.run(id, teacherId, ts, new Date(ts).toISOString(), author, text, author_uid);
   return id;
 }
-function overall(r){ let tot=0,cnt=0; for(const k of CHARACTERISTICS_KEYS){ const v=r[k]; if(v&&v.count){ tot+=v.sum/v.count; cnt++; } } return cnt?tot/cnt:0; }
 
-/* Votes (likes/dislikes) */
-function loadVotesRowsFromDisk(){
-  if(!fs.existsSync(VOTES_CSV)) return [];
-  const rows=parseCSV(fs.readFileSync(VOTES_CSV,'utf-8'));
-  if(!rows.length) return [];
-  const start = dataStartIndex(rows, ['commentid,userid','commentid,userid,vote','commentid,userid,vote,ts']);
-  const out=[];
-  for(let i=start;i<rows.length;i++){
-    const [commentId,userId,vote,ts]=rows[i];
-    if(!commentId || !userId) continue;
-    const v = Number(vote||0);
-    if (![1,0,-1].includes(v)) continue;
-    out.push({commentId:String(commentId), userId:String(userId), vote:v, ts:Number(ts||0)});
-  }
-  return out;
+function deleteComment(commentId) {
+  const stmt = db.prepare('DELETE FROM comments WHERE id = ?');
+  const info = stmt.run(commentId);
+  return info.changes > 0;
 }
-function rebuildVotesCache(rows){
-  VOTE_ROWS_CACHE = rows.map(r => ({
-    commentId: String(r.commentId||''),
-    userId: String(r.userId||''),
-    vote: Number(r.vote||0),
-    ts: Number(r.ts||0) || Date.now()
-  }));
-  VOTE_LOOKUP = new Map();
-  VOTE_COUNTS = new Map();
-  for (const row of VOTE_ROWS_CACHE) {
-    const key = `${row.commentId}__${row.userId}`;
-    VOTE_LOOKUP.set(key, row);
-    let cnt = VOTE_COUNTS.get(row.commentId);
-    if (!cnt) {
-      cnt = { likes:0, dislikes:0 };
-      VOTE_COUNTS.set(row.commentId, cnt);
-    }
-    if (row.vote === 1) cnt.likes++;
-    else if (row.vote === -1) cnt.dislikes++;
+
+function updateRatings(teacherId, ratings) {
+  const upsert = db.prepare('INSERT INTO ratings (teacher_id, key, sum, count) VALUES (?, ?, ?, ?) ON CONFLICT(teacher_id, key) DO UPDATE SET sum = sum + excluded.sum, count = count + excluded.count');
+  
+  for (const key of Object.keys(ratings)) {
+    if (!CHARACTERISTICS_KEYS.includes(key)) continue;
+    const v = Number(ratings[key]);
+    if (!(v >= 1 && v <= 5)) continue;
+    upsert.run(teacherId, key, v, 1);
   }
 }
-function flushVotesFile(){
-  let out='commentId,userId,vote,ts\n';
-  for(const r of VOTE_ROWS_CACHE){
-    out += toCSVRow([r.commentId, r.userId, r.vote, r.ts||Date.now()]);
-  }
-  fs.writeFileSync(VOTES_CSV, out, 'utf-8');
-}
-function readVotesRows(){
-  return VOTE_ROWS_CACHE.map(r=>({...r}));
-}
-function writeVotesRows(rows){
-  rebuildVotesCache(rows);
-  flushVotesFile();
-}
-function adjustVoteCounts(commentId, prevVote, newVote){
-  const key = String(commentId);
-  let cnt = VOTE_COUNTS.get(key);
-  if (!cnt) {
-    cnt = { likes:0, dislikes:0 };
-    VOTE_COUNTS.set(key, cnt);
-  }
-  if (prevVote === 1) cnt.likes = Math.max(0, (cnt.likes||0) - 1);
-  else if (prevVote === -1) cnt.dislikes = Math.max(0, (cnt.dislikes||0) - 1);
-  if (newVote === 1) cnt.likes = (cnt.likes||0) + 1;
-  else if (newVote === -1) cnt.dislikes = (cnt.dislikes||0) + 1;
-  if (!cnt.likes && !cnt.dislikes) {
-    VOTE_COUNTS.delete(key);
-  } else {
-    VOTE_COUNTS.set(key, cnt);
-  }
-}
-function getUserVote(commentId, userId){
-  const row = VOTE_LOOKUP.get(`${String(commentId)}__${String(userId)}`);
+
+// Votes
+function getUserVote(commentId, userId) {
+  const stmt = db.prepare('SELECT vote FROM comment_votes WHERE comment_id = ? AND user_id = ?');
+  const row = stmt.get(commentId, userId);
   return row ? row.vote : 0;
 }
-function setUserVote(commentId, userId, newVote){
-  const key = `${String(commentId)}__${String(userId)}`;
-  const existing = VOTE_LOOKUP.get(key);
-  if (newVote === 0){
-    if (!existing) return;
-    adjustVoteCounts(existing.commentId, existing.vote, 0);
-    VOTE_LOOKUP.delete(key);
-    const ix = VOTE_ROWS_CACHE.indexOf(existing);
-    if (ix>=0) VOTE_ROWS_CACHE.splice(ix,1);
+
+function setUserVote(commentId, userId, newVote) {
+  if (newVote === 0) {
+    const stmt = db.prepare('DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?');
+    stmt.run(commentId, userId);
   } else {
-    if (existing){
-      if (existing.vote !== newVote){
-        adjustVoteCounts(existing.commentId, existing.vote, newVote);
-        existing.vote = newVote;
-      }
-      existing.ts = Date.now();
-    } else {
-      const row = { commentId:String(commentId), userId:String(userId), vote:newVote, ts:Date.now() };
-      VOTE_ROWS_CACHE.push(row);
-      VOTE_LOOKUP.set(key, row);
-      adjustVoteCounts(row.commentId, 0, newVote);
-    }
+    const stmt = db.prepare('INSERT INTO comment_votes (comment_id, user_id, vote, ts) VALUES (?, ?, ?, ?) ON CONFLICT(comment_id, user_id) DO UPDATE SET vote = excluded.vote, ts = excluded.ts');
+    stmt.run(commentId, userId, newVote, Date.now());
   }
-  flushVotesFile();
-}
-function countVotesForCommentBulk(commentIds, myUserId=null){
-  const counts = {}; const myVotes = {};
-  const userIdStr = myUserId ? String(myUserId) : null;
-  for (const cid of commentIds) {
-    const key = String(cid);
-    const cnt = VOTE_COUNTS.get(key);
-    counts[key] = { likes: cnt?.likes || 0, dislikes: cnt?.dislikes || 0 };
-    if (userIdStr) {
-      const row = VOTE_LOOKUP.get(`${key}__${userIdStr}`);
-      if (row) myVotes[key] = row.vote;
-    }
-  }
-  return {counts, myVotes};
 }
 
-/* Users & sessions */
+function countVotesForCommentBulk(commentIds, myUserId = null) {
+  if (!commentIds.length) return { counts: {}, myVotes: {} };
+  
+  const placeholders = commentIds.map(() => '?').join(',');
+  const stmt = db.prepare(`SELECT comment_id, vote FROM comment_votes WHERE comment_id IN (${placeholders})`);
+  const rows = stmt.all(...commentIds);
+  
+  const counts = {};
+  const myVotes = {};
+  const userIdStr = myUserId ? String(myUserId) : null;
+  
+  for (const cid of commentIds) {
+    counts[String(cid)] = { likes: 0, dislikes: 0 };
+  }
+  
+  for (const row of rows) {
+    const key = String(row.comment_id);
+    if (!counts[key]) counts[key] = { likes: 0, dislikes: 0 };
+    
+    if (row.vote === 1) counts[key].likes++;
+    else if (row.vote === -1) counts[key].dislikes++;
+    
+    if (userIdStr && row.user_id === userIdStr) {
+      myVotes[key] = row.vote;
+    }
+  }
+  
+  return { counts, myVotes };
+}
+
+// Users
+function findUserByEmail(email) {
+  const stmt = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)');
+  return stmt.get(email);
+}
+
+function findUserById(userId) {
+  const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
+  return stmt.get(userId);
+}
+
+function upsertUserOnLogin(email) {
+  const now = Date.now();
+  const username = String(email).split('@')[0];
+  
+  let user = findUserByEmail(email);
+  
+  if (!user) {
+    const id = 'u-' + crypto.randomBytes(8).toString('hex');
+    const stmt = db.prepare('INSERT INTO users (id, email, username, created_ts, last_login_ts, login_count, comment_count, rating_count, cast_likes, cast_dislikes, received_likes, received_dislikes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    stmt.run(id, email, username, now, now, 1, 0, 0, 0, 0, 0, 0);
+    user = findUserById(id);
+  } else {
+    const stmt = db.prepare('UPDATE users SET username = ?, last_login_ts = ?, login_count = login_count + 1 WHERE id = ?');
+    stmt.run(username, now, user.id);
+    user = findUserById(user.id);
+  }
+  
+  return user;
+}
+
+function incUserStats(userId, { comments = 0, ratings = 0, cast_like = 0, cast_dislike = 0, recv_like = 0, recv_dislike = 0 } = {}) {
+  const stmt = db.prepare(`UPDATE users SET 
+    comment_count = comment_count + ?,
+    rating_count = rating_count + ?,
+    cast_likes = cast_likes + ?,
+    cast_dislikes = cast_dislikes + ?,
+    received_likes = received_likes + ?,
+    received_dislikes = received_dislikes + ?
+    WHERE id = ?`);
+  stmt.run(comments, ratings, cast_like, cast_dislike, recv_like, recv_dislike, userId);
+}
+
+function isUserBanned(userId) {
+  const stmt = db.prepare('SELECT is_banned FROM banned_users WHERE user_id = ?');
+  const row = stmt.get(userId);
+  return row ? !!row.is_banned : false;
+}
+
+function setBanStatus(userId, banned, reason = '') {
+  const stmt = db.prepare('INSERT INTO banned_users (user_id, is_banned, reason, ts) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET is_banned = excluded.is_banned, reason = excluded.reason, ts = excluded.ts');
+  stmt.run(userId, banned ? 1 : 0, reason, Date.now());
+}
+
+// Teachers CRUD
+function upsertTeacher(teacher) {
+  const { id, lastName, firstName, patronymic, department, subjects, photo } = teacher;
+  const subjectsStr = Array.isArray(subjects) ? subjects.join('|') : String(subjects || '');
+  const photoStr = photo ? (photo.startsWith('/photo/') ? photo : `/photo/${photo}`) : null;
+  
+  const stmt = db.prepare('INSERT INTO teachers (id, last_name, first_name, patronymic, department, subjects, photo) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_name = excluded.last_name, first_name = excluded.first_name, patronymic = excluded.patronymic, department = excluded.department, subjects = excluded.subjects, photo = excluded.photo');
+  stmt.run(id, lastName || '', firstName || '', patronymic || '', department || '', subjectsStr, photoStr);
+}
+
+function deleteTeacherById(id) {
+  // Удалится также связанные комментарии, рейтинги и голоса благодаря ON DELETE CASCADE
+  const stmt = db.prepare('DELETE FROM teachers WHERE id = ?');
+  const info = stmt.run(id);
+  return info.changes > 0;
+}
+
+/* Sessions & Auth */
+app.set('trust proxy', true);
+
+function getClientIp(req){
+  const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xf || req.socket.remoteAddress || '0.0.0.0';
+}
+
 function parseCookies(req){
   const header = req.headers['cookie'] || '';
   const out = {};
@@ -515,154 +440,132 @@ function parseCookies(req){
   });
   return out;
 }
-function loadUsersRowsFromDisk(){
-  if (!fs.existsSync(USERS_CSV)) return [];
-  const rows = parseCSV(fs.readFileSync(USERS_CSV,'utf-8'));
-  if (!rows.length) return [];
-  const header = rows[0];
-  const out = [];
-  for (let i=1;i<rows.length;i++){
-    const r = rows[i]; if(!r || !r.length) continue;
-    const obj = Object.fromEntries(header.map((h,ix)=>[h, r[ix]??'']));
-    out.push(obj);
-  }
-  return out;
-}
-function rebuildUsersCache(rows){
-  const normalized = rows.map(r => ({
-    id: String(r.id||''),
-    email: r.email || '',
-    username: r.username || '',
-    created_ts: String(r.created_ts||''),
-    last_login_ts: String(r.last_login_ts||''),
-    login_count: String(r.login_count||'0'),
-    comment_count: String(r.comment_count||'0'),
-    rating_count: String(r.rating_count||'0'),
-    cast_likes: String(r.cast_likes||'0'),
-    cast_dislikes: String(r.cast_dislikes||'0'),
-    received_likes: String(r.received_likes||'0'),
-    received_dislikes: String(r.received_dislikes||'0')
-  }));
-  USERS_CACHE = normalized;
-  USERS_BY_ID = new Map();
-  USERS_BY_EMAIL = new Map();
-  for (const u of USERS_CACHE) {
-    USERS_BY_ID.set(String(u.id), u);
-    USERS_BY_EMAIL.set(String(u.email||'').toLowerCase(), u);
-  }
-}
-function flushUsersFile(){
-  const header = ['id','email','username','created_ts','last_login_ts','login_count','comment_count','rating_count','cast_likes','cast_dislikes','received_likes','received_dislikes'];
-  let out = header.join(',')+'\n';
-  for(const r of USERS_CACHE){
-    out += toCSVRow(header.map(h=>r[h] ?? ''));
-  }
-  fs.writeFileSync(USERS_CSV, out, 'utf-8');
-}
-function readUsersRows(){
-  return USERS_CACHE.map(r=>({...r}));
-}
-function writeUsersRows(rows){
-  rebuildUsersCache(rows);
-  flushUsersFile();
-}
-function findUserByEmail(email){
-  const user = USERS_BY_EMAIL.get(String(email||'').toLowerCase());
-  return user ? {...user} : null;
-}
-function findUserById(uid){
-  const user = USERS_BY_ID.get(String(uid));
-  return user ? {...user} : null;
-}
-function upsertUserOnLogin(email){
-  const now = Date.now();
-  const username = String(email).split('@')[0];
-  const lower = String(email||'').toLowerCase();
-  let found = USERS_BY_EMAIL.get(lower);
-  if (!found){
-    found = {
-      id: 'u-' + crypto.randomBytes(8).toString('hex'),
-      email,
-      username,
-      created_ts: String(now),
-      last_login_ts: String(now),
-      login_count: '1',
-      comment_count: '0',
-      rating_count: '0',
-      cast_likes: '0',
-      cast_dislikes: '0',
-      received_likes: '0',
-      received_dislikes: '0'
-    };
-    USERS_CACHE.push(found);
-    USERS_BY_ID.set(found.id, found);
-    USERS_BY_EMAIL.set(lower, found);
-  } else {
-    found.username = username;
-    found.last_login_ts = String(now);
-    found.login_count = String(Number(found.login_count||0)+1);
-    found.cast_likes = String(Number(found.cast_likes||0));
-    found.cast_dislikes = String(Number(found.cast_dislikes||0));
-    found.received_likes = String(Number(found.received_likes||0));
-    found.received_dislikes = String(Number(found.received_dislikes||0));
-  }
-  flushUsersFile();
-  return {...found};
-}
-function incUserStats(uid, {comments=0, ratings=0, cast_like=0, cast_dislike=0, recv_like=0, recv_dislike=0}={}){
-  const user = USERS_BY_ID.get(String(uid));
-  if (!user) return;
-  user.comment_count = String(Number(user.comment_count||0) + comments);
-  user.rating_count  = String(Number(user.rating_count||0)  + ratings);
-  user.cast_likes    = String(Number(user.cast_likes||0)    + cast_like);
-  user.cast_dislikes = String(Number(user.cast_dislikes||0) + cast_dislike);
-  user.received_likes    = String(Number(user.received_likes||0)    + recv_like);
-  user.received_dislikes = String(Number(user.received_dislikes||0) + recv_dislike);
-  flushUsersFile();
-}
 
-const SESSIONS = new Map();     // token -> { userId, created, ip, ua }
-const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
-
-app.set('trust proxy', true);
-
-function getClientIp(req){
-  const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return xf || req.socket.remoteAddress || '0.0.0.0';
-}
+// === БЕЗОПАСНОСТЬ: Управление сессиями через БД ===
 function setSessionCookie(res, token){
   const maxAge = SESSION_TTL_MS;
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(maxAge/1000)}`);
+  const secureFlag = IS_PRODUCTION ? '; Secure' : '';
+  res.setHeader('Set-Cookie', 
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${secureFlag}; Max-Age=${Math.floor(maxAge/1000)}`
+  );
 }
+
 function clearSessionCookie(res){
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
-}
-function createSession(userId, req) {
-    const token = 'st-' + crypto.randomBytes(18).toString('hex');
-    const ip = getClientIp(req);
-    const ua = req.headers['user-agent'] || '';
-    SESSIONS.set(token, { userId, created: Date.now(), ip, ua });
-    return token;
+  const secureFlag = IS_PRODUCTION ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax${secureFlag}; Max-Age=0`);
 }
 
-
-function getUserFromRequest(req) {
-    const cookies = parseCookies(req);
-    const token = cookies[SESSION_COOKIE];
-    if (!token) return null;
-    const session = SESSIONS.get(token);
-    if (!session) return null;
-    const ip = getClientIp(req);
-    const ua = req.headers['user-agent'] || '';
-    // простая проверка: ip и ua должны совпадать с сохранёнными
-    if (session.ip !== ip || session.ua !== ua) return null;
-    const user = findUserById(session.userId);
-    return user || null;
+function createSession(userId, req){
+  const token = generateSecureToken();
+  const tokenHash = hashToken(token);
+  const now = Date.now();
+  const expiresTs = now + SESSION_TTL_MS;
+  const ip = getClientIp(req);
+  const ua = req.headers['user-agent'] || '';
+  const sessionId = 'ses-' + crypto.randomBytes(12).toString('hex');
+  
+  // Ограничение количества сессий на пользователя
+  const existingSessions = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE user_id = ? AND is_active = 1').get(userId);
+  if (existingSessions && existingSessions.count >= MAX_SESSIONS_PER_USER) {
+    // Удаляем самую старую сессию
+    db.prepare('DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE user_id = ? AND is_active = 1 ORDER BY last_activity_ts ASC LIMIT 1)').run(userId);
+    
+    logSecurityEvent('session_limit_reached', {
+      userId,
+      ip,
+      userAgent: ua,
+      severity: 'warning'
+    });
+  }
+  
+  const stmt = db.prepare(`
+    INSERT INTO sessions (id, token_hash, user_id, created_ts, last_activity_ts, expires_ts, ip, user_agent, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `);
+  
+  stmt.run(sessionId, tokenHash, userId, now, now, expiresTs, ip, ua);
+  
+  logSecurityEvent('session_created', {
+    userId,
+    sessionId,
+    ip,
+    userAgent: ua
+  });
+  
+  return token;
 }
 
-/* Anti-abuse limiters */
+function getUserFromRequest(req){
+  const cookies = parseCookies(req);
+  const token = cookies[SESSION_COOKIE];
+  if (!token) return null;
+  
+  const tokenHash = hashToken(token);
+  const stmt = db.prepare(`
+    SELECT * FROM sessions 
+    WHERE token_hash = ? AND is_active = 1 AND expires_ts > ?
+  `);
+  
+  const session = stmt.get(tokenHash, Date.now());
+  if (!session) return null;
+  
+  // Проверка IP (опционально, для усиленной безопасности)
+  const currentIp = getClientIp(req);
+  if (session.ip && session.ip !== currentIp) {
+    logSecurityEvent('session_ip_mismatch', {
+      userId: session.user_id,
+      sessionIp: session.ip,
+      requestIp: currentIp,
+      severity: 'warning'
+    });
+    // Не блокируем, но логируем (IP может меняться легитимно)
+  }
+  
+  // Обновляем время последней активности
+  db.prepare('UPDATE sessions SET last_activity_ts = ? WHERE id = ?').run(Date.now(), session.id);
+  
+  const user = findUserById(session.user_id);
+  return user || null;
+}
+
+function invalidateSession(token) {
+  if (!token) return;
+  const tokenHash = hashToken(token);
+  db.prepare('UPDATE sessions SET is_active = 0 WHERE token_hash = ?').run(tokenHash);
+}
+
+function invalidateAllUserSessions(userId) {
+  db.prepare('UPDATE sessions SET is_active = 0 WHERE user_id = ?').run(userId);
+  logSecurityEvent('all_sessions_invalidated', {
+    userId,
+    severity: 'warning'
+  });
+}
+
+// Автоматическая очистка истекших сессий
+function cleanupExpiredSessions() {
+  const deleted = db.prepare('DELETE FROM sessions WHERE expires_ts < ? OR is_active = 0').run(Date.now());
+  if (deleted.changes > 0) {
+    console.log(`🧹 Очищено ${deleted.changes} истекших сессий`);
+  }
+}
+
+// Очистка старых логов (старше 90 дней)
+function cleanupOldLogs() {
+  const cutoff = Date.now() - (90 * 24 * 60 * 60 * 1000);
+  db.prepare('DELETE FROM security_log WHERE ts < ?').run(cutoff);
+  db.prepare('DELETE FROM login_attempts WHERE ts < ?').run(cutoff);
+}
+
+// Запускаем очистку периодически
+setInterval(() => {
+  cleanupExpiredSessions();
+  cleanupOldLogs();
+}, SESSION_CLEANUP_INTERVAL);
+
+/* Rate limiters */
 function limitPerIp(minIntervalMs){
-  const lastByIp = new Map(); // ip -> lastTimestamp
+  const lastByIp = new Map();
   return function(req, res, next){
     const ip = getClientIp(req);
     const now = Date.now();
@@ -682,10 +585,9 @@ function limitPerIp(minIntervalMs){
     next();
   };
 }
-const commentPerMinuteLimiter = limitPerIp(30_000); // 30 сек
-const postLimiter = limitPerIp(3_000);
-const authRequestLimiter = limitPerIp(10_000);
-const authPollLimiter    = limitPerIp(1_000);
+
+const commentPerMinuteLimiter = limitPerIp(30_000);
+// Rate limiting убран для обычных API запросов
 
 function createSlidingWindowLimiter({ windowMs, maxRequests }) {
   const buckets = new Map();
@@ -728,7 +630,29 @@ function createSlidingWindowLimiter({ windowMs, maxRequests }) {
 const apiRateLimiter = createSlidingWindowLimiter({ windowMs: 60_000, maxRequests: 120 });
 app.use('/api', apiRateLimiter);
 
-/* GuerrillaMail helpers (Node 18: fetch встроен) */
+/* Profanity filter */
+const BAD_STEMS = [
+  'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
+  'пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'
+];
+const LAT2CYR = { 'a':'а','b':'в','c':'с','e':'е','h':'н','k':'к','m':'м','o':'о','p':'р','t':'т','x':'х','y':'у' };
+const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
+
+function normalizeForBadWords(s){
+  let t = String(s||'').toLowerCase();
+  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
+  t = t.replace(/[a-z]/g, ch => LAT2CYR[ch] || ch);
+  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g,'');
+  t = t.replace(/(.)\1{2,}/g, '$1$1');
+  return t;
+}
+
+function hasBadWords(text){
+  const norm = normalizeForBadWords(text);
+  return BAD_STEMS.some(st => norm.includes(st));
+}
+
+/* GuerrillaMail helpers */
 async function gmGetEmailAddress(){
   const url = 'https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=ru';
   const r = await fetch(url).catch(()=>null);
@@ -736,6 +660,7 @@ async function gmGetEmailAddress(){
   const j = await r.json();
   return { email: j.email_addr, sid_token: j.sid_token };
 }
+
 async function gmCheckEmail(sid_token){
   const url = `https://api.guerrillamail.com/ajax.php?f=check_email&seq=1&sid_token=${encodeURIComponent(sid_token)}`;
   const r = await fetch(url).catch(()=>null);
@@ -743,96 +668,66 @@ async function gmCheckEmail(sid_token){
   const j = await r.json();
   return Array.isArray(j.list) ? j.list : [];
 }
+
 async function gmFetchEmail(sid_token, id){
   const url = `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${encodeURIComponent(id)}&sid_token=${encodeURIComponent(sid_token)}`;
   const r = await fetch(url).catch(()=>null);
   if (!r || !r.ok) return null;
   return await r.json();
 }
+
 function extractCode(text){
   if (!text) return null;
   const m = String(text).match(/\b(\d{6})\b/);
   return m ? m[1] : null;
 }
+
 function extractPureEmail(s){
   if (!s) return '';
   const m = String(s).match(/<([^>]+)>/);
   return (m ? m[1] : String(s)).trim().toLowerCase();
 }
 
-/* Admins & Bans */
-function readAdminEmails() {
-  if (!fs.existsSync(ADMINS_CSV)) return new Set();
-  const rows = parseCSV(fs.readFileSync(ADMINS_CSV, 'utf-8'));
-  if (!rows.length) return new Set();
-  let start = 0;
-  const headerJoin = rows[0].map(x => String(x||'').toLowerCase()).join(',');
-  if (headerJoin.includes('email')) start = 1;
-  const set = new Set();
-  for (let i = start; i < rows.length; i++) {
-    const email = String(rows[i][0] || '').trim().toLowerCase();
-    if (email) set.add(email);
-  }
-  return set;
-}
-let ADMIN_EMAILS = readAdminEmails(); // читаем один раз при старте (CSV неизменяемый)
-function isAdminUser(u) {
-  const email = String(u?.email || '').toLowerCase();
-  return ADMIN_EMAILS.has(email);
-}
+/* --- PUBLIC API --- */
 
-function loadBansMapFromDisk() {
-  const map = {};
-  if (!fs.existsSync(BANS_CSV)) return map;
-  const rows = parseCSV(fs.readFileSync(BANS_CSV, 'utf-8'));
-  if (!rows.length) return map;
-  const start = dataStartIndex(rows, ['userid,is_banned']);
-  for (let i=start;i<rows.length;i++){
-    const [userId,is_banned,reason,ts] = rows[i];
-    if (!userId) continue;
-    map[String(userId)] = { is_banned: String(is_banned||'0')==='1', reason: reason||'', ts: Number(ts||0) };
-  }
-  return map;
-}
-function writeBansMap(map) {
-  BANS = map;
-  let out = 'userId,is_banned,reason,ts\n';
-  for (const uid of Object.keys(map)) {
-    const r = map[uid] || { is_banned:false, reason:'', ts: Date.now() };
-    out += toCSVRow([uid, r.is_banned ? '1':'0', r.reason||'', r.ts||Date.now()]);
-  }
-  fs.writeFileSync(BANS_CSV, out, 'utf-8');
-}
-function isUserBanned(userId) { return !!(userId && BANS[String(userId)]?.is_banned); }
-
-function initializeCaches(){
-  TEACHERS = loadTeachersFromDisk();
-  RATINGS_CACHE = loadRatingsMapFromDisk();
-  rebuildCommentsCache(loadCommentsFromDisk());
-  rebuildVotesCache(loadVotesRowsFromDisk());
-  rebuildUsersCache(loadUsersRowsFromDisk());
-  BANS = loadBansMapFromDisk();
-}
-initializeCaches();
-
-/* API — публичные */
 app.get('/api/departments',(req,res)=>{
-  const set=new Set(TEACHERS.map(t=>t.department).filter(Boolean));
+  const teachers = getAllTeachers();
+  const set = new Set(teachers.map(t=>t.department).filter(Boolean));
   res.json({departments:[...set].sort(new Intl.Collator('ru',{sensitivity:'base'}).compare)});
 });
+
 app.get('/api/teachers',(req,res)=>{
-  const rmap=readRatingsMap();
-  const teachers=TEACHERS.map(t=>{
-    const ratings={}; for(const k of CHARACTERISTICS_KEYS){ ratings[k]=rmap[t.id]?.[k] || {sum:0,count:0}; }
-    return {...t, ratings, overall:overall(ratings)};
+  const teachers = getAllTeachers();
+  const ratingsMap = getAllRatings();
+  
+  const result = teachers.map(t=>{
+    const ratings = {};
+    for(const k of CHARACTERISTICS_KEYS){ 
+      ratings[k] = ratingsMap[t.id]?.[k] || {sum:0,count:0}; 
+    }
+    return {
+      id: t.id,
+      lastName: t.last_name,
+      firstName: t.first_name,
+      patronymic: t.patronymic,
+      department: t.department,
+      photo: t.photo,
+      subjects: t.subjects ? t.subjects.split('|') : [],
+      ratings,
+      overall: overall(ratings)
+    };
   });
-  res.json({teachers});
+  
+  res.json({teachers: result});
 });
+
 app.get('/api/teacher/:id',(req,res)=>{
-  const t=TEACHERS.find(x=>x.id===req.params.id);
+  const t = getTeacherById(req.params.id);
   if(!t) return res.status(404).json({error:'not_found'});
-  const rmap=readRatingsMap(); const ratings={}; for(const k of CHARACTERISTICS_KEYS) ratings[k]=rmap[t.id]?.[k] || {sum:0,count:0};
-  const commentsRaw=readCommentsFor(t.id);
+  
+  const ratings = getRatingsForTeacher(t.id);
+  const commentsRaw = getCommentsForTeacher(t.id);
+  
   const u = getUserFromRequest(req);
   const myId = u?.id || null;
   const amAdmin = isAdminUser(u);
@@ -843,7 +738,7 @@ app.get('/api/teacher/:id',(req,res)=>{
   const comments = commentsRaw.map(c=>{
     const base = {
       id: c.id,
-      teacherId: c.teacherId,
+      teacherId: c.teacher_id,
       ts: c.ts,
       ts_iso: c.ts_iso,
       author: c.author,
@@ -860,39 +755,26 @@ app.get('/api/teacher/:id',(req,res)=>{
     return base;
   });
 
-  res.json({...t, ratings, comments, overall:overall(ratings)});
+  res.json({
+    id: t.id,
+    lastName: t.last_name,
+    firstName: t.first_name,
+    patronymic: t.patronymic,
+    department: t.department,
+    photo: t.photo,
+    subjects: t.subjects ? t.subjects.split('|') : [],
+    ratings,
+    comments,
+    overall: overall(ratings)
+  });
 });
 
-/* Сильная модерация мата */
-// Нормализация и проверка: кир/лат, 1337, пробелы/символы, удвоения
-const BAD_STEMS = [
-  'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
-  'пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'
-];
-const LAT2CYR = { 'a':'а','b':'в','c':'с','e':'е','h':'н','k':'к','m':'м','o':'о','p':'р','t':'т','x':'х','y':'у' };
-const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
-
-function normalizeForBadWords(s){
-  let t = String(s||'').toLowerCase();
-  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
-  t = t.replace(/[a-z]/g, ch => LAT2CYR[ch] || ch);     // латиница → «похожие» кириллические
-  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g,''); // убрать разделители
-  t = t.replace(/(.)\1{2,}/g, '$1$1');                   // сжать длинные повторения
-  return t;
-}
-function hasBadWords(text){
-  const norm = normalizeForBadWords(text);
-  return BAD_STEMS.some(st => norm.includes(st));
-}
-
-/* Комментарии + рейтинг + учёт статистики
-   ТРЕБОВАНИЕ: если текст пустой, но есть оценки — сохраняем только оценки (коммент не публикуем).
-   Бан блокирует ТОЛЬКО текстовые комментарии; оценки без текста разрешены. */
 app.post('/api/comment-with-ratings', commentPerMinuteLimiter, (req,res)=>{
   const {teacherId,text,author,ratings}=req.body||{};
   if(!teacherId) return res.status(400).json({error:'bad_request'});
 
-  const t=TEACHERS.find(x=>x.id===teacherId); if(!t) return res.status(404).json({error:'teacher_not_found'});
+  const t = getTeacherById(teacherId);
+  if(!t) return res.status(404).json({error:'teacher_not_found'});
 
   const u = getUserFromRequest(req);
   const userId = u?.id || '';
@@ -906,27 +788,26 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, (req,res)=>{
   if(!textStr && !hasRatings){
     return res.status(400).json({error:'bad_request', message:'empty'});
   }
+  
   if (textStr && u && isUserBanned(u.id)) {
     return res.status(403).json({ error:'banned', message:'commenting_banned' });
   }
-  if (textStr && hasBadWords(textStr)) return res.status(400).json({ error: 'profanity_forbidden' });
-
-  // (а) публикуем комментарий, только если есть текст
+  
+  if (textStr && hasBadWords(textStr)) {
+    return res.status(400).json({ error: 'profanity_forbidden' });
+  }
+  
+  // Публикуем комментарий, если есть текст
   if (textStr){
-    appendCommentRow({teacherId,author:authorName,text:textStr,author_uid:userId});
+    addComment({teacherId, author:authorName, text:textStr, author_uid:userId});
   }
 
-  // (б) обновляем рейтинг
+  // Обновляем рейтинг
   if(hasRatings){
-    const map=readRatingsMap(); (map[teacherId] ||= {});
-    for(const k of Object.keys(ratings)){ if(!CHARACTERISTICS_KEYS.includes(k)) continue;
-      const v=Number(ratings[k]); if(!(v>=1&&v<=5)) continue;
-      const cur=map[teacherId][k] || {sum:0,count:0}; cur.sum+=v; cur.count+=1; map[teacherId][k]=cur;
-    }
-    writeRatingsMap(map);
+    updateRatings(teacherId, ratings);
   }
-
-  // --- учёт статистики пользователя ---
+  
+  // Статистика пользователя
   if (u){
     let validRatings = 0;
     if (ratings && typeof ratings==='object'){
@@ -938,13 +819,23 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, (req,res)=>{
     incUserStats(u.id, { comments: textStr ? 1 : 0, ratings: validRatings });
   }
 
-  const rmap=readRatingsMap(); const retRatings={}; for(const k of CHARACTERISTICS_KEYS) retRatings[k]=rmap[teacherId]?.[k] || {sum:0,count:0};
-  const comments=readCommentsFor(teacherId);
-  res.json({ok:true, teacher:{...t, ratings:retRatings, comments, overall:overall(retRatings)}});
+  const retRatings = getRatingsForTeacher(teacherId);
+  const comments = getCommentsForTeacher(teacherId);
+  res.json({ok:true, teacher:{
+    id: t.id,
+    lastName: t.last_name,
+    firstName: t.first_name,
+    patronymic: t.patronymic,
+    department: t.department,
+    photo: t.photo,
+    subjects: t.subjects ? t.subjects.split('|') : [],
+    ratings:retRatings,
+    comments,
+    overall:overall(retRatings)
+  }});
 });
 
-/* Голосование за комментарии (лайк/дизлайк/снятие голоса) */
-app.post('/api/comment/vote', postLimiter, (req,res)=>{
+app.post('/api/comment/vote', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.json({error:'unauthorized'});
 
@@ -960,25 +851,19 @@ app.post('/api/comment/vote', postLimiter, (req,res)=>{
   const prev = getUserVote(commentId, u.id);
 
   if (prev === newVote){
-    // idempotent: просто вернём текущее состояние
     const {counts} = countVotesForCommentBulk([String(commentId)], u.id);
     const cnt = counts[String(commentId)] || {likes:0,dislikes:0};
     return res.json({ok:true, likes:cnt.likes, dislikes:cnt.dislikes, myVote:newVote});
   }
 
-  // применяем
   setUserVote(commentId, u.id, newVote);
 
-  // дельты по статистике
   const cast_like     = (newVote===1?1:0)  - (prev===1?1:0);
   const cast_dislike  = (newVote===-1?1:0) - (prev===-1?1:0);
-  const recv_like     = cast_like;    // для автора коммента
-  const recv_dislike  = cast_dislike; // для автора коммента
+  const recv_like     = cast_like;
+  const recv_dislike  = cast_dislike;
 
-  // обновим статистику голосовавшего
   if (cast_like || cast_dislike) incUserStats(u.id, { cast_like, cast_dislike });
-
-  // обновим статистику автора комментария
   if (c.author_uid) incUserStats(String(c.author_uid), { recv_like, recv_dislike });
 
   const {counts} = countVotesForCommentBulk([String(commentId)], u.id);
@@ -986,7 +871,8 @@ app.post('/api/comment/vote', postLimiter, (req,res)=>{
   res.json({ok:true, likes:cnt.likes, dislikes:cnt.dislikes, myVote:newVote});
 });
 
-/* Админ утилиты */
+/* --- ADMIN API --- */
+
 function requireAdmin(req,res,next){
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({error:'unauthorized'});
@@ -995,40 +881,11 @@ function requireAdmin(req,res,next){
   next();
 }
 
-function deleteCommentById(commentId){
-  const target = COMMENTS_BY_ID.get(String(commentId));
-  if (!target) return { ok:false, error:'not_found' };
-
-  // считаем лайки/дизлайки по комменту для корректировки стат
-  const { counts } = countVotesForCommentBulk([String(commentId)], null);
-  const cnt = counts[String(commentId)] || { likes:0, dislikes:0 };
-
-  // вычтем у автора полученные лайки/дизлайки и комментарий
-  if (target.author_uid) {
-    incUserStats(String(target.author_uid), {
-      comments: -1,
-      recv_like: -(cnt.likes||0),
-      recv_dislike: -(cnt.dislikes||0)
-    });
-  }
-
-  const remaining = COMMENTS_CACHE.filter(c => String(c.id) !== String(commentId));
-  rebuildCommentsCache(remaining);
-  flushCommentsFile();
-
-  // чистим голоса по нему
-  const votes = readVotesRows().filter(v => String(v.commentId)!==String(commentId));
-  writeVotesRows(votes);
-
-  return { ok:true };
-}
-
-/* --- Admin API --- */
-// пользователи, оставлявшие комментарии
 app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
-  const comments = readCommentsAll();
+  const comments = getAllComments();
   const counts = {};
   const lastTs = {};
+  
   for (const c of comments) {
     const uid = String(c.author_uid||'').trim();
     if (!uid) continue;
@@ -1036,8 +893,10 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
     lastTs[uid] = Math.max(lastTs[uid]||0, Number(c.ts)||0);
   }
 
-  const users = readUsersRows();
+  const stmt = db.prepare('SELECT * FROM users');
+  const users = stmt.all();
   const out = [];
+  
   for (const u of users) {
     const uid = String(u.id||'');
     const cnt = counts[uid] || Number(u.comment_count||0) || 0;
@@ -1060,21 +919,23 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
   res.json({ ok:true, users: out });
 });
 
-// комментарии конкретного пользователя
 app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
   const userId = String(req.query.userId||'').trim();
   if (!userId) return res.status(400).json({ error:'bad_request' });
 
-  const all = readCommentsAll().filter(c=>String(c.author_uid||'')===userId).sort((a,b)=>b.ts-a.ts);
-  const teacherMap = new Map(TEACHERS.map(t=>[t.id, t]));
+  const stmt = db.prepare('SELECT * FROM comments WHERE author_uid = ? ORDER BY ts DESC');
+  const all = stmt.all(userId);
+  
+  const teachers = getAllTeachers();
+  const teacherMap = new Map(teachers.map(t=>[t.id, t]));
   const user = findUserById(userId);
 
   const comments = all.map(c=>{
-    const teacher = teacherMap.get(c.teacherId);
-    const fio = teacher ? [teacher.lastName, teacher.firstName, teacher.patronymic].filter(Boolean).join(' ') : '';
+    const teacher = teacherMap.get(c.teacher_id);
+    const fio = teacher ? [teacher.last_name, teacher.first_name, teacher.patronymic].filter(Boolean).join(' ') : '';
     return {
       id: c.id,
-      teacherId: c.teacherId,
+      teacherId: c.teacher_id,
       teacher_name: fio,
       ts: c.ts,
       ts_iso: c.ts_iso,
@@ -1094,10 +955,10 @@ app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
   });
 });
 
-// полный список пользователей с флагом бана
 app.get('/api/admin/users', requireAdmin, (req,res)=>{
-  const users = readUsersRows();
-  const collator = new Intl.Collator('ru', { sensitivity:'base' });
+  const stmt = db.prepare('SELECT * FROM users ORDER BY email');
+  const users = stmt.all();
+  
   const out = users.map(u=>({
     id: u.id,
     email: u.email || '',
@@ -1105,36 +966,51 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
     comment_count: Number(u.comment_count||0) || 0,
     rating_count: Number(u.rating_count||0) || 0,
     is_banned: isUserBanned(u.id)
-  })).sort((a,b)=>collator.compare(a.email||'', b.email||''));
+  }));
+  
   res.json({ ok:true, users: out });
 });
 
-// последние N комментариев (для модерации, быстрый просмотр)
 app.get('/api/admin/comments', requireAdmin, (req,res)=>{
   const limit = Math.max(1, Math.min(500, Number(req.query.limit||100)));
-  const all = readCommentsAll().sort((a,b)=>b.ts-a.ts).slice(0,limit);
+  const stmt = db.prepare('SELECT * FROM comments ORDER BY ts DESC LIMIT ?');
+  const all = stmt.all(limit);
+  
   const out = all.map(c=>{
     const u = c.author_uid ? findUserById(String(c.author_uid)) : null;
     return {
-      id:c.id, teacherId:c.teacherId, ts:c.ts, ts_iso:c.ts_iso,
+      id:c.id, teacherId:c.teacher_id, ts:c.ts, ts_iso:c.ts_iso,
       text:c.text, author:c.author,
       author_uid:c.author_uid||'',
       author_email:u?.email||''
     };
   });
+  
   res.json({ ok:true, comments: out });
 });
 
-// удалить комментарий
 app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
   const { commentId } = req.body || {};
   if (!commentId) return res.status(400).json({error:'bad_request'});
-  const r = deleteCommentById(commentId);
-  if (!r.ok) return res.status(404).json(r);
+  
+  const comment = getCommentById(commentId);
+  if (!comment) return res.status(404).json({error:'not_found'});
+  
+  const { counts } = countVotesForCommentBulk([String(commentId)], null);
+  const cnt = counts[String(commentId)] || { likes:0, dislikes:0 };
+  
+  if (comment.author_uid) {
+    incUserStats(String(comment.author_uid), {
+      comments: -1,
+      recv_like: -(cnt.likes||0),
+      recv_dislike: -(cnt.dislikes||0)
+    });
+  }
+  
+  deleteComment(commentId);
   return res.json({ ok:true });
 });
 
-// поиск пользователя и бан/разбан комментирования
 app.get('/api/admin/user/find', requireAdmin, (req,res)=>{
   const email = String(req.query.email||'').toLowerCase().trim();
   if (!email) return res.status(400).json({error:'bad_request'});
@@ -1150,42 +1026,203 @@ app.post('/api/admin/user/ban', requireAdmin, express.json(), (req,res)=>{
   if (!u && email) u = findUserByEmail(String(email).toLowerCase());
   if (!u) return res.status(404).json({ error:'user_not_found' });
 
-  const updated = { ...BANS };
-  updated[String(u.id)] = { is_banned: !!banned, reason: String(reason||''), ts: Date.now() };
-  writeBansMap(updated);
+  setBanStatus(u.id, !!banned, String(reason||''));
   return res.json({ ok:true, user: { id:u.id, email:u.email, is_banned: !!banned } });
 });
 
-// список учителей / CRUD учителей
 app.get('/api/admin/teachers', requireAdmin, (req,res)=>{
-  return res.json({ ok:true, teachers: TEACHERS });
+  const teachers = getAllTeachers();
+  const result = teachers.map(t => ({
+    ...t,
+    subjects: t.subjects ? t.subjects.split('|') : []
+  }));
+  return res.json({ ok:true, teachers: result });
 });
 
 app.post('/api/admin/teacher/upsert', requireAdmin, express.json(), (req,res)=>{
   const { id, lastName, firstName, patronymic, department, subjects, photo } = req.body || {};
   upsertTeacher({ id, lastName, firstName, patronymic, department, subjects, photo });
-  return res.json({ ok:true, total: TEACHERS.length });
+  return res.json({ ok:true, total: getAllTeachers().length });
 });
 
 app.post('/api/admin/teacher/delete', requireAdmin, express.json(), (req,res)=>{
   const { id } = req.body || {};
   if (!id) return res.status(400).json({error:'bad_request'});
   deleteTeacherById(String(id));
-  return res.json({ ok:true, total: TEACHERS.length });
+  return res.json({ ok:true, total: getAllTeachers().length });
 });
 
-/* Старый лог входа/выхода (опционально) */
-app.post('/api/auth/log', postLimiter, (req,res)=>{
-  const {action,email}=req.body||{}; const a=(action||'').toLowerCase();
-  if(!['login','logout'].includes(a)) return res.status(400).json({error:'bad_action'});
-  const ip=(req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.socket.remoteAddress || '';
-  const ua=req.headers['user-agent']||''; const ts=Date.now();
-  fs.appendFileSync(LOGIN_CSV,toCSVRow([ts,new Date(ts).toISOString(),a,(email||'').slice(0,100),ip,ua]),'utf-8');
-  res.json({ok:true});
+/* --- ADMIN SECURITY ENDPOINTS --- */
+
+// Просмотр логов безопасности
+app.get('/api/admin/security/logs', requireAdmin, (req,res)=>{
+  const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+  const offset = parseInt(req.query.offset) || 0;
+  const severity = req.query.severity || null;
+  
+  let query = 'SELECT * FROM security_log';
+  let params = [];
+  
+  if (severity) {
+    query += ' WHERE severity = ?';
+    params.push(severity);
+  }
+  
+  query += ' ORDER BY ts DESC LIMIT ? OFFSET ?';
+  params.push(limit, offset);
+  
+  const logs = db.prepare(query).all(...params);
+  const total = db.prepare('SELECT COUNT(*) as count FROM security_log').get();
+  
+  res.json({
+    ok: true,
+    logs: logs.map(log => ({
+      ...log,
+      details: log.details ? JSON.parse(log.details) : null
+    })),
+    total: total.count,
+    limit,
+    offset
+  });
 });
 
-/* ---- Email-based auth ---- */
-app.post('/api/auth/request', authRequestLimiter, async (req,res)=>{
+// Просмотр активных сессий
+app.get('/api/admin/security/sessions', requireAdmin, (req,res)=>{
+  const sessions = db.prepare(`
+    SELECT s.id, s.user_id, s.created_ts, s.last_activity_ts, s.expires_ts, s.ip, s.user_agent, s.is_active,
+           u.email, u.username
+    FROM sessions s
+    LEFT JOIN users u ON s.user_id = u.id
+    WHERE s.is_active = 1 AND s.expires_ts > ?
+    ORDER BY s.last_activity_ts DESC
+  `).all(Date.now());
+  
+  res.json({
+    ok: true,
+    sessions: sessions.map(s => ({
+      id: s.id,
+      userId: s.user_id,
+      email: s.email,
+      username: s.username,
+      createdAt: new Date(s.created_ts).toISOString(),
+      lastActivity: new Date(s.last_activity_ts).toISOString(),
+      expiresAt: new Date(s.expires_ts).toISOString(),
+      ip: s.ip,
+      userAgent: s.user_agent
+    })),
+    total: sessions.length
+  });
+});
+
+// Удаление всех сессий пользователя (принудительный выход)
+app.post('/api/admin/security/revoke-sessions', requireAdmin, express.json(), (req,res)=>{
+  const { userId } = req.body || {};
+  if (!userId) return res.status(400).json({error:'bad_request'});
+  
+  const admin = getUserFromRequest(req);
+  invalidateAllUserSessions(userId);
+  
+  logSecurityEvent('admin_revoked_sessions', {
+    adminId: admin.id,
+    adminEmail: admin.email,
+    targetUserId: userId,
+    ip: getClientIp(req),
+    userAgent: req.headers['user-agent'] || '',
+    severity: 'warning'
+  });
+  
+  res.json({ ok: true, message: 'Все сессии пользователя удалены' });
+});
+
+// Статистика попыток входа
+app.get('/api/admin/security/login-attempts', requireAdmin, (req,res)=>{
+  const windowMs = parseInt(req.query.window) || 3600000; // По умолчанию последний час
+  const cutoff = Date.now() - windowMs;
+  
+  const attempts = db.prepare(`
+    SELECT email, ip, COUNT(*) as total, SUM(success) as successful, MAX(ts) as last_attempt
+    FROM login_attempts
+    WHERE ts > ?
+    GROUP BY email, ip
+    ORDER BY total DESC
+    LIMIT 100
+  `).all(cutoff);
+  
+  res.json({
+    ok: true,
+    attempts: attempts.map(a => ({
+      email: a.email,
+      ip: a.ip,
+      total: a.total,
+      successful: a.successful || 0,
+      failed: a.total - (a.successful || 0),
+      lastAttempt: new Date(a.last_attempt).toISOString()
+    })),
+    windowMs
+  });
+});
+
+/* --- USER SECURITY ENDPOINTS --- */
+
+// Просмотр собственных активных сессий
+app.get('/api/user/sessions', (req,res)=>{
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({error:'unauthorized'});
+  
+  const sessions = db.prepare(`
+    SELECT id, created_ts, last_activity_ts, expires_ts, ip, user_agent
+    FROM sessions
+    WHERE user_id = ? AND is_active = 1 AND expires_ts > ?
+    ORDER BY last_activity_ts DESC
+  `).all(u.id, Date.now());
+  
+  res.json({
+    ok: true,
+    sessions: sessions.map(s => ({
+      id: s.id,
+      createdAt: new Date(s.created_ts).toISOString(),
+      lastActivity: new Date(s.last_activity_ts).toISOString(),
+      expiresAt: new Date(s.expires_ts).toISOString(),
+      ip: s.ip,
+      userAgent: s.user_agent,
+      isCurrent: false // TODO: определять текущую сессию
+    }))
+  });
+});
+
+// Удаление всех своих сессий кроме текущей
+app.post('/api/user/revoke-other-sessions', (req,res)=>{
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({error:'unauthorized'});
+  
+  const cookies = parseCookies(req);
+  const currentToken = cookies[SESSION_COOKIE];
+  const currentTokenHash = currentToken ? hashToken(currentToken) : null;
+  
+  if (currentTokenHash) {
+    db.prepare(`
+      UPDATE sessions 
+      SET is_active = 0 
+      WHERE user_id = ? AND token_hash != ? AND is_active = 1
+    `).run(u.id, currentTokenHash);
+  }
+  
+  logSecurityEvent('user_revoked_other_sessions', {
+    userId: u.id,
+    email: u.email,
+    ip: getClientIp(req),
+    userAgent: req.headers['user-agent'] || ''
+  });
+  
+  res.json({ ok: true, message: 'Все остальные сессии удалены' });
+});
+
+/* --- AUTH --- */
+
+app.post('/api/auth/request', authLimiter, async (req,res)=>{
+  const ip = getClientIp(req);
+  const ua = req.headers['user-agent'] || '';
+  
   try{
     let email, sid_token;
     try{
@@ -1197,16 +1234,38 @@ app.post('/api/auth/request', authRequestLimiter, async (req,res)=>{
       sid_token = null;
     }
 
+    // Проверка на слишком много попыток входа
+    const attempts = getRecentLoginAttempts(email, ip);
+    if (attempts.count > MAX_LOGIN_ATTEMPTS && attempts.successful < 1) {
+      logSecurityEvent('login_rate_limit_exceeded', {
+        email,
+        ip,
+        userAgent: ua,
+        attempts: attempts.count,
+        severity: 'warning'
+      });
+      return res.status(429).json({ 
+        error: 'too_many_attempts',
+        message: 'Слишком много попыток входа. Попробуйте позже.'
+      });
+    }
+
     const code = ('' + Math.floor(100000 + Math.random()*900000)).slice(0,6);
-    const sessionId = 'a-' + crypto.randomBytes(9).toString('hex');
+    const sessionId = 'a-' + crypto.randomBytes(16).toString('hex');
 
     PENDING_AUTH.set(sessionId, {
       email, sid_token, code,
       created: Date.now(),
       seenIds: new Set(),
       verified: false,
-      ip: getClientIp(req),
-      ua: req.headers['user-agent']||''
+      ip,
+      ua
+    });
+
+    logSecurityEvent('auth_request_initiated', {
+      email,
+      ip,
+      userAgent: ua
     });
 
     return res.json({
@@ -1218,12 +1277,18 @@ app.post('/api/auth/request', authRequestLimiter, async (req,res)=>{
       expires_in_ms: AUTH_SESSION_TTL_MS,
       required_domain: ALLOWED_EMAIL_DOMAIN
     });
-  }catch{
+  }catch(err){
+    logSecurityEvent('auth_request_error', {
+      error: err.message,
+      ip,
+      userAgent: ua,
+      severity: 'error'
+    });
     return res.status(500).json({ error:'auth_request_failed' });
   }
 });
 
-app.get('/api/auth/poll', authPollLimiter, async (req,res)=>{
+app.get('/api/auth/poll', authLimiter, async (req,res)=>{
   const sessionId = String(req.query.session_id||'');
   const rec = PENDING_AUTH.get(sessionId);
   if (!rec) return res.status(404).json({ error:'no_auth_session' });
@@ -1256,10 +1321,25 @@ app.get('/api/auth/poll', authPollLimiter, async (req,res)=>{
     if (!codeFound) continue;
 
     if (codeFound !== rec.code){
+      recordLoginAttempt(from, rec.ip, false);
+      logSecurityEvent('login_invalid_code', {
+        email: from,
+        ip: rec.ip,
+        userAgent: rec.ua,
+        severity: 'warning'
+      });
       continue;
     }
 
     if (!from.endsWith(ALLOWED_EMAIL_DOMAIN)){
+      recordLoginAttempt(from, rec.ip, false);
+      logSecurityEvent('login_wrong_domain', {
+        email: from,
+        domain: from.split('@')[1],
+        ip: rec.ip,
+        userAgent: rec.ua,
+        severity: 'warning'
+      });
       return res.json({
         status:'wrong_domain',
         sender_email: from,
@@ -1267,19 +1347,26 @@ app.get('/api/auth/poll', authPollLimiter, async (req,res)=>{
       });
     }
 
-    // авторизация ок
     rec.verified = true;
     const user = upsertUserOnLogin(from);
+    
+    // Записываем успешную попытку входа
+    recordLoginAttempt(from, rec.ip, true);
+    
     const token = createSession(user.id, req);
     setSessionCookie(res, token);
 
     try{
-      fs.appendFileSync(
-        LOGIN_CSV,
-        toCSVRow([Date.now(), new Date().toISOString(), 'login', user.email, getClientIp(req), req.headers['user-agent']||'']),
-        'utf-8'
-      );
+      const stmt = db.prepare('INSERT INTO login_events (ts, ts_iso, action, email, ip, ua) VALUES (?, ?, ?, ?, ?, ?)');
+      stmt.run(Date.now(), new Date().toISOString(), 'login', user.email, getClientIp(req), req.headers['user-agent']||'');
     }catch{}
+    
+    logSecurityEvent('login_successful', {
+      userId: user.id,
+      email: user.email,
+      ip: rec.ip,
+      userAgent: rec.ua
+    });
 
     PENDING_AUTH.delete(sessionId);
     return res.json({
@@ -1302,7 +1389,6 @@ app.get('/api/auth/poll', authPollLimiter, async (req,res)=>{
   return res.json({ status:'pending' });
 });
 
-// Текущий пользователь (+флаги admin/ban)
 app.get('/api/auth/me', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.json({ loggedIn:false });
@@ -1326,23 +1412,34 @@ app.get('/api/auth/me', (req,res)=>{
   });
 });
 
-// Логаут
-app.post('/api/auth/logout', postLimiter, (req,res)=>{
+app.post('/api/auth/logout', (req,res)=>{
   const u = getUserFromRequest(req);
+  const cookies = parseCookies(req);
+  const token = cookies[SESSION_COOKIE];
+  
+  if (token) {
+    invalidateSession(token);
+  }
+  
   clearSessionCookie(res);
+  
   try{
     if (u){
-      fs.appendFileSync(
-        LOGIN_CSV,
-        toCSVRow([Date.now(), new Date().toISOString(), 'logout', u.email, getClientIp(req), req.headers['user-agent']||'']),
-        'utf-8'
-      );
+      const stmt = db.prepare('INSERT INTO login_events (ts, ts_iso, action, email, ip, ua) VALUES (?, ?, ?, ?, ?, ?)');
+      stmt.run(Date.now(), new Date().toISOString(), 'logout', u.email, getClientIp(req), req.headers['user-agent']||'');
+      
+      logSecurityEvent('logout', {
+        userId: u.id,
+        email: u.email,
+        ip: getClientIp(req),
+        userAgent: req.headers['user-agent'] || ''
+      });
     }
   }catch{}
+  
   return res.json({ ok:true });
 });
 
-// Статистика пользователя (для поповера; без флагов admin/ban)
 app.get('/api/user/stats', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.json({ ok:false, error:'unauthorized' });
@@ -1362,11 +1459,44 @@ app.get('/api/user/stats', (req,res)=>{
   });
 });
 
+/* Catch-all для SPA */
 app.get(/^\/(?!.*\.).*$/, (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
+/* Graceful shutdown */
+process.on('SIGINT', () => {
+  console.log('\n👋 Закрываем соединение с базой данных...');
+  db.close();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n👋 Закрываем соединение с базой данных...');
+  db.close();
+  process.exit(0);
+});
+
 app.listen(PORT, ()=>{
-  console.log(`Server on http://localhost:${PORT}`);
-  if(!fs.existsSync(TEACHERS_CSV)) console.warn(`⚠️ Не найден ${TEACHERS_CSV}. Положи letovo_teachers.csv в папку data/`);
+  const teachersCount = db.prepare('SELECT COUNT(*) as count FROM teachers').get().count;
+  const usersCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
+  const commentsCount = db.prepare('SELECT COUNT(*) as count FROM comments').get().count;
+  
+  console.log('\n' + '='.repeat(60));
+  console.log('🎓  LETO TALKS — Платформа рейтинга учителей');
+  console.log('='.repeat(60));
+  console.log('');
+  console.log('🌐  Сервер:        http://localhost:' + PORT);
+  console.log('📊  База данных:   SQLite (WAL mode)');
+  console.log('🔒  Безопасность:  Helmet + Rate Limiting');
+  console.log('');
+  console.log('📈  Статистика:');
+  console.log('    👨‍🏫 Учителя:    ' + teachersCount);
+  console.log('    👥 Пользователи: ' + usersCount);
+  console.log('    💬 Комментарии:  ' + commentsCount);
+  console.log('    🛡️  Администраторы: ' + ADMIN_EMAILS.size);
+  console.log('');
+  console.log('✅  Сервер готов к работе!');
+  console.log('='.repeat(60));
+  console.log('');
 });
