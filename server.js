@@ -66,7 +66,7 @@ app.use('/photo', express.static(PHOTO_DIR));
 function ensureDirsAndDb() {
   if (!fs.existsSync(DATA_DIR))  fs.mkdirSync(DATA_DIR, {recursive:true});
   if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR, {recursive:true});
-  
+
   if (!fs.existsSync(DB_PATH)) {
     console.error('❌ База данных не найдена!');
     console.log('Запустите миграцию: npm run migrate');
@@ -79,6 +79,23 @@ ensureDirsAndDb();
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+
+// Создаем таблицу для инвентаря пользователей
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    item_type TEXT NOT NULL,
+    item_name TEXT NOT NULL,
+    purchase_date INTEGER NOT NULL,
+    is_active INTEGER DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)`);
+
+// Индексы для быстрого поиска
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_user_id ON user_inventory(user_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_item_id ON user_inventory(item_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_active ON user_inventory(user_id, is_active) WHERE is_active = 1`);
 
 console.log('⚡ Инициализация сервера...');
 console.log('✅ База данных подключена');
@@ -100,11 +117,11 @@ function initSecurityTables() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
-  
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_ts)`);
-  
+
   // Таблица логов безопасности
   db.exec(`
     CREATE TABLE IF NOT EXISTS security_log (
@@ -120,11 +137,11 @@ function initSecurityTables() {
       severity TEXT DEFAULT 'info'
     )
   `);
-  
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_ts ON security_log(ts)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_user ON security_log(user_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_type ON security_log(event_type)`);
-  
+
   // Таблица попыток входа (для защиты от брутфорса)
   db.exec(`
     CREATE TABLE IF NOT EXISTS login_attempts (
@@ -135,7 +152,7 @@ function initSecurityTables() {
       success INTEGER DEFAULT 0
     )
   `);
-  
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email, ts)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, ts)`);
 }
@@ -211,13 +228,13 @@ function isAdminUser(u) {
 
 const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 
-function overall(r){ 
-  let tot=0,cnt=0; 
-  for(const k of CHARACTERISTICS_KEYS){ 
-    const v=r[k]; 
-    if(v&&v.count){ tot+=v.sum/v.count; cnt++; } 
-  } 
-  return cnt?tot/cnt:0; 
+function overall(r){
+  let tot=0,cnt=0;
+  for(const k of CHARACTERISTICS_KEYS){
+    const v=r[k];
+    if(v&&v.count){ tot+=v.sum/v.count; cnt++; }
+  }
+  return cnt?tot/cnt:0;
 }
 
 /* API helper functions */
@@ -295,7 +312,7 @@ function deleteComment(commentId) {
 
 function updateRatings(teacherId, ratings) {
   const upsert = db.prepare('INSERT INTO ratings (teacher_id, key, sum, count) VALUES (?, ?, ?, ?) ON CONFLICT(teacher_id, key) DO UPDATE SET sum = sum + excluded.sum, count = count + excluded.count');
-  
+
   for (const key of Object.keys(ratings)) {
     if (!CHARACTERISTICS_KEYS.includes(key)) continue;
     const v = Number(ratings[key]);
@@ -323,35 +340,56 @@ function setUserVote(commentId, userId, newVote) {
 
 function countVotesForCommentBulk(commentIds, myUserId = null) {
   if (!commentIds.length) return { counts: {}, myVotes: {} };
-  
+
   const placeholders = commentIds.map(() => '?').join(',');
   const stmt = db.prepare(`SELECT comment_id, vote FROM comment_votes WHERE comment_id IN (${placeholders})`);
   const rows = stmt.all(...commentIds);
-  
+
   const counts = {};
   const myVotes = {};
   const userIdStr = myUserId ? String(myUserId) : null;
-  
+
   for (const cid of commentIds) {
     counts[String(cid)] = { likes: 0, dislikes: 0 };
   }
-  
+
   for (const row of rows) {
     const key = String(row.comment_id);
     if (!counts[key]) counts[key] = { likes: 0, dislikes: 0 };
-    
+
     if (row.vote === 1) counts[key].likes++;
     else if (row.vote === -1) counts[key].dislikes++;
-    
+
     if (userIdStr && row.user_id === userIdStr) {
       myVotes[key] = row.vote;
     }
   }
-  
+
   return { counts, myVotes };
 }
 
 // Users
+
+// Функция для получения отображаемого имени пользователя (с учетом купленных ников)
+function getDisplayName(user) {
+  if (!user) return 'Student';
+
+  // Сначала проверяем активный ник в инвентаре
+  const nickStmt = db.prepare(`
+    SELECT item_name FROM user_inventory
+    WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
+    LIMIT 1
+  `);
+
+  const activeNick = nickStmt.get(user.id);
+  if (activeNick) {
+    return activeNick.item_name;
+  }
+
+  // Иначе используем стандартное имя
+  return (user.username || user.email || 'Student').split('@')[0];
+}
+
 function findUserByEmail(email) {
   const stmt = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)');
   return stmt.get(email);
@@ -365,9 +403,9 @@ function findUserById(userId) {
 function upsertUserOnLogin(email) {
   const now = Date.now();
   const username = String(email).split('@')[0];
-  
+
   let user = findUserByEmail(email);
-  
+
   if (!user) {
     const id = 'u-' + crypto.randomBytes(8).toString('hex');
     const stmt = db.prepare('INSERT INTO users (id, email, username, created_ts, last_login_ts, login_count, comment_count, rating_count, cast_likes, cast_dislikes, received_likes, received_dislikes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
@@ -378,12 +416,12 @@ function upsertUserOnLogin(email) {
     stmt.run(username, now, user.id);
     user = findUserById(user.id);
   }
-  
+
   return user;
 }
 
 function incUserStats(userId, { comments = 0, ratings = 0, cast_like = 0, cast_dislike = 0, recv_like = 0, recv_dislike = 0 } = {}) {
-  const stmt = db.prepare(`UPDATE users SET 
+  const stmt = db.prepare(`UPDATE users SET
     comment_count = comment_count + ?,
     rating_count = rating_count + ?,
     cast_likes = cast_likes + ?,
@@ -410,7 +448,7 @@ function upsertTeacher(teacher) {
   const { id, lastName, firstName, patronymic, department, subjects, photo } = teacher;
   const subjectsStr = Array.isArray(subjects) ? subjects.join('|') : String(subjects || '');
   const photoStr = photo ? (photo.startsWith('/photo/') ? photo : `/photo/${photo}`) : null;
-  
+
   const stmt = db.prepare('INSERT INTO teachers (id, last_name, first_name, patronymic, department, subjects, photo) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_name = excluded.last_name, first_name = excluded.first_name, patronymic = excluded.patronymic, department = excluded.department, subjects = excluded.subjects, photo = excluded.photo');
   stmt.run(id, lastName || '', firstName || '', patronymic || '', department || '', subjectsStr, photoStr);
 }
@@ -445,7 +483,7 @@ function parseCookies(req){
 function setSessionCookie(res, token){
   const maxAge = SESSION_TTL_MS;
   const secureFlag = IS_PRODUCTION ? '; Secure' : '';
-  res.setHeader('Set-Cookie', 
+  res.setHeader('Set-Cookie',
     `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${secureFlag}; Max-Age=${Math.floor(maxAge/1000)}`
   );
 }
@@ -463,13 +501,13 @@ function createSession(userId, req){
   const ip = getClientIp(req);
   const ua = req.headers['user-agent'] || '';
   const sessionId = 'ses-' + crypto.randomBytes(12).toString('hex');
-  
+
   // Ограничение количества сессий на пользователя
   const existingSessions = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE user_id = ? AND is_active = 1').get(userId);
   if (existingSessions && existingSessions.count >= MAX_SESSIONS_PER_USER) {
     // Удаляем самую старую сессию
     db.prepare('DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE user_id = ? AND is_active = 1 ORDER BY last_activity_ts ASC LIMIT 1)').run(userId);
-    
+
     logSecurityEvent('session_limit_reached', {
       userId,
       ip,
@@ -477,21 +515,21 @@ function createSession(userId, req){
       severity: 'warning'
     });
   }
-  
+
   const stmt = db.prepare(`
     INSERT INTO sessions (id, token_hash, user_id, created_ts, last_activity_ts, expires_ts, ip, user_agent, is_active)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
   `);
-  
+
   stmt.run(sessionId, tokenHash, userId, now, now, expiresTs, ip, ua);
-  
+
   logSecurityEvent('session_created', {
     userId,
     sessionId,
     ip,
     userAgent: ua
   });
-  
+
   return token;
 }
 
@@ -499,16 +537,16 @@ function getUserFromRequest(req){
   const cookies = parseCookies(req);
   const token = cookies[SESSION_COOKIE];
   if (!token) return null;
-  
+
   const tokenHash = hashToken(token);
   const stmt = db.prepare(`
-    SELECT * FROM sessions 
+    SELECT * FROM sessions
     WHERE token_hash = ? AND is_active = 1 AND expires_ts > ?
   `);
-  
+
   const session = stmt.get(tokenHash, Date.now());
   if (!session) return null;
-  
+
   // Проверка IP (опционально, для усиленной безопасности)
   const currentIp = getClientIp(req);
   if (session.ip && session.ip !== currentIp) {
@@ -520,10 +558,10 @@ function getUserFromRequest(req){
     });
     // Не блокируем, но логируем (IP может меняться легитимно)
   }
-  
+
   // Обновляем время последней активности
   db.prepare('UPDATE sessions SET last_activity_ts = ? WHERE id = ?').run(Date.now(), session.id);
-  
+
   const user = findUserById(session.user_id);
   return user || null;
 }
@@ -699,11 +737,11 @@ app.get('/api/departments',(req,res)=>{
 app.get('/api/teachers',(req,res)=>{
   const teachers = getAllTeachers();
   const ratingsMap = getAllRatings();
-  
+
   const result = teachers.map(t=>{
     const ratings = {};
-    for(const k of CHARACTERISTICS_KEYS){ 
-      ratings[k] = ratingsMap[t.id]?.[k] || {sum:0,count:0}; 
+    for(const k of CHARACTERISTICS_KEYS){
+      ratings[k] = ratingsMap[t.id]?.[k] || {sum:0,count:0};
     }
     return {
       id: t.id,
@@ -717,17 +755,17 @@ app.get('/api/teachers',(req,res)=>{
       overall: overall(ratings)
     };
   });
-  
+
   res.json({teachers: result});
 });
 
 app.get('/api/teacher/:id',(req,res)=>{
   const t = getTeacherById(req.params.id);
   if(!t) return res.status(404).json({error:'not_found'});
-  
+
   const ratings = getRatingsForTeacher(t.id);
   const commentsRaw = getCommentsForTeacher(t.id);
-  
+
   const u = getUserFromRequest(req);
   const myId = u?.id || null;
   const amAdmin = isAdminUser(u);
@@ -788,15 +826,15 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, (req,res)=>{
   if(!textStr && !hasRatings){
     return res.status(400).json({error:'bad_request', message:'empty'});
   }
-  
+
   if (textStr && u && isUserBanned(u.id)) {
     return res.status(403).json({ error:'banned', message:'commenting_banned' });
   }
-  
+
   if (textStr && hasBadWords(textStr)) {
     return res.status(400).json({ error: 'profanity_forbidden' });
   }
-  
+
   // Публикуем комментарий, если есть текст
   if (textStr){
     addComment({teacherId, author:authorName, text:textStr, author_uid:userId});
@@ -806,7 +844,7 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, (req,res)=>{
   if(hasRatings){
     updateRatings(teacherId, ratings);
   }
-  
+
   // Статистика пользователя
   if (u){
     let validRatings = 0;
@@ -885,7 +923,7 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
   const comments = getAllComments();
   const counts = {};
   const lastTs = {};
-  
+
   for (const c of comments) {
     const uid = String(c.author_uid||'').trim();
     if (!uid) continue;
@@ -896,7 +934,7 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
   const stmt = db.prepare('SELECT * FROM users');
   const users = stmt.all();
   const out = [];
-  
+
   for (const u of users) {
     const uid = String(u.id||'');
     const cnt = counts[uid] || Number(u.comment_count||0) || 0;
@@ -925,7 +963,7 @@ app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
 
   const stmt = db.prepare('SELECT * FROM comments WHERE author_uid = ? ORDER BY ts DESC');
   const all = stmt.all(userId);
-  
+
   const teachers = getAllTeachers();
   const teacherMap = new Map(teachers.map(t=>[t.id, t]));
   const user = findUserById(userId);
@@ -958,7 +996,7 @@ app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
 app.get('/api/admin/users', requireAdmin, (req,res)=>{
   const stmt = db.prepare('SELECT * FROM users ORDER BY email');
   const users = stmt.all();
-  
+
   const out = users.map(u=>({
     id: u.id,
     email: u.email || '',
@@ -967,7 +1005,7 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
     rating_count: Number(u.rating_count||0) || 0,
     is_banned: isUserBanned(u.id)
   }));
-  
+
   res.json({ ok:true, users: out });
 });
 
@@ -975,7 +1013,7 @@ app.get('/api/admin/comments', requireAdmin, (req,res)=>{
   const limit = Math.max(1, Math.min(500, Number(req.query.limit||100)));
   const stmt = db.prepare('SELECT * FROM comments ORDER BY ts DESC LIMIT ?');
   const all = stmt.all(limit);
-  
+
   const out = all.map(c=>{
     const u = c.author_uid ? findUserById(String(c.author_uid)) : null;
     return {
@@ -985,20 +1023,20 @@ app.get('/api/admin/comments', requireAdmin, (req,res)=>{
       author_email:u?.email||''
     };
   });
-  
+
   res.json({ ok:true, comments: out });
 });
 
 app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
   const { commentId } = req.body || {};
   if (!commentId) return res.status(400).json({error:'bad_request'});
-  
+
   const comment = getCommentById(commentId);
   if (!comment) return res.status(404).json({error:'not_found'});
-  
+
   const { counts } = countVotesForCommentBulk([String(commentId)], null);
   const cnt = counts[String(commentId)] || { likes:0, dislikes:0 };
-  
+
   if (comment.author_uid) {
     incUserStats(String(comment.author_uid), {
       comments: -1,
@@ -1006,7 +1044,7 @@ app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
       recv_dislike: -(cnt.dislikes||0)
     });
   }
-  
+
   deleteComment(commentId);
   return res.json({ ok:true });
 });
@@ -1059,21 +1097,21 @@ app.get('/api/admin/security/logs', requireAdmin, (req,res)=>{
   const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
   const offset = parseInt(req.query.offset) || 0;
   const severity = req.query.severity || null;
-  
+
   let query = 'SELECT * FROM security_log';
   let params = [];
-  
+
   if (severity) {
     query += ' WHERE severity = ?';
     params.push(severity);
   }
-  
+
   query += ' ORDER BY ts DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
-  
+
   const logs = db.prepare(query).all(...params);
   const total = db.prepare('SELECT COUNT(*) as count FROM security_log').get();
-  
+
   res.json({
     ok: true,
     logs: logs.map(log => ({
@@ -1096,7 +1134,7 @@ app.get('/api/admin/security/sessions', requireAdmin, (req,res)=>{
     WHERE s.is_active = 1 AND s.expires_ts > ?
     ORDER BY s.last_activity_ts DESC
   `).all(Date.now());
-  
+
   res.json({
     ok: true,
     sessions: sessions.map(s => ({
@@ -1118,10 +1156,10 @@ app.get('/api/admin/security/sessions', requireAdmin, (req,res)=>{
 app.post('/api/admin/security/revoke-sessions', requireAdmin, express.json(), (req,res)=>{
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({error:'bad_request'});
-  
+
   const admin = getUserFromRequest(req);
   invalidateAllUserSessions(userId);
-  
+
   logSecurityEvent('admin_revoked_sessions', {
     adminId: admin.id,
     adminEmail: admin.email,
@@ -1130,7 +1168,7 @@ app.post('/api/admin/security/revoke-sessions', requireAdmin, express.json(), (r
     userAgent: req.headers['user-agent'] || '',
     severity: 'warning'
   });
-  
+
   res.json({ ok: true, message: 'Все сессии пользователя удалены' });
 });
 
@@ -1138,7 +1176,7 @@ app.post('/api/admin/security/revoke-sessions', requireAdmin, express.json(), (r
 app.get('/api/admin/security/login-attempts', requireAdmin, (req,res)=>{
   const windowMs = parseInt(req.query.window) || 3600000; // По умолчанию последний час
   const cutoff = Date.now() - windowMs;
-  
+
   const attempts = db.prepare(`
     SELECT email, ip, COUNT(*) as total, SUM(success) as successful, MAX(ts) as last_attempt
     FROM login_attempts
@@ -1147,7 +1185,7 @@ app.get('/api/admin/security/login-attempts', requireAdmin, (req,res)=>{
     ORDER BY total DESC
     LIMIT 100
   `).all(cutoff);
-  
+
   res.json({
     ok: true,
     attempts: attempts.map(a => ({
@@ -1168,14 +1206,14 @@ app.get('/api/admin/security/login-attempts', requireAdmin, (req,res)=>{
 app.get('/api/user/sessions', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({error:'unauthorized'});
-  
+
   const sessions = db.prepare(`
     SELECT id, created_ts, last_activity_ts, expires_ts, ip, user_agent
     FROM sessions
     WHERE user_id = ? AND is_active = 1 AND expires_ts > ?
     ORDER BY last_activity_ts DESC
   `).all(u.id, Date.now());
-  
+
   res.json({
     ok: true,
     sessions: sessions.map(s => ({
@@ -1194,26 +1232,26 @@ app.get('/api/user/sessions', (req,res)=>{
 app.post('/api/user/revoke-other-sessions', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({error:'unauthorized'});
-  
+
   const cookies = parseCookies(req);
   const currentToken = cookies[SESSION_COOKIE];
   const currentTokenHash = currentToken ? hashToken(currentToken) : null;
-  
+
   if (currentTokenHash) {
     db.prepare(`
-      UPDATE sessions 
-      SET is_active = 0 
+      UPDATE sessions
+      SET is_active = 0
       WHERE user_id = ? AND token_hash != ? AND is_active = 1
     `).run(u.id, currentTokenHash);
   }
-  
+
   logSecurityEvent('user_revoked_other_sessions', {
     userId: u.id,
     email: u.email,
     ip: getClientIp(req),
     userAgent: req.headers['user-agent'] || ''
   });
-  
+
   res.json({ ok: true, message: 'Все остальные сессии удалены' });
 });
 
@@ -1222,7 +1260,7 @@ app.post('/api/user/revoke-other-sessions', (req,res)=>{
 app.post('/api/auth/request', authLimiter, async (req,res)=>{
   const ip = getClientIp(req);
   const ua = req.headers['user-agent'] || '';
-  
+
   try{
     let email, sid_token;
     try{
@@ -1244,7 +1282,7 @@ app.post('/api/auth/request', authLimiter, async (req,res)=>{
         attempts: attempts.count,
         severity: 'warning'
       });
-      return res.status(429).json({ 
+      return res.status(429).json({
         error: 'too_many_attempts',
         message: 'Слишком много попыток входа. Попробуйте позже.'
       });
@@ -1349,10 +1387,10 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
 
     rec.verified = true;
     const user = upsertUserOnLogin(from);
-    
+
     // Записываем успешную попытку входа
     recordLoginAttempt(from, rec.ip, true);
-    
+
     const token = createSession(user.id, req);
     setSessionCookie(res, token);
 
@@ -1360,7 +1398,7 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
       const stmt = db.prepare('INSERT INTO login_events (ts, ts_iso, action, email, ip, ua) VALUES (?, ?, ?, ?, ?, ?)');
       stmt.run(Date.now(), new Date().toISOString(), 'login', user.email, getClientIp(req), req.headers['user-agent']||'');
     }catch{}
-    
+
     logSecurityEvent('login_successful', {
       userId: user.id,
       email: user.email,
@@ -1400,6 +1438,7 @@ app.get('/api/auth/me', (req,res)=>{
       id: u.id,
       email: u.email,
       username: u.username,
+      display_name: getDisplayName(u),
       comment_count: Number(u.comment_count||0),
       rating_count: Number(u.rating_count||0),
       cast_likes: Number(u.cast_likes||0),
@@ -1416,18 +1455,18 @@ app.post('/api/auth/logout', (req,res)=>{
   const u = getUserFromRequest(req);
   const cookies = parseCookies(req);
   const token = cookies[SESSION_COOKIE];
-  
+
   if (token) {
     invalidateSession(token);
   }
-  
+
   clearSessionCookie(res);
-  
+
   try{
     if (u){
       const stmt = db.prepare('INSERT INTO login_events (ts, ts_iso, action, email, ip, ua) VALUES (?, ?, ?, ?, ?, ?)');
       stmt.run(Date.now(), new Date().toISOString(), 'logout', u.email, getClientIp(req), req.headers['user-agent']||'');
-      
+
       logSecurityEvent('logout', {
         userId: u.id,
         email: u.email,
@@ -1436,7 +1475,7 @@ app.post('/api/auth/logout', (req,res)=>{
       });
     }
   }catch{}
-  
+
   return res.json({ ok:true });
 });
 
@@ -1449,6 +1488,7 @@ app.get('/api/user/stats', (req,res)=>{
       id: u.id,
       email: u.email,
       username: u.username,
+      display_name: getDisplayName(u),
       comment_count: Number(u.comment_count||0),
       rating_count: Number(u.rating_count||0),
       cast_likes: Number(u.cast_likes||0),
@@ -1458,6 +1498,195 @@ app.get('/api/user/stats', (req,res)=>{
     }
   });
 });
+
+/* Store */
+
+/* --- SHOP API --- */
+
+app.get('/api/shop/items', (req, res) => {
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+
+  // Убедитесь, что этот массив существует и заполнен
+  const availableNicks = [
+    { id: 'nick-1', name: 'Умник', price: 50, category: 'nickname' },
+    { id: 'nick-2', name: 'Отличник', price: 75, category: 'nickname' },
+    { id: 'nick-3', name: 'Эрудит', price: 100, category: 'nickname' },
+    { id: 'nick-4', name: 'Профи', price: 150, category: 'nickname' },
+    { id: 'nick-5', name: 'Гуру', price: 200, category: 'nickname' },
+    { id: 'nick-6', name: 'Легенда', price: 300, category: 'nickname' },
+    { id: 'nick-7', name: 'Мастер', price: 250, category: 'nickname' },
+    { id: 'nick-8', name: 'Эксперт', price: 180, category: 'nickname' }
+  ];
+
+  console.log('🛍️ [SERVER] Отправляю товары:', availableNicks.length);
+
+  // Получаем купленные ники пользователя
+  const purchasedStmt = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ? AND item_type = ?');
+  const purchasedItems = purchasedStmt.all(u.id, 'nickname').map(row => row.item_id);
+
+  // Получаем текущий активный ник
+  const activeNickStmt = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ? AND item_type = ? AND is_active = 1');
+  const activeNick = activeNickStmt.get(u.id, 'nickname');
+
+  res.json({
+    ok: true,
+    items: availableNicks.map(item => ({
+      ...item,
+      purchased: purchasedItems.includes(item.id),
+      isActive: activeNick ? activeNick.item_id === item.id : false
+    })),
+    balance: coinsOf(u)
+  });
+});
+
+app.post('/api/shop/buy', express.json(), (req, res) => {
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+
+  const { itemId } = req.body;
+  if (!itemId) return res.status(400).json({ error: 'bad_request' });
+
+  // Определяем товары (в реальном приложении это должно быть в БД)
+  const shopItems = {
+    'nick-1': { name: 'Умник', price: 50, type: 'nickname' },
+    'nick-2': { name: 'Отличник', price: 75, type: 'nickname' },
+    'nick-3': { name: 'Эрудит', price: 100, type: 'nickname' },
+    'nick-4': { name: 'Профи', price: 150, type: 'nickname' },
+    'nick-5': { name: 'Гуру', price: 200, type: 'nickname' },
+    'nick-6': { name: 'Легенда', price: 300, type: 'nickname' },
+    'nick-7': { name: 'Мастер', price: 250, type: 'nickname' },
+    'nick-8': { name: 'Эксперт', price: 180, type: 'nickname' }
+  };
+
+  const item = shopItems[itemId];
+  if (!item) return res.status(404).json({ error: 'item_not_found' });
+
+  const userCoins = coinsOf(u);
+  if (userCoins < item.price) {
+    return res.status(400).json({ error: 'not_enough_coins' });
+  }
+
+  // Проверяем, не куплен ли уже этот ник
+  const existingStmt = db.prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ? AND item_type = ?');
+  const existing = existingStmt.get(u.id, itemId, 'nickname');
+
+  if (existing) {
+    return res.status(400).json({ error: 'already_purchased' });
+  }
+
+  // Создаем таблицу для инвентаря, если её нет
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_inventory (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      item_name TEXT NOT NULL,
+      purchase_date INTEGER NOT NULL,
+      is_active INTEGER DEFAULT 0,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Покупаем товар
+  const insertStmt = db.prepare(`
+    INSERT INTO user_inventory (user_id, item_id, item_type, item_name, purchase_date, is_active)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  insertStmt.run(u.id, itemId, item.type, item.name, Date.now(), 0);
+
+  logSecurityEvent('shop_purchase', {
+    userId: u.id,
+    itemId: itemId,
+    itemName: item.name,
+    price: item.price,
+    balanceBefore: userCoins,
+    balanceAfter: userCoins - item.price
+  });
+
+  res.json({
+    ok: true,
+    message: `Ник "${item.name}" успешно приобретен!`,
+    newBalance: userCoins - item.price
+  });
+});
+
+app.post('/api/shop/activate', express.json(), (req, res) => {
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+
+  const { itemId } = req.body;
+  if (!itemId) return res.status(400).json({ error: 'bad_request' });
+
+  // Проверяем, есть ли у пользователя этот товар
+  const itemStmt = db.prepare('SELECT id, item_name FROM user_inventory WHERE user_id = ? AND item_id = ? AND item_type = ?');
+  const item = itemStmt.get(u.id, itemId, 'nickname');
+
+  if (!item) {
+    return res.status(400).json({ error: 'item_not_owned' });
+  }
+
+  // Деактивируем все ники пользователя
+  const deactivateStmt = db.prepare('UPDATE user_inventory SET is_active = 0 WHERE user_id = ? AND item_type = ?');
+  deactivateStmt.run(u.id, 'nickname');
+
+  // Активируем выбранный ник
+  const activateStmt = db.prepare('UPDATE user_inventory SET is_active = 1 WHERE id = ?');
+  activateStmt.run(item.id);
+
+  logSecurityEvent('nickname_activated', {
+    userId: u.id,
+    itemId: itemId,
+    nickname: item.item_name
+  });
+
+  res.json({
+    ok: true,
+    message: `Ник "${item.item_name}" теперь отображается в вашем профиле!`
+  });
+});
+
+app.get('/api/shop/my-items', (req, res) => {
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+
+  const stmt = db.prepare(`
+    SELECT item_id, item_name, item_type, purchase_date, is_active
+    FROM user_inventory
+    WHERE user_id = ?
+    ORDER BY purchase_date DESC
+  `);
+
+  const items = stmt.all(u.id);
+
+  res.json({
+    ok: true,
+    items: items,
+    balance: coinsOf(u)
+  });
+});
+
+// Функция для получения отображаемого имени пользователя
+function getDisplayName(user) {
+  if (!user) return 'Student';
+
+  // Сначала проверяем активный ник в инвентаре
+  const nickStmt = db.prepare(`
+    SELECT item_name FROM user_inventory
+    WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
+    LIMIT 1
+  `);
+
+  const activeNick = nickStmt.get(user.id);
+  if (activeNick) {
+    return activeNick.item_name;
+  }
+
+  // Иначе используем стандартное имя
+  return (user.username || user.email || 'Student').split('@')[0];
+}
 
 /* Catch-all для SPA */
 app.get(/^\/(?!.*\.).*$/, (req, res) => {
@@ -1481,7 +1710,9 @@ app.listen(PORT, ()=>{
   const teachersCount = db.prepare('SELECT COUNT(*) as count FROM teachers').get().count;
   const usersCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
   const commentsCount = db.prepare('SELECT COUNT(*) as count FROM comments').get().count;
-  
+
+  const inventoryCount = db.prepare('SELECT COUNT(*) as count FROM user_inventory').get().count;
+
   console.log('\n' + '='.repeat(60));
   console.log('🎓  LETO TALKS — Платформа рейтинга учителей');
   console.log('='.repeat(60));
