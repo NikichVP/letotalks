@@ -21,7 +21,9 @@ const ROOT_DIR    = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const DATA_DIR    = path.join(ROOT_DIR, 'data');
 const PHOTO_DIR   = path.join(ROOT_DIR, 'photos');
-const DB_PATH     = path.join(ROOT_DIR, 'letotalks.db');
+const DB_PATH     = process.env.LETOTALKS_DB_PATH
+  ? path.resolve(process.env.LETOTALKS_DB_PATH)
+  : path.join(ROOT_DIR, 'letotalks.db');
 
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
 const SESSION_COOKIE = 'lt_session';
@@ -90,15 +92,15 @@ const authLimiter = rateLimit({
   trustProxy: false
 });
 
-// Глобальный rate limiter убран - не мешает нормальной работе API
-app.use(express.json({ limit: '1mb' }));
-app.use(express.static(PUBLIC_DIR));
-app.use('/photo', express.static(PHOTO_DIR));
-
 // Проверка и инициализация
 function ensureDirsAndDb() {
   if (!fs.existsSync(DATA_DIR))  fs.mkdirSync(DATA_DIR, {recursive:true});
   if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR, {recursive:true});
+
+  const dbDir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
 
   if (!fs.existsSync(DB_PATH)) {
     console.error('❌ База данных не найдена!');
@@ -122,13 +124,29 @@ db.exec(`
     item_type TEXT NOT NULL,
     item_name TEXT NOT NULL,
     purchase_date INTEGER NOT NULL,
+    price INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)`);
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )`);
 
 // Индексы для быстрого поиска
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_user_id ON user_inventory(user_id)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_item_id ON user_inventory(item_id)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_active ON user_inventory(user_id, is_active) WHERE is_active = 1`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_user_id ON user_inventory(user_id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_item_id ON user_inventory(item_id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_active ON user_inventory(user_id, is_active) WHERE is_active = 1`);
+
+function ensureInventorySchemaUpToDate() {
+  try {
+    const columns = db.prepare('PRAGMA table_info(user_inventory)').all();
+    const hasPrice = columns.some(col => col.name === 'price');
+    if (!hasPrice) {
+      db.exec('ALTER TABLE user_inventory ADD COLUMN price INTEGER NOT NULL DEFAULT 0');
+    }
+  } catch (err) {
+    console.error('Не удалось обновить схему user_inventory:', err);
+  }
+}
+
+ensureInventorySchemaUpToDate();
 
 console.log('⚡ Инициализация сервера...');
 console.log('✅ База данных подключена');
@@ -257,6 +275,32 @@ loadAdminEmails();
 function isAdminUser(u) {
   const email = String(u?.email || '').toLowerCase();
   return ADMIN_EMAILS.has(email);
+}
+
+function calculateEarnedCoins(user) {
+  if (!user) return 0;
+  const comments = Number(user.comment_count || 0);
+  const ratings = Number(user.rating_count || 0);
+  const receivedLikes = Number(user.received_likes || 0);
+  const receivedDislikes = Number(user.received_dislikes || 0);
+  return (comments * 5) + ratings + receivedLikes - receivedDislikes;
+}
+
+function getUserSpentCoins(userId) {
+  if (!userId) return 0;
+  const row = db.prepare('SELECT COALESCE(SUM(price), 0) as total FROM user_inventory WHERE user_id = ?').get(userId);
+  return Number(row?.total || 0);
+}
+
+function getAvailableCoins(user) {
+  if (!user) return 0;
+  const earned = calculateEarnedCoins(user);
+  const spent = getUserSpentCoins(user.id);
+  return Math.max(0, earned - spent);
+}
+
+function coinsOf(user) {
+  return getAvailableCoins(user);
 }
 
 const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
@@ -629,10 +673,14 @@ function cleanupOldLogs() {
 }
 
 // Запускаем очистку периодически
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
   cleanupExpiredSessions();
   cleanupOldLogs();
 }, SESSION_CLEANUP_INTERVAL);
+
+if (typeof cleanupTimer.unref === 'function') {
+  cleanupTimer.unref();
+}
 
 /* Rate limiters */
 function limitPerIp(minIntervalMs){
@@ -1591,6 +1639,9 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
         cast_dislikes: Number(user.cast_dislikes||0),
         received_likes: Number(user.received_likes||0),
         received_dislikes: Number(user.received_dislikes||0),
+        available_coins: getAvailableCoins(user),
+        earned_coins: calculateEarnedCoins(user),
+        spent_coins: getUserSpentCoins(user.id),
         is_admin: isAdminUser(user),
         is_banned: isUserBanned(user.id)
       }
@@ -1617,6 +1668,9 @@ app.get('/api/auth/me', (req,res)=>{
       cast_dislikes: Number(u.cast_dislikes||0),
       received_likes: Number(u.received_likes||0),
       received_dislikes: Number(u.received_dislikes||0),
+      available_coins: getAvailableCoins(u),
+      earned_coins: calculateEarnedCoins(u),
+      spent_coins: getUserSpentCoins(u.id),
       is_admin,
       is_banned
     }
@@ -1654,6 +1708,9 @@ app.post('/api/auth/logout', (req,res)=>{
 app.get('/api/user/stats', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.json({ ok:false, error:'unauthorized' });
+  const earned = calculateEarnedCoins(u);
+  const spent = getUserSpentCoins(u.id);
+  const available = Math.max(0, earned - spent);
   return res.json({
     ok:true,
     user: {
@@ -1667,6 +1724,9 @@ app.get('/api/user/stats', (req,res)=>{
       cast_dislikes: Number(u.cast_dislikes||0),
       received_likes: Number(u.received_likes||0),
       received_dislikes: Number(u.received_dislikes||0),
+      available_coins: available,
+      earned_coins: earned,
+      spent_coins: spent,
     }
   });
 });
@@ -1701,6 +1761,10 @@ app.get('/api/shop/items', (req, res) => {
   const activeNickStmt = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ? AND item_type = ? AND is_active = 1');
   const activeNick = activeNickStmt.get(u.id, 'nickname');
 
+  const balance = getAvailableCoins(u);
+  const earnedCoins = calculateEarnedCoins(u);
+  const spentCoins = getUserSpentCoins(u.id);
+
   res.json({
     ok: true,
     items: availableNicks.map(item => ({
@@ -1708,7 +1772,9 @@ app.get('/api/shop/items', (req, res) => {
       purchased: purchasedItems.includes(item.id),
       isActive: activeNick ? activeNick.item_id === item.id : false
     })),
-    balance: coinsOf(u)
+    balance,
+    earnedCoins,
+    spentCoins
   });
 });
 
@@ -1734,8 +1800,8 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   const item = shopItems[itemId];
   if (!item) return res.status(404).json({ error: 'item_not_found' });
 
-  const userCoins = coinsOf(u);
-  if (userCoins < item.price) {
+  const availableCoins = getAvailableCoins(u);
+  if (availableCoins < item.price) {
     return res.status(400).json({ error: 'not_enough_coins' });
   }
 
@@ -1747,41 +1813,33 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
     return res.status(400).json({ error: 'already_purchased' });
   }
 
-  // Создаем таблицу для инвентаря, если её нет
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS user_inventory (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      item_id TEXT NOT NULL,
-      item_type TEXT NOT NULL,
-      item_name TEXT NOT NULL,
-      purchase_date INTEGER NOT NULL,
-      is_active INTEGER DEFAULT 0,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
   // Покупаем товар
   const insertStmt = db.prepare(`
-    INSERT INTO user_inventory (user_id, item_id, item_type, item_name, purchase_date, is_active)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO user_inventory (user_id, item_id, item_type, item_name, purchase_date, price, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
-  insertStmt.run(u.id, itemId, item.type, item.name, Date.now(), 0);
+  insertStmt.run(u.id, itemId, item.type, item.name, Date.now(), item.price, 0);
+
+  const balanceAfter = getAvailableCoins(u);
+  const spentCoins = getUserSpentCoins(u.id);
+  const earnedCoins = calculateEarnedCoins(u);
 
   logSecurityEvent('shop_purchase', {
     userId: u.id,
     itemId: itemId,
     itemName: item.name,
     price: item.price,
-    balanceBefore: userCoins,
-    balanceAfter: userCoins - item.price
+    balanceBefore: availableCoins,
+    balanceAfter
   });
 
   res.json({
     ok: true,
     message: `Ник "${item.name}" успешно приобретен!`,
-    newBalance: userCoins - item.price
+    balance: balanceAfter,
+    earnedCoins,
+    spentCoins
   });
 });
 
@@ -1814,9 +1872,16 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
     nickname: item.item_name
   });
 
+  const balance = getAvailableCoins(u);
+  const spentCoins = getUserSpentCoins(u.id);
+  const earnedCoins = calculateEarnedCoins(u);
+
   res.json({
     ok: true,
-    message: `Ник "${item.item_name}" теперь отображается в вашем профиле!`
+    message: `Ник "${item.item_name}" теперь отображается в вашем профиле!`,
+    balance,
+    earnedCoins,
+    spentCoins
   });
 });
 
@@ -1833,52 +1898,25 @@ app.get('/api/shop/my-items', (req, res) => {
 
   const items = stmt.all(u.id);
 
+  const balance = getAvailableCoins(u);
+  const earnedCoins = calculateEarnedCoins(u);
+  const spentCoins = getUserSpentCoins(u.id);
+
   res.json({
     ok: true,
     items: items,
-    balance: coinsOf(u)
+    balance,
+    earnedCoins,
+    spentCoins
   });
 });
-
-// Функция для получения отображаемого имени пользователя
-function getDisplayName(user) {
-  if (!user) return 'Student';
-
-  // Сначала проверяем активный ник в инвентаре
-  const nickStmt = db.prepare(`
-    SELECT item_name FROM user_inventory
-    WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
-    LIMIT 1
-  `);
-
-  const activeNick = nickStmt.get(user.id);
-  if (activeNick) {
-    return activeNick.item_name;
-  }
-
-  // Иначе используем стандартное имя
-  return (user.username || user.email || 'Student').split('@')[0];
-}
 
 /* Catch-all для SPA */
 app.get(/^\/(?!.*\.).*$/, (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-/* Graceful shutdown */
-process.on('SIGINT', () => {
-  console.log('\n👋 Закрываем соединение с базой данных...');
-  db.close();
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n👋 Закрываем соединение с базой данных...');
-  db.close();
-  process.exit(0);
-});
-
-app.listen(PORT, ()=>{
+function printStartupInfo(port = PORT) {
   const teachersCount = db.prepare('SELECT COUNT(*) as count FROM teachers').get().count;
   const usersCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
   const commentsCount = db.prepare('SELECT COUNT(*) as count FROM comments').get().count;
@@ -1889,7 +1927,7 @@ app.listen(PORT, ()=>{
   console.log('🎓  LETO TALKS — Платформа рейтинга учителей');
   console.log('='.repeat(60));
   console.log('');
-  console.log('🌐  Сервер:        http://localhost:' + PORT);
+  console.log('🌐  Сервер:        http://localhost:' + port);
   console.log('📊  База данных:   SQLite (WAL mode)');
   console.log('🔒  Безопасность:  Helmet + Rate Limiting');
   console.log('');
@@ -1902,4 +1940,55 @@ app.listen(PORT, ()=>{
   console.log('✅  Сервер готов к работе!');
   console.log('='.repeat(60));
   console.log('');
-});
+}
+
+function startServer(port = PORT, onListen = null) {
+  const server = app.listen(port, () => {
+    const address = server.address();
+    const actualPort = typeof address === 'object' && address ? address.port : port;
+    printStartupInfo(actualPort);
+    if (typeof onListen === 'function') {
+      onListen(actualPort);
+    }
+  });
+  return server;
+}
+
+/* Graceful shutdown */
+function closeDatabaseAndExit(signal) {
+  console.log(`\n👋 (${signal}) Закрываем соединение с базой данных...`);
+  try {
+    clearInterval(cleanupTimer);
+  } catch (err) {
+    console.warn('Не удалось остановить таймер очистки:', err);
+  }
+  try {
+    db.close();
+  } catch (err) {
+    console.error('Ошибка при закрытии базы данных:', err);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => closeDatabaseAndExit('SIGINT'));
+process.on('SIGTERM', () => closeDatabaseAndExit('SIGTERM'));
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  db,
+  startServer,
+  constants: {
+    SESSION_COOKIE,
+    SESSION_TTL_MS,
+    AUTH_SESSION_TTL_MS
+  },
+  helpers: {
+    calculateEarnedCoins,
+    getUserSpentCoins,
+    getAvailableCoins
+  }
+};

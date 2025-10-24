@@ -19,17 +19,27 @@ function overall(t){ let tot=0,cnt=0; for(const c of CHARACTERISTICS){ const r=t
 const collator = new Intl.Collator('ru',{sensitivity:'base'});
 
 function coinsOf(u){
-  // На клиенте для отображения: 5 за комментарий, 1 за каждую оценку критерия, +1 за полученный лайк, -1 за полученный дизлайк
+  if (!u) return 0;
+
+  const hasAvailable = typeof u.available_coins === 'number' && !Number.isNaN(u.available_coins);
+  const hasEarned = typeof u.earned_coins === 'number' && !Number.isNaN(u.earned_coins);
+  const hasSpent = typeof u.spent_coins === 'number' && !Number.isNaN(u.spent_coins);
+
   const comments = Number(u?.comment_count||0);
   const ratings  = Number(u?.rating_count||0);
   const recLikes = Number(u?.received_likes||0);
   const recDis   = Number(u?.received_dislikes||0);
 
-  const calculated = 5*comments + ratings + recLikes - recDis;
+  const earnedFallback = 5*comments + ratings + recLikes - recDis;
+  const earned = hasEarned ? Number(u.earned_coins) : earnedFallback;
+  const spent = hasSpent ? Number(u.spent_coins) : 0;
+  const available = hasAvailable ? Number(u.available_coins) : (earned - spent);
 
-  console.log(`[DEBUG coinsOf] User ${u?.id}: comments=${comments}*5, ratings=${ratings}, recLikes=${recLikes}, recDis=${recDis} = ${calculated}`);
+  const normalized = Math.max(0, Number.isFinite(available) ? available : 0);
 
-  return calculated;
+  console.log(`[DEBUG coinsOf] User ${u?.id}: earned=${earned}, spent=${spent}, available=${normalized}`);
+
+  return normalized;
 }
 
 /* ---------- client-side предмодерация (минимальная, но умная) ---------- */
@@ -47,11 +57,19 @@ function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); 
 /* ---------- auth (server-backed) ---------- */
 const Auth = {
   key: 'letotalks:auth',
-  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false },
+  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false },
 
   get(){ return this._state; },
   set(o){
-    this._state = { ...this._state, ...o };
+    const merged = { ...this._state, ...o };
+    merged.available_coins = coinsOf(merged);
+    if (typeof merged.earned_coins !== 'number' || Number.isNaN(merged.earned_coins)) {
+      merged.earned_coins = 5*Number(merged.comment_count||0) + Number(merged.rating_count||0) + Number(merged.received_likes||0) - Number(merged.received_dislikes||0);
+    }
+    if (typeof merged.spent_coins !== 'number' || Number.isNaN(merged.spent_coins)) {
+      merged.spent_coins = Math.max(0, merged.earned_coins - merged.available_coins);
+    }
+    this._state = merged;
     try{ localStorage.setItem(this.key, JSON.stringify({ email: this._state.email })); }catch{}
     this.render();
     this.renderProfilePopover(); // обновление поповера
@@ -74,14 +92,17 @@ const Auth = {
           cast_dislikes: j.user.cast_dislikes||0,
           received_likes: j.user.received_likes||0,
           received_dislikes: j.user.received_dislikes||0,
+          available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
+          earned_coins: Number(j.user.earned_coins ?? 0),
+          spent_coins: Number(j.user.spent_coins ?? 0),
           _isAdmin: !!j.user.is_admin,
           _isBanned: !!j.user.is_banned
         });
       }else{
-        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false });
+        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false });
       }
     }catch{
-      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false });
+      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false });
     }
   },
 
@@ -89,7 +110,7 @@ const Auth = {
 
   async logout(){
     try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
-    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, _isAdmin:false, _isBanned:false });
+    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false });
     window.Router?.match();
   },
 
@@ -148,7 +169,10 @@ const Auth = {
           cast_likes: j.user.cast_likes,
           cast_dislikes: j.user.cast_dislikes,
           received_likes: j.user.received_likes,
-          received_dislikes: j.user.received_dislikes
+          received_dislikes: j.user.received_dislikes,
+          available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
+          earned_coins: Number(j.user.earned_coins ?? 0),
+          spent_coins: Number(j.user.spent_coins ?? 0)
         });
       }
     }catch{}
@@ -169,6 +193,8 @@ const Auth = {
       const u = this._state;
       const nick = (u.username||u.email||'Student').split('@')[0]||'Student';
       const coins = coinsOf(u);
+      const earned = typeof u.earned_coins === 'number' ? Number(u.earned_coins) : coins + Number(u.spent_coins||0);
+      const spent = typeof u.spent_coins === 'number' ? Number(u.spent_coins) : Math.max(0, earned - coins);
       pop.innerHTML = `
         <div class="popover-inner">
           <div class="row space-between" style="margin-bottom:6px">
@@ -178,6 +204,8 @@ const Auth = {
           <div class="muted" style="margin-bottom:6px">${u.email || ''}</div>
           <div class="hr"></div>
           <ul class="stats">
+            <li>Заработано: <b>${earned}</b> coins</li>
+            <li>Потрачено: <b>${spent}</b> coins</li>
             <li>Комментарии: <b>${u.comment_count||0}</b> (×5 coins)</li>
             <li>Оценки по критериям: <b>${u.rating_count||0}</b> (×1 coin)</li>
             <li>Поставил лайков: <b>${u.cast_likes||0}</b>, дизлайков: <b>${u.cast_dislikes||0}</b></li>
@@ -1377,7 +1405,7 @@ async viewHome(){
         return;
   }
 
-  let shopData = { items: [], balance: coinsOf(Auth._state) };
+  let shopData = { items: [], balance: coinsOf(Auth._state), earnedCoins: Auth._state.earned_coins||0, spentCoins: Auth._state.spent_coins||0 };
   try {
     console.log('🛒 Загружаю данные магазина...');
     const response = await fetch('/api/shop/items');
@@ -1387,7 +1415,13 @@ async viewHome(){
     console.log('📦 Данные магазина:', data);
 
     if (data.ok) {
-      shopData = data;
+      shopData = {
+        items: Array.isArray(data.items) ? data.items : [],
+        balance: Number(data.balance || 0),
+        earnedCoins: Number(data.earnedCoins || 0),
+        spentCoins: Number(data.spentCoins || 0)
+      };
+      Auth.set({ available_coins: shopData.balance, earned_coins: shopData.earnedCoins, spent_coins: shopData.spentCoins });
       console.log('✅ Товары загружены:', data.items.length);
     } else {
       console.log('❌ Ошибка в данных:', data.error);
@@ -1400,6 +1434,8 @@ async viewHome(){
   console.log('🎯 Данные для рендеринга:', {
     itemsCount: shopData.items.length,
     balance: shopData.balance,
+    earnedCoins: shopData.earnedCoins,
+    spentCoins: shopData.spentCoins,
     items: shopData.items
   });
 
@@ -1418,6 +1454,7 @@ async viewHome(){
             <div>
               <h3 style="margin: 0 0 4px 0;">Ваш баланс</h3>
               <div class="tname" style="font-size: 24px; color: var(--gold-500);">${shopData.balance} coins</div>
+              <div class="muted" style="font-size: 13px;">Заработано: ${shopData.earnedCoins} • Потрачено: ${shopData.spentCoins}</div>
             </div>
             <div class="muted" style="text-align: right;">
               Токены начисляются за активность:<br>
@@ -1519,7 +1556,12 @@ async viewHome(){
 
     if (result.ok) {
       alert(result.message);
-      this.viewShop();
+      Auth.set({
+        available_coins: Number(result.balance ?? Auth._state.available_coins),
+        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+      });
+      await this.viewShop();
       Auth.me();
     } else {
       alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
@@ -1544,7 +1586,12 @@ async activateItem(itemId) {
 
     if (result.ok) {
       alert(result.message);
-      this.viewShop();
+      Auth.set({
+        available_coins: Number(result.balance ?? Auth._state.available_coins),
+        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+      });
+      await this.viewShop();
       Auth.me();
     } else {
       alert('Ошибка при активации: ' + (result.error === 'item_not_owned' ? 'Этот ник не куплен' : 'Ошибка сервера'));
