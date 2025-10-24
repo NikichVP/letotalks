@@ -771,7 +771,8 @@ async viewHome(){
         const commentEl = e.target.closest('.comment');
         const cid = commentEl?.dataset?.cid;
         if (!cid) return;
-        const reason = prompt('Причина жалобы (оскорбления, спам и т.д.):');
+        const reasonRaw = prompt('Причина жалобы (оскорбления, спам и т.д.):');
+        const reason = reasonRaw?.trim();
         if (!reason) return;
         try {
           const r = await fetch('/api/report-comment', {
@@ -779,8 +780,16 @@ async viewHome(){
             headers:{'Content-Type':'application/json'},
             body: JSON.stringify({ commentId: cid, reason })
           });
-          if (r.ok) alert('Жалоба отправлена. Спасибо!');
-          else alert('Ошибка: не удалось отправить жалобу.');
+          let data = null;
+          try {
+            data = await r.json();
+          } catch {}
+          if (r.ok && data?.ok !== false) {
+            alert('Жалоба отправлена. Спасибо!');
+          } else {
+            const errorText = data?.description || data?.error || 'не удалось отправить жалобу.';
+            alert('Ошибка: ' + errorText);
+          }
         } catch {
           alert('Ошибка соединения');
         }

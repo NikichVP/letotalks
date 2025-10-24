@@ -12,6 +12,9 @@ const Database = require('better-sqlite3');
 const bcrypt = require('bcrypt');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const dotenv = require('dotenv');
+
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -264,12 +267,42 @@ function getRecentLoginAttempts(email, ip, windowMs = 3600000) {
 let ADMIN_EMAILS = new Set();
 const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
 
+function syncAdminsFromFile() {
+  const adminsPath = path.join(DATA_DIR, 'admins.csv');
+  if (!fs.existsSync(adminsPath)) return [];
+
+  try {
+    const fileContent = fs.readFileSync(adminsPath, 'utf8');
+    const emails = fileContent
+      .split(/\r?\n/)
+      .map(e => String(e || '').trim().toLowerCase())
+      .filter(e => e && e.includes('@'));
+
+    if (!emails.length) return [];
+
+    const insert = db.prepare('INSERT OR IGNORE INTO admins (email, role) VALUES (?, ?)');
+    const tx = db.transaction(list => {
+      for (const email of list) {
+        insert.run(email, 'admin');
+      }
+    });
+    tx(emails);
+
+    return emails;
+  } catch (err) {
+    console.error('Не удалось синхронизировать список админов из файла:', err);
+    return [];
+  }
+}
+
 /* Teachers */
 function loadAdminEmails() {
   const stmt = db.prepare('SELECT email FROM admins');
   const rows = stmt.all();
   ADMIN_EMAILS = new Set(rows.map(r => r.email.toLowerCase()));
 }
+
+syncAdminsFromFile();
 loadAdminEmails();
 
 function isAdminUser(u) {
@@ -1229,42 +1262,58 @@ app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
 app.post('/api/report-comment', express.json(), async (req, res) => {
   const u = getUserFromRequest(req);
   const { commentId, reason } = req.body || {};
-  if (!commentId || !reason) return res.status(400).json({ error: 'bad_request' });
+  const cleanedReason = String(reason || '').trim();
+  if (!commentId || !cleanedReason) return res.status(400).json({ error: 'bad_request' });
 
   const comment = getCommentById(commentId);
   if (!comment) return res.status(404).json({ error: 'comment_not_found' });
 
-  const text = comment.text || '(без текста)';
-  const author = comment.author || 'Аноним';
-  const teacherId = comment.teacherId;
-  const teacher = TEACHERS.find(t => t.id === teacherId);
-  const teacherName = teacher ? [teacher.lastName, teacher.firstName].filter(Boolean).join(' ') : teacherId;
 
-  const msg = `🚩 *Жалоба на комментарий*\n🆔 ID: ${commentId}\n👤 От: ${u ? u.email : 'анон'}\n👨‍🏫 Учитель: ${teacherName}\n💬 Текст: ${text}\n📄 Причина: ${reason}`;
+  const reporter = u ? u.email : 'анон';
+  const messageParts = [
+    '🚩 Жалоба на комментарий',
+    `ID: ${commentId}`,
+    `От: ${reporter}`,
+    `Текст: ${String(comment.text || '(без текста)')}`,
+    `Причина: ${cleanedReason.slice(0, 500)}`
+  ];
+  const msg = messageParts.join('\n');
 
   try {
     const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
     const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
     if (!BOT_TOKEN || !CHAT_ID) {
       console.warn('TELEGRAM_TOKEN или CHAT_ID не заданы');
-      return res.json({ ok: false, error: 'telegram_not_configured' });
+      return res.status(503).json({ ok: false, error: 'telegram_not_configured' });
     }
 
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-    await fetch(url, {
+    const tgResponse = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: CHAT_ID,
-        text: msg,
-        parse_mode: 'Markdown'
+        text: msg
       })
     });
+
+    let tgData = null;
+    try {
+      tgData = await tgResponse.json();
+    } catch (parseErr) {
+      console.warn('Не удалось прочитать ответ Telegram:', parseErr);
+    }
+
+    if (!tgResponse.ok || (tgData && tgData.ok === false)) {
+      const description = tgData?.description || tgResponse.statusText || 'telegram_failed';
+      console.warn('Telegram вернул ошибку при отправке жалобы:', description);
+      return res.status(502).json({ ok: false, error: 'telegram_failed', description });
+    }
 
     res.json({ ok: true });
   } catch (err) {
     console.error('Ошибка отправки в Telegram:', err);
-    res.status(500).json({ error: 'telegram_failed' });
+    res.status(500).json({ ok: false, error: 'telegram_failed' });
   }
 });
 
