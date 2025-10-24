@@ -622,6 +622,7 @@ async viewHome(){
           <div class="cactions" style="display:flex;gap:8px;align-items:center">
             <button class="iconbtn like ${c.myVote===1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👍 <span class="cnt">${c.likes||0}</span></button>
             <button class="iconbtn dislike ${c.myVote===-1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👎 <span class="cnt">${c.dislikes||0}</span></button>
+            <button class="btn small outline report-btn">🚩 Пожаловаться</button>
             ${amAdmin ? html`<button class="btn small outline del-comment">Удалить</button>`:''}
           </div>
         </div>`).join('')
@@ -710,6 +711,9 @@ async viewHome(){
           alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
         } else if (err?.message === 'commenting_banned' || err?.message === 'banned') {
           alert('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.');
+        } else if (err?.code === 'toxic_comment' || (typeof err?.score === 'number' && err.score >= 0.5)) {
+          const scoreText = typeof err.score === 'number' ? ` (вероятность токсичности: ${Math.round(err.score * 100)}%)` : '';
+          alert('Комментарий был отклонён системой модерации как токсичный.' + scoreText);
         } else {
           alert('Не удалось опубликовать :(');
         }
@@ -733,7 +737,27 @@ async viewHome(){
         }
         return;
       }
-
+      // жалоба на комментарий
+      const reportBtn = e.target.closest('.report-btn');
+      if (reportBtn) {
+        const commentEl = e.target.closest('.comment');
+        const cid = commentEl?.dataset?.cid;
+        if (!cid) return;
+        const reason = prompt('Причина жалобы (оскорбления, спам и т.д.):');
+        if (!reason) return;
+        try {
+          const r = await fetch('/api/report-comment', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ commentId: cid, reason })
+          });
+          if (r.ok) alert('Жалоба отправлена. Спасибо!');
+          else alert('Ошибка: не удалось отправить жалобу.');
+        } catch {
+          alert('Ошибка соединения');
+        }
+        return;
+      }
       const likeBtn = e.target.closest('.iconbtn.like');
       const dislikeBtn = e.target.closest('.iconbtn.dislike');
       if (!likeBtn && !dislikeBtn) return;
