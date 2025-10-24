@@ -34,6 +34,39 @@ const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 10; // За час
 const SECURITY_HEADERS_ENABLED = true;
 
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static(PUBLIC_DIR));
+app.use('/photo', express.static(PHOTO_DIR));
+// --- Проверка токсичности через локальный Python API (uvicorn на 127.0.0.1:8001) ---
+async function isToxicComment(text) {
+  if (!text || !String(text).trim()) return false;
+  try {
+    const resp = await fetch('http://127.0.0.1:8001/toxicity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: String(text) })
+    });
+    if (!resp.ok) {
+      console.warn('toxicity API returned', resp.status);
+      return false; // на время падения сервера — не блокируем публикацию
+    }
+    const data = await resp.json();
+    // data формат зависит от твоего python-сервера; подстроил порог:
+    // пример ожидаемого: { label: 'toxic'|'neutral'|'insult', score: 0.92 }
+    const label = String(data.label || '').toLowerCase();
+    const score = Number(data.score || 0);
+    // считаем токсичным, если label содержит 'toxic' или score >= 0.6
+    if (label.includes('toxic') || score >= 0.6) return true;
+    return false;
+  } catch (err) {
+    console.warn('Ошибка запроса к toxicity API:', err && err.message ? err.message : err);
+    // если сервер упал — лучше не блокировать комментарии; верни false
+    return false;
+  }
+}
+
+
 // === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
 if (SECURITY_HEADERS_ENABLED) {
   app.use(helmet({
@@ -668,27 +701,6 @@ function createSlidingWindowLimiter({ windowMs, maxRequests }) {
 const apiRateLimiter = createSlidingWindowLimiter({ windowMs: 60_000, maxRequests: 120 });
 app.use('/api', apiRateLimiter);
 
-/* Profanity filter */
-const BAD_STEMS = [
-  'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
-  'пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'
-];
-const LAT2CYR = { 'a':'а','b':'в','c':'с','e':'е','h':'н','k':'к','m':'м','o':'о','p':'р','t':'т','x':'х','y':'у' };
-const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
-
-function normalizeForBadWords(s){
-  let t = String(s||'').toLowerCase();
-  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
-  t = t.replace(/[a-z]/g, ch => LAT2CYR[ch] || ch);
-  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g,'');
-  t = t.replace(/(.)\1{2,}/g, '$1$1');
-  return t;
-}
-
-function hasBadWords(text){
-  const norm = normalizeForBadWords(text);
-  return BAD_STEMS.some(st => norm.includes(st));
-}
 
 /* GuerrillaMail helpers */
 async function gmGetEmailAddress(){
@@ -807,70 +819,185 @@ app.get('/api/teacher/:id',(req,res)=>{
   });
 });
 
-app.post('/api/comment-with-ratings', commentPerMinuteLimiter, (req,res)=>{
-  const {teacherId,text,author,ratings}=req.body||{};
-  if(!teacherId) return res.status(400).json({error:'bad_request'});
 
-  const t = getTeacherById(teacherId);
-  if(!t) return res.status(404).json({error:'teacher_not_found'});
+/* Сильная модерация мата */
+// Нормализация и проверка: кир/лат, 1337, пробелы/символы, удвоения
+const BAD_STEMS = [
+  'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
+  'пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'
+];
+const LAT2CYR = { 'a':'а','b':'в','c':'с','e':'е','h':'н','k':'к','m':'м','o':'о','p':'р','t':'т','x':'х','y':'у' };
+const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
+/* --- Модель токсичности RuBERT --- */
 
-  const u = getUserFromRequest(req);
-  const userId = u?.id || '';
-  const authorName = String(author||'Аноним').slice(0,64);
-  const textStr = String(text||'').trim();
 
-  const hasRatings = ratings && typeof ratings==='object' && Object.keys(ratings).some(k=>{
-    const v=Number(ratings[k]); return CHARACTERISTICS_KEYS.includes(k) && v>=1 && v<=5;
-  });
+/* --- Проверка мата --- */
+function normalizeForBadWords(s) {
+  let t = String(s || '').toLowerCase();
+  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
+  t = t.replace(/[a-z]/g, ch => LAT2CYR[ch] || ch); // латиница → кириллица
+  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g, ''); // убрать разделители
+  t = t.replace(/(.)\1{2,}/g, '$1$1'); // сжать длинные повторения
+  return t;
+}
 
-  if(!textStr && !hasRatings){
-    return res.status(400).json({error:'bad_request', message:'empty'});
-  }
+function hasBadWords(text) {
+  const norm = normalizeForBadWords(text);
+  return BAD_STEMS.some(st => norm.includes(st));
+}
 
-  if (textStr && u && isUserBanned(u.id)) {
-    return res.status(403).json({ error:'banned', message:'commenting_banned' });
-  }
 
-  if (textStr && hasBadWords(textStr)) {
-    return res.status(400).json({ error: 'profanity_forbidden' });
-  }
+// Комментарии + рейтинг + модерация (локальная + опциональная модель)
+app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) => {
+  try {
+    const { teacherId, text, author, ratings } = req.body || {};
+    if (!teacherId) return res.status(400).json({ error: 'bad_request' });
 
-  // Публикуем комментарий, если есть текст
-  if (textStr){
-    addComment({teacherId, author:authorName, text:textStr, author_uid:userId});
-  }
+    const t = getTeacherById(teacherId);
+    if (!t) return res.status(404).json({ error: 'teacher_not_found' });
 
-  // Обновляем рейтинг
-  if(hasRatings){
-    updateRatings(teacherId, ratings);
-  }
+    const u = getUserFromRequest(req);
+    const userId = u?.id || '';
+    const authorName = String(author || (u ? u.username : 'Аноним')).slice(0, 64);
+    const textStr = String(text || '').trim();
 
-  // Статистика пользователя
-  if (u){
-    let validRatings = 0;
-    if (ratings && typeof ratings==='object'){
-      for (const k of Object.keys(ratings)){
-        const v = Number(ratings[k]);
-        if (CHARACTERISTICS_KEYS.includes(k) && v>=1 && v<=5) validRatings++;
+    const hasRatings = ratings && typeof ratings === 'object' && Object.keys(ratings).some(k => {
+      const v = Number(ratings[k]);
+      return Array.isArray(CHARACTERISTICS_KEYS) && CHARACTERISTICS_KEYS.includes(k) && v >= 1 && v <= 5;
+    });
+
+    if (!textStr && !hasRatings) {
+      return res.status(400).json({ error: 'bad_request', message: 'empty' });
+    }
+
+    // Бан — блокируем только текстовые комментарии
+    if (textStr && u && isUserBanned(u.id)) {
+      return res.status(403).json({ error: 'banned', message: 'commenting_banned' });
+    }
+
+    // Локальная проверка мата
+    if (textStr && hasBadWords(textStr)) {
+      return res.status(400).json({ error: 'profanity_forbidden' });
+    }
+
+    // Вызов внешней модели токсичности (опционально, если fetch доступен и задан URL)
+    if (textStr) {
+      let toxicScore = 0;
+      try {
+        if (typeof fetch === 'function') {
+          const toxxUrl = typeof TOXICITY_SERVER_URL !== 'undefined' ? TOXICITY_SERVER_URL : 'http://127.0.0.1:8001/toxicity';
+          const r = await fetch(toxxUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: textStr })
+          });
+
+          if (r.ok) {
+            const jr = await r.json();
+
+            // Универсальный разбор возможных форматов ответа
+            if (jr && Array.isArray(jr.probs) && jr.probs.length >= 2) {
+              toxicScore = Number(jr.probs[1]) || 0;
+            } else if (jr && Array.isArray(jr.logits) && jr.logits.length >= 2) {
+              try {
+                const l0 = Number(jr.logits[0]) || 0;
+                const l1 = Number(jr.logits[1]) || 0;
+                const max = Math.max(l0, l1);
+                const e0 = Math.exp(l0 - max);
+                const e1 = Math.exp(l1 - max);
+                toxicScore = e1 / (e0 + e1);
+              } catch (e) { toxicScore = 0; }
+            } else if (Array.isArray(jr) && jr.length > 0 && jr[0].label) {
+              for (const it of jr) {
+                const lab = String(it.label || '').toLowerCase();
+                const sc = Number(it.score || 0);
+                if (lab.includes('tox') || lab === 'label_1' || lab === 'label1') toxicScore = Math.max(toxicScore, sc);
+              }
+              if (!toxicScore && jr.length === 1) {
+                const lab = String(jr[0].label || '').toLowerCase();
+                if (lab.includes('tox')) toxicScore = Number(jr[0].score || 0);
+              }
+            } else if (jr && (jr.toxic === true || jr.is_toxic === true || String(jr.label||'').toLowerCase().includes('tox'))) {
+              toxicScore = 1;
+            }
+          } else {
+            console.warn('toxicity server returned non-ok', r.status);
+          }
+        } else {
+          // fetch отсутствует — пропускаем вызов модели (локальная модерация уже выполнена)
+          console.warn('fetch is not available — skipping toxicity server call');
+        }
+      } catch (err) {
+        console.warn('failed to call toxicity server:', err && err.message ? err.message : err);
+        // фоллбек: при ошибке модели не блокируем (как ты и просила — локальная модерация остаётся)
+      }
+
+      const thresh = typeof TOXICITY_THRESHOLD !== 'undefined' ? TOXICITY_THRESHOLD : 0.8;
+      if (toxicScore >= thresh) {
+        return res.status(400).json({ error: 'toxic_comment', message: 'Комментарий отклонён как токсичный', score: toxicScore });
       }
     }
-    incUserStats(u.id, { comments: textStr ? 1 : 0, ratings: validRatings });
-  }
 
-  const retRatings = getRatingsForTeacher(teacherId);
-  const comments = getCommentsForTeacher(teacherId);
-  res.json({ok:true, teacher:{
-    id: t.id,
-    lastName: t.last_name,
-    firstName: t.first_name,
-    patronymic: t.patronymic,
-    department: t.department,
-    photo: t.photo,
-    subjects: t.subjects ? t.subjects.split('|') : [],
-    ratings:retRatings,
-    comments,
-    overall:overall(retRatings)
-  }});
+    // Сохраняем комментарий (используем только новую функцию addComment)
+    if (textStr) {
+      try {
+        // предполагается, что addComment может быть async и вернуть id или объект
+        await addComment({ teacherId, author: authorName, text: textStr, author_uid: userId || '' });
+      } catch (err) {
+        console.error('addComment failed:', err && err.message ? err.message : err);
+        return res.status(500).json({ error: 'server_error', message: 'failed_to_save_comment' });
+      }
+    }
+
+    // Обновляем рейтинг (используем только новую функцию updateRatings)
+    if (hasRatings) {
+      try {
+        await updateRatings(teacherId, ratings);
+      } catch (err) {
+        console.error('updateRatings failed:', err && err.message ? err.message : err);
+        // не прерываем основной поток — вернём ответ с тем, что успели сохранить
+      }
+    }
+
+    // Статистика пользователя — считаем валидные оценки и комментарии
+    if (u) {
+      try {
+        let validRatings = 0;
+        if (ratings && typeof ratings === 'object') {
+          for (const k of Object.keys(ratings)) {
+            const v = Number(ratings[k]);
+            if (Array.isArray(CHARACTERISTICS_KEYS) && CHARACTERISTICS_KEYS.includes(k) && v >= 1 && v <= 5) validRatings++;
+          }
+        }
+        incUserStats(u.id, { comments: textStr ? 1 : 0, ratings: validRatings });
+      } catch (err) {
+        console.warn('incUserStats failed:', err && err.message ? err.message : err);
+      }
+    }
+
+    // Формируем и отдаем ответ в формате новой версии проекта
+    const retRatings = typeof getRatingsForTeacher === 'function' ? getRatingsForTeacher(teacherId) : {};
+    const comments = typeof getCommentsForTeacher === 'function' ? getCommentsForTeacher(teacherId) : [];
+
+    return res.json({
+      ok: true,
+      teacher: {
+        id: t.id,
+        lastName: t.last_name,
+        firstName: t.first_name,
+        patronymic: t.patronymic,
+        department: t.department,
+        photo: t.photo,
+        subjects: t.subjects ? t.subjects.split('|') : [],
+        ratings: retRatings,
+        comments,
+        overall: typeof overall === 'function' ? overall(retRatings) : null
+      }
+    });
+  } catch (err) {
+    console.error('Unhandled error in /api/comment-with-ratings:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'server_error' });
+  }
 });
 
 app.post('/api/comment/vote', (req,res)=>{
@@ -1048,6 +1175,51 @@ app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
   deleteComment(commentId);
   return res.json({ ok:true });
 });
+
+
+// --- Жалобы на комментарии (пользователи -> Telegram админу) ---
+app.post('/api/report-comment', express.json(), async (req, res) => {
+  const u = getUserFromRequest(req);
+  const { commentId, reason } = req.body || {};
+  if (!commentId || !reason) return res.status(400).json({ error: 'bad_request' });
+
+  const comment = getCommentById(commentId);
+  if (!comment) return res.status(404).json({ error: 'comment_not_found' });
+
+  const text = comment.text || '(без текста)';
+  const author = comment.author || 'Аноним';
+  const teacherId = comment.teacherId;
+  const teacher = TEACHERS.find(t => t.id === teacherId);
+  const teacherName = teacher ? [teacher.lastName, teacher.firstName].filter(Boolean).join(' ') : teacherId;
+
+  const msg = `🚩 *Жалоба на комментарий*\n🆔 ID: ${commentId}\n👤 От: ${u ? u.email : 'анон'}\n👨‍🏫 Учитель: ${teacherName}\n💬 Текст: ${text}\n📄 Причина: ${reason}`;
+
+  try {
+    const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
+    const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+    if (!BOT_TOKEN || !CHAT_ID) {
+      console.warn('TELEGRAM_TOKEN или CHAT_ID не заданы');
+      return res.json({ ok: false, error: 'telegram_not_configured' });
+    }
+
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: msg,
+        parse_mode: 'Markdown'
+      })
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Ошибка отправки в Telegram:', err);
+    res.status(500).json({ error: 'telegram_failed' });
+  }
+});
+
 
 app.get('/api/admin/user/find', requireAdmin, (req,res)=>{
   const email = String(req.query.email||'').toLowerCase().trim();
