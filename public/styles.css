@@ -621,3 +621,164 @@ table th, table td { border-bottom:1px solid var(--border); padding:8px; text-al
   gap: 20px;
   align-items: stretch;
 }
+
+
+/* Стили для магазина */
+.shop-item {
+  transition: all 0.3s ease;
+  border: 2px solid transparent;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Эффект при наведении на карточку товара */
+.shop-item:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+}
+
+/* Стиль для купленных товаров */
+.shop-item.purchased {
+  border-color: var(--blue-500);
+  background: linear-gradient(135deg, #f8fafc 0%, #e7eef9 100%);
+}
+
+/* Стиль для активного ника (текущего) */
+.shop-item.active {
+  border-color: var(--gold-500);
+  background: linear-gradient(135deg, #fff9ed 0%, #fffbeb 100%);
+  position: relative;
+}
+
+/* Индикатор активного товара */
+.shop-item.active::before {
+  content: "★ Активен";
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: var(--gold-500);
+  color: #000;
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+/* Стиль для бейджа "Успех" */
+.badge.success {
+  background: #dcfce7;
+  border-color: #22c55e;
+  color: #166534;
+  font-weight: 600;
+}
+
+/* Стиль для бейджа цены */
+.badge.price {
+  background: var(--gold-500);
+  color: #000;
+  font-weight: bold;
+}
+
+/* Отступ для кнопок в карточках товаров */
+.shop-item .btn.small {
+  margin-top: 8px;
+  width: 100%;
+}
+
+/* Анимация при покупке */
+@keyframes purchaseAnimation {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.purchase-effect {
+  animation: purchaseAnimation 0.6s ease;
+}
+
+/* Стили для секции купленных товаров */
+.shop-purchased-section {
+  margin-top: 30px;
+  padding-top: 20px;
+  border-top: 2px solid var(--border);
+}
+
+.shop-purchased-section h3 {
+  color: var(--blue-700);
+  margin-bottom: 16px;
+}
+
+/* Стили для списка купленных ников */
+.shop-purchased-list .list-item {
+  transition: all 0.2s ease;
+  border-left: 4px solid transparent;
+}
+
+.shop-purchased-list .list-item:hover {
+  border-left-color: var(--blue-500);
+  background: var(--blue-100);
+}
+
+.shop-purchased-list .list-item.active {
+  border-left-color: var(--gold-500);
+  background: #fff9ed;
+}
+
+/* Адаптивность для мобильных устройств */
+@media (max-width: 768px) {
+  .shop-item .card-content {
+    padding: 12px;
+  }
+
+  .shop-item h3 {
+    font-size: 16px;
+  }
+
+  .shop-item .btn.small {
+    padding: 8px 12px;
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 480px) {
+  .grid[style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+  }
+
+  .shop-item {
+    margin-bottom: 12px;
+  }
+}
+
+/* Стили для баланса пользователя */
+.balance-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+}
+
+.balance-card .tname {
+  color: white !important;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.1);
+}
+
+.balance-card .muted {
+  color: rgba(255,255,255,0.8) !important;
+}
+
+/* Индикатор недостаточно средств */
+.insufficient-funds {
+  opacity: 0.7;
+  position: relative;
+}
+
+.insufficient-funds::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,0.05);
+  border-radius: 14px;
+}
