@@ -650,26 +650,24 @@ table th, table td { border-bottom:1px solid var(--border); padding:8px; text-al
   position: relative;
 }
 
-/* Индикатор активного товара */
-.shop-item.active::before {
-  content: "★ Активен";
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  background: var(--gold-500);
-  color: #000;
-  padding: 4px 8px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: bold;
-}
-
 /* Стиль для бейджа "Успех" */
 .badge.success {
   background: #dcfce7;
   border-color: #22c55e;
   color: #166534;
   font-weight: 600;
+}
+
+/* Статусы в магазине */
+.badge.status {
+  font-weight: 600;
+  padding: 6px 14px;
+}
+
+.badge.muted {
+  background: #f1f5f9;
+  border-color: var(--border);
+  color: #475569;
 }
 
 /* Стиль для бейджа цены */
@@ -722,6 +720,20 @@ table th, table td { border-bottom:1px solid var(--border); padding:8px; text-al
 .shop-purchased-list .list-item.active {
   border-left-color: var(--gold-500);
   background: #fff9ed;
+}
+
+.purchased-nick {
+  grid-template-columns: 1fr auto;
+}
+
+.purchased-nick .nick-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.purchased-nick .nick-actions .badge {
+  flex: none;
 }
 
 /* Адаптивность для мобильных устройств */

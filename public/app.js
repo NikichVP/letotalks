@@ -170,6 +170,7 @@ const Auth = {
           cast_dislikes: j.user.cast_dislikes,
           received_likes: j.user.received_likes,
           received_dislikes: j.user.received_dislikes,
+          display_name: j.user.display_name || this._state.display_name,
           available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
           earned_coins: Number(j.user.earned_coins ?? 0),
           spent_coins: Number(j.user.spent_coins ?? 0)
@@ -191,7 +192,7 @@ const Auth = {
     }
     const updateContent = ()=>{
       const u = this._state;
-      const nick = (u.username||u.email||'Student').split('@')[0]||'Student';
+      const nick = u.display_name || (u.username||u.email||'Student').split('@')[0]||'Student';
       const coins = coinsOf(u);
       const earned = typeof u.earned_coins === 'number' ? Number(u.earned_coins) : coins + Number(u.spent_coins||0);
       const spent = typeof u.spent_coins === 'number' ? Number(u.spent_coins) : Math.max(0, earned - coins);
@@ -637,10 +638,12 @@ async viewHome(){
     }).join('');
 
     const commentsHtml = (t.comments&&t.comments.length)
-      ? t.comments.slice().reverse().map(c=>html`
+      ? t.comments.slice().reverse().map(c=>{
+        const authorName = c.authorDisplay || c.author || 'Аноним';
+        return html`
         <div class="comment" data-cid="${c.id}">
           <div class="meta">
-            Аноним · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
+            ${authorName} · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
             ${amAdmin && (c.author_email||c.author_uid) ? html`
               <span class="badge" title="Видно только администраторам" style="margin-left:8px">
                 ${c.author_email || c.author_uid}
@@ -653,7 +656,8 @@ async viewHome(){
             <button class="btn small outline report-btn">🚩 Пожаловаться</button>
             ${amAdmin ? html`<button class="btn small outline del-comment">Удалить</button>`:''}
           </div>
-        </div>`).join('')
+        </div>`;
+      }).join('')
       : '<div class="empty">Комментариев пока нет</div>';
 
     const banned = !!Auth._state._isBanned;
@@ -1407,148 +1411,147 @@ async viewHome(){
 
   // --- Магазин ---
   async viewShop() {
-      await this.mountNavbar();
+    await this.mountNavbar();
 
-      if (!Auth.isLogged()) {
-        Router.go('/login');
-        return;
-  }
-
-  let shopData = { items: [], balance: coinsOf(Auth._state), earnedCoins: Auth._state.earned_coins||0, spentCoins: Auth._state.spent_coins||0 };
-  try {
-    console.log('🛒 Загружаю данные магазина...');
-    const response = await fetch('/api/shop/items');
-    console.log('📡 Ответ получен, статус:', response.status);
-
-    const data = await response.json();
-    console.log('📦 Данные магазина:', data);
-
-    if (data.ok) {
-      shopData = {
-        items: Array.isArray(data.items) ? data.items : [],
-        balance: Number(data.balance || 0),
-        earnedCoins: Number(data.earnedCoins || 0),
-        spentCoins: Number(data.spentCoins || 0)
-      };
-      Auth.set({ available_coins: shopData.balance, earned_coins: shopData.earnedCoins, spent_coins: shopData.spentCoins });
-      console.log('✅ Товары загружены:', data.items.length);
-    } else {
-      console.log('❌ Ошибка в данных:', data.error);
+    if (!Auth.isLogged()) {
+      try { await Auth.me(); } catch {}
     }
-  } catch (error) {
-    console.error('❌ Ошибка загрузки магазина:', error);
-  }
+    if (!Auth.isLogged()) {
+      Router.go('/login');
+      return;
+    }
 
-  // ДОБАВЬТЕ ЭТОТ ОТЛАДОЧНЫЙ ВЫВОД
-  console.log('🎯 Данные для рендеринга:', {
-    itemsCount: shopData.items.length,
-    balance: shopData.balance,
-    earnedCoins: shopData.earnedCoins,
-    spentCoins: shopData.spentCoins,
-    items: shopData.items
-  });
+    let shopData = {
+      items: [],
+      balance: coinsOf(Auth._state),
+      earnedCoins: Auth._state.earned_coins || 0,
+      spentCoins: Auth._state.spent_coins || 0
+    };
 
-  $('#app').innerHTML = html`
-    <section class="section">
-      <div class="row space-between wrap">
-        <h2>🎁 Магазин ников</h2>
-        <div class="list-controls">
-          <a class="link" href="#/">← На главную</a>
-        </div>
-      </div>
+    try {
+      const response = await fetch('/api/shop/items');
+      const data = await response.json();
+      if (data.ok) {
+        shopData = {
+          items: Array.isArray(data.items) ? data.items : [],
+          balance: Number(data.balance || 0),
+          earnedCoins: Number(data.earnedCoins || 0),
+          spentCoins: Number(data.spentCoins || 0)
+        };
+        Auth.set({
+          available_coins: shopData.balance,
+          earned_coins: shopData.earnedCoins,
+          spent_coins: shopData.spentCoins
+        });
+      }
+    } catch (error) {
+      console.error('Ошибка загрузки магазина:', error);
+    }
 
-      <div class="card" style="margin-bottom: 20px;">
-        <div class="card-content">
-          <div class="row space-between" style="align-items: center;">
-            <div>
-              <h3 style="margin: 0 0 4px 0;">Ваш баланс</h3>
-              <div class="tname" style="font-size: 24px; color: var(--gold-500);">${shopData.balance} coins</div>
-              <div class="muted" style="font-size: 13px;">Заработано: ${shopData.earnedCoins} • Потрачено: ${shopData.spentCoins}</div>
-            </div>
-            <div class="muted" style="text-align: right;">
-              Токены начисляются за активность:<br>
-              💬 Комментарии: 5 coins<br>
-              ⭐ Оценки: 1 coin за критерий<br>
-              👍 Лайки: +1 coin за полученный лайк
-            </div>
+    const purchasedItems = shopData.items.filter(item => item.purchased);
+    const appEl = $('#app');
+
+    appEl.innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>🎁 Магазин ников</h2>
+          <div class="list-controls">
+            <a class="link" href="#/">← На главную</a>
           </div>
         </div>
-      </div>
 
-      <!-- ДОБАВЬТЕ ПРОВЕРКУ НА ПУСТОЙ МАССИВ -->
-      ${shopData.items.length > 0 ? html`
-        <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px;">
-          ${shopData.items.map(item => html`
-            <div class="card shop-item ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
-              <div class="card-content">
-                <div class="row space-between" style="margin-bottom: 12px;">
-                  <h3 style="margin: 0;">${item.name}</h3>
-                  <div class="badge" style="background: var(--gold-500); color: #000;">
-                    ${item.price} coins
-                  </div>
-                </div>
-
-                ${item.purchased ?
-                  (item.isActive ?
-                    '<div class="badge success">Активен</div>' :
-                    html`<button class="btn small primary activate-btn" data-item="${item.id}">Активировать</button>`
-                  ) :
-                  (shopData.balance >= item.price ?
-                    html`<button class="btn small primary buy-btn" data-item="${item.id}">Купить</button>` :
-                    html`<button class="btn small outline" disabled>Не хватает coins</button>`
-                  )
-                }
+        <div class="card" style="margin-bottom: 20px;">
+          <div class="card-content">
+            <div class="row space-between" style="align-items: center;">
+              <div>
+                <h3 style="margin: 0 0 4px 0;">Ваш баланс</h3>
+                <div class="tname" style="font-size: 24px; color: var(--gold-500);">${shopData.balance} coins</div>
+                <div class="muted" style="font-size: 13px;">Заработано: ${shopData.earnedCoins} • Потрачено: ${shopData.spentCoins}</div>
+              </div>
+              <div class="muted" style="text-align: right;">
+                Токены начисляются за активность:<br>
+                💬 Комментарии: 5 coins<br>
+                ⭐ Оценки: 1 coin за критерий<br>
+                👍 Лайки: +1 coin за полученный лайк
               </div>
             </div>
-          `).join('')}
-        </div>
-      ` : html`
-        <!-- СООБЩЕНИЕ ЕСЛИ ТОВАРОВ НЕТ -->
-        <div class="card">
-          <div class="card-content">
-            <div style="text-align: center; padding: 40px;">
-              <h3 style="color: var(--muted);">🛒 Товары временно отсутствуют</h3>
-              <p class="muted">Попробуйте обновить страницу или зайти позже.</p>
-              <button class="btn outline" onclick="location.reload()">Обновить страницу</button>
-            </div>
           </div>
         </div>
-      `}
 
-      ${shopData.items.filter(item => item.purchased).length > 0 ? html`
-        <div style="margin-top: 30px;">
-          <h3>Ваши купленные ники</h3>
-          <div class="list">
-            ${shopData.items.filter(item => item.purchased).map(item => html`
-              <div class="list-item">
-                <div class="tname">${item.name}</div>
-                <div>
-                  ${item.isActive ?
-                    '<span class="badge success">Активен</span>' :
-                    html`<button class="btn small outline activate-btn" data-item="${item.id}">Сделать активным</button>`
-                  }
+        ${shopData.items.length > 0 ? html`
+          <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px;">
+            ${shopData.items.map(item => html`
+              <div class="card shop-item ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
+                <div class="card-content">
+                  <div class="row space-between shop-item-header">
+                    <h3 style="margin: 0;">${item.name}</h3>
+                    ${item.purchased
+                      ? html`<div class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</div>`
+                      : html`<div class="badge price">${item.price} coins</div>`}
+                  </div>
+
+                  ${item.purchased
+                    ? (item.isActive
+                      ? html`<button class="btn small outline deactivate-btn" data-item="${item.id}">Сделать неактивным</button>`
+                      : html`<button class="btn small primary activate-btn" data-item="${item.id}">Сделать активным</button>`)
+                    : (shopData.balance >= item.price
+                      ? html`<button class="btn small primary buy-btn" data-item="${item.id}">Купить за ${item.price}</button>`
+                      : html`<button class="btn small outline" disabled>Не хватает coins</button>`)}
                 </div>
               </div>
             `).join('')}
           </div>
-        </div>
-      ` : ''}
-    </section>
-  `;
+        ` : html`
+          <div class="card">
+            <div class="card-content">
+              <div style="text-align: center; padding: 40px;">
+                <h3 style="color: var(--muted);">🛒 Товары временно отсутствуют</h3>
+                <p class="muted">Попробуйте обновить страницу или зайти позже.</p>
+                <button class="btn outline" onclick="location.reload()">Обновить страницу</button>
+              </div>
+            </div>
+          </div>
+        `}
 
-  console.log('🎨 Рендеринг завершен, проверяем DOM...');
-  console.log('🛒 Товаров отрисовано:', document.querySelectorAll('.shop-item').length);
+        ${purchasedItems.length ? html`
+          <div class="shop-purchased-section">
+            <h3>Ваши купленные ники</h3>
+            <div class="list shop-purchased-list">
+              ${purchasedItems.map(item => html`
+                <div class="list-item purchased-nick">
+                  <div class="tname">${item.name}</div>
+                  <div class="nick-actions">
+                    <span class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</span>
+                    ${item.isActive
+                      ? html`<button class="btn small outline deactivate-btn" data-item="${item.id}">Сделать неактивным</button>`
+                      : html`<button class="btn small primary activate-btn" data-item="${item.id}">Сделать активным</button>`}
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        ` : ''}
+      </section>
+    `;
 
-  // Обработчики событий
-  $('#app').addEventListener('click', async (e) => {
-    if (e.target.classList.contains('buy-btn')) {
-      const itemId = e.target.dataset.item;
-      await this.buyItem(itemId);
-    } else if (e.target.classList.contains('activate-btn')) {
-      const itemId = e.target.dataset.item;
-      await this.activateItem(itemId);
+    if (!this._shopClickHandler) {
+      this._shopClickHandler = async (event) => {
+        const targetBtn = event.target.closest('.buy-btn, .activate-btn, .deactivate-btn');
+        if (!targetBtn) return;
+        const itemId = targetBtn.dataset.item;
+        if (!itemId) return;
+
+        if (targetBtn.classList.contains('buy-btn')) {
+          await App.buyItem(itemId);
+        } else if (targetBtn.classList.contains('activate-btn')) {
+          await App.activateItem(itemId);
+        } else if (targetBtn.classList.contains('deactivate-btn')) {
+          await App.deactivateItem(itemId);
+        }
+      };
     }
-  });
+    appEl.removeEventListener('click', this._shopClickHandler);
+    appEl.addEventListener('click', this._shopClickHandler);
   },
 
   async buyItem(itemId) {
@@ -1571,7 +1574,7 @@ async viewHome(){
         spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
       });
       await this.viewShop();
-      Auth.me();
+      await Auth.me();
     } else {
       alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
             result.error === 'already_purchased' ? 'Этот ник уже куплен' : 'Ошибка сервера'));
@@ -1601,12 +1604,46 @@ async activateItem(itemId) {
         spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
       });
       await this.viewShop();
-      Auth.me();
+      await Auth.me();
     } else {
       alert('Ошибка при активации: ' + (result.error === 'item_not_owned' ? 'Этот ник не куплен' : 'Ошибка сервера'));
     }
   } catch (error) {
     alert('Ошибка сети при активации');
+  }
+},
+
+async deactivateItem(itemId) {
+  if (!Auth.isLogged()) return;
+
+  try {
+    const response = await fetch('/api/shop/deactivate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemId })
+    });
+
+    const result = await response.json();
+
+    if (result.ok) {
+      alert(result.message);
+      Auth.set({
+        available_coins: Number(result.balance ?? Auth._state.available_coins),
+        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+      });
+      await this.viewShop();
+      await Auth.me();
+    } else {
+      const msg = result.error === 'not_active'
+        ? 'Этот ник уже отключен'
+        : result.error === 'item_not_found'
+          ? 'Ник не найден'
+          : 'Ошибка сервера';
+      alert('Ошибка при отключении: ' + msg);
+    }
+  } catch (error) {
+    alert('Ошибка сети при отключении');
   }
 },
 

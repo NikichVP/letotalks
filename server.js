@@ -8,11 +8,48 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const Database = require('better-sqlite3');
+const { execFileSync } = require('child_process');
 const bcrypt = require('bcrypt');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
+
+function loadBetterSqlite3() {
+  try {
+    return require('better-sqlite3');
+  } catch (err) {
+    const needsRebuild = err && err.code === 'ERR_DLOPEN_FAILED' && /NODE_MODULE_VERSION/.test(String(err.message || ''));
+    if (!needsRebuild) throw err;
+    console.warn('⚠️  Обнаружено несовпадение версии native-модуля better-sqlite3. Пытаюсь пересобрать под текущую версию Node...');
+    try {
+      const rebuildArgs = ['rebuild', 'better-sqlite3'];
+      if (process.env.npm_execpath) {
+        execFileSync(process.execPath, [process.env.npm_execpath, ...rebuildArgs], {
+          cwd: __dirname,
+          stdio: 'inherit'
+        });
+      } else {
+        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+        execFileSync(npmCmd, rebuildArgs, {
+          cwd: __dirname,
+          stdio: 'inherit'
+        });
+      }
+      // Удаляем кэш на случай, если модуль уже закеширован
+      try {
+        delete require.cache[require.resolve('better-sqlite3')];
+      } catch {}
+      console.log('✅ better-sqlite3 успешно пересобран. Повторная загрузка...');
+      return require('better-sqlite3');
+    } catch (rebuildErr) {
+      console.error('❌ Автоматически пересобрать better-sqlite3 не удалось. Выполните вручную: npm rebuild better-sqlite3');
+      console.error(rebuildErr);
+      throw err;
+    }
+  }
+}
+
+const Database = loadBetterSqlite3();
 
 dotenv.config({ path: path.join(__dirname, '.env') });
 
@@ -38,6 +75,20 @@ const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый 
 const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 10; // За час
 const SECURITY_HEADERS_ENABLED = true;
+
+const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
+
+const DEFAULT_SHOP_ITEMS = [
+  { id: 'nick-0', name: 'Новичок', price: 1, category: 'nickname' },
+  { id: 'nick-1', name: 'Умник', price: 50, category: 'nickname' },
+  { id: 'nick-2', name: 'Отличник', price: 75, category: 'nickname' },
+  { id: 'nick-3', name: 'Эрудит', price: 100, category: 'nickname' },
+  { id: 'nick-4', name: 'Профи', price: 150, category: 'nickname' },
+  { id: 'nick-5', name: 'Гуру', price: 200, category: 'nickname' },
+  { id: 'nick-6', name: 'Легенда', price: 300, category: 'nickname' },
+  { id: 'nick-7', name: 'Мастер', price: 250, category: 'nickname' },
+  { id: 'nick-8', name: 'Эксперт', price: 180, category: 'nickname' }
+];
 
 
 app.use(express.json({ limit: '1mb' }));
@@ -149,10 +200,91 @@ function ensureInventorySchemaUpToDate() {
   }
 }
 
+function ensureShopItemsTable() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS shop_items (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      category TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1
+    )
+  `);
+
+  try {
+    const columns = db.prepare('PRAGMA table_info(shop_items)').all();
+    const hasIsActive = columns.some(col => col.name === 'is_active');
+    if (!hasIsActive) {
+      db.exec('ALTER TABLE shop_items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
+    }
+  } catch (err) {
+    console.error('Не удалось обновить схему shop_items:', err);
+  }
+
+  const upsert = db.prepare(`
+    INSERT OR IGNORE INTO shop_items (id, name, price, category, is_active)
+    VALUES (?, ?, ?, ?, 1)
+  `);
+  const updateMeta = db.prepare(`
+    UPDATE shop_items
+    SET name = ?, category = ?, is_active = 1
+    WHERE id = ?
+  `);
+
+  for (const item of DEFAULT_SHOP_ITEMS) {
+    const info = upsert.run(item.id, item.name, item.price, item.category);
+    if (!info.changes) {
+      updateMeta.run(item.name, item.category, item.id);
+    }
+  }
+}
+
+function ensureUserRatingsTable() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_ratings (
+      user_id TEXT NOT NULL,
+      teacher_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value INTEGER NOT NULL,
+      updated_ts INTEGER NOT NULL,
+      PRIMARY KEY (user_id, teacher_id, key),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_user_ratings_teacher ON user_ratings(teacher_id, key)`);
+}
+
 ensureInventorySchemaUpToDate();
+ensureShopItemsTable();
+ensureUserRatingsTable();
 
 console.log('⚡ Инициализация сервера...');
 console.log('✅ База данных подключена');
+
+const ensureAggregateRatingRowStmt = db.prepare(`
+  INSERT OR IGNORE INTO ratings (teacher_id, key, sum, count)
+  VALUES (?, ?, 0, 0)
+`);
+const updateAggregateRatingStmt = db.prepare(`
+  UPDATE ratings
+  SET sum = sum + ?, count = count + ?
+  WHERE teacher_id = ? AND key = ?
+`);
+const selectUserRatingStmt = db.prepare(`
+  SELECT value FROM user_ratings
+  WHERE user_id = ? AND teacher_id = ? AND key = ?
+`);
+const insertUserRatingStmt = db.prepare(`
+  INSERT INTO user_ratings (user_id, teacher_id, key, value, updated_ts)
+  VALUES (?, ?, ?, ?, ?)
+`);
+const updateUserRatingStmt = db.prepare(`
+  UPDATE user_ratings
+  SET value = ?, updated_ts = ?
+  WHERE user_id = ? AND teacher_id = ? AND key = ?
+`);
 
 // === БЕЗОПАСНОСТЬ: Создание таблиц для сессий и логов ===
 function initSecurityTables() {
@@ -336,8 +468,6 @@ function coinsOf(user) {
   return getAvailableCoins(user);
 }
 
-const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
-
 function overall(r){
   let tot=0,cnt=0;
   for(const k of CHARACTERISTICS_KEYS){
@@ -357,6 +487,19 @@ function getAllTeachers() {
 function getTeacherById(id) {
   const stmt = db.prepare('SELECT * FROM teachers WHERE id = ?');
   return stmt.get(id);
+}
+
+function normalizeTeacherRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    lastName: row.last_name || '',
+    firstName: row.first_name || '',
+    patronymic: row.patronymic || '',
+    department: row.department || '',
+    photo: row.photo || null,
+    subjects: row.subjects ? row.subjects.split('|').filter(Boolean) : []
+  };
 }
 
 function getRatingsForTeacher(teacherId) {
@@ -420,15 +563,48 @@ function deleteComment(commentId) {
   return info.changes > 0;
 }
 
-function updateRatings(teacherId, ratings) {
-  const upsert = db.prepare('INSERT INTO ratings (teacher_id, key, sum, count) VALUES (?, ?, ?, ?) ON CONFLICT(teacher_id, key) DO UPDATE SET sum = sum + excluded.sum, count = count + excluded.count');
+const updateRatingsTx = db.transaction((teacherId, ratings, userId) => {
+  let added = 0;
+  let updated = 0;
+  if (!teacherId || !ratings || typeof ratings !== 'object') {
+    return { added, updated };
+  }
+
+  const ts = Date.now();
 
   for (const key of Object.keys(ratings)) {
     if (!CHARACTERISTICS_KEYS.includes(key)) continue;
-    const v = Number(ratings[key]);
-    if (!(v >= 1 && v <= 5)) continue;
-    upsert.run(teacherId, key, v, 1);
+    const value = Number(ratings[key]);
+    if (!(value >= 1 && value <= 5)) continue;
+
+    ensureAggregateRatingRowStmt.run(teacherId, key);
+
+    if (!userId) {
+      updateAggregateRatingStmt.run(value, 1, teacherId, key);
+      added++;
+      continue;
+    }
+
+    const prev = selectUserRatingStmt.get(userId, teacherId, key);
+    if (!prev) {
+      insertUserRatingStmt.run(userId, teacherId, key, value, ts);
+      updateAggregateRatingStmt.run(value, 1, teacherId, key);
+      added++;
+    } else {
+      const prevValue = Number(prev.value);
+      updateUserRatingStmt.run(value, ts, userId, teacherId, key);
+      if (prevValue !== value) {
+        updateAggregateRatingStmt.run(value - prevValue, 0, teacherId, key);
+        updated++;
+      }
+    }
   }
+
+  return { added, updated };
+});
+
+function updateRatings(teacherId, ratings, userId = null) {
+  return updateRatingsTx(teacherId, ratings, userId);
 }
 
 // Votes
@@ -452,7 +628,7 @@ function countVotesForCommentBulk(commentIds, myUserId = null) {
   if (!commentIds.length) return { counts: {}, myVotes: {} };
 
   const placeholders = commentIds.map(() => '?').join(',');
-  const stmt = db.prepare(`SELECT comment_id, vote FROM comment_votes WHERE comment_id IN (${placeholders})`);
+  const stmt = db.prepare(`SELECT comment_id, user_id, vote FROM comment_votes WHERE comment_id IN (${placeholders})`);
   const rows = stmt.all(...commentIds);
 
   const counts = {};
@@ -471,7 +647,7 @@ function countVotesForCommentBulk(commentIds, myUserId = null) {
     else if (row.vote === -1) counts[key].dislikes++;
 
     if (userIdStr && row.user_id === userIdStr) {
-      myVotes[key] = row.vote;
+      myVotes[key] = Number(row.vote) || 0;
     }
   }
 
@@ -480,20 +656,25 @@ function countVotesForCommentBulk(commentIds, myUserId = null) {
 
 // Users
 
+const activeNicknameStmt = db.prepare(`
+  SELECT item_name FROM user_inventory
+  WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
+  LIMIT 1
+`);
+
+function getActiveNickname(userId) {
+  if (!userId) return null;
+  const row = activeNicknameStmt.get(userId);
+  return row ? row.item_name : null;
+}
+
 // Функция для получения отображаемого имени пользователя (с учетом купленных ников)
 function getDisplayName(user) {
   if (!user) return 'Student';
 
-  // Сначала проверяем активный ник в инвентаре
-  const nickStmt = db.prepare(`
-    SELECT item_name FROM user_inventory
-    WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
-    LIMIT 1
-  `);
-
-  const activeNick = nickStmt.get(user.id);
+  const activeNick = getActiveNickname(user.id);
   if (activeNick) {
-    return activeNick.item_name;
+    return activeNick;
   }
 
   // Иначе используем стандартное имя
@@ -571,7 +752,11 @@ function deleteTeacherById(id) {
 }
 
 /* Sessions & Auth */
-app.set('trust proxy', true);
+if (IS_PRODUCTION) {
+  app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+} else {
+  app.set('trust proxy', false);
+}
 
 function getClientIp(req){
   const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -831,23 +1016,19 @@ app.get('/api/teachers',(req,res)=>{
   const teachers = getAllTeachers();
   const ratingsMap = getAllRatings();
 
-  const result = teachers.map(t=>{
+  const result = teachers.map(row=>{
+    const teacher = normalizeTeacherRow(row);
+    if (!teacher) return null;
     const ratings = {};
-    for(const k of CHARACTERISTICS_KEYS){
-      ratings[k] = ratingsMap[t.id]?.[k] || {sum:0,count:0};
+    for (const k of CHARACTERISTICS_KEYS){
+      ratings[k] = ratingsMap[row.id]?.[k] || {sum:0,count:0};
     }
     return {
-      id: t.id,
-      lastName: t.last_name,
-      firstName: t.first_name,
-      patronymic: t.patronymic,
-      department: t.department,
-      photo: t.photo,
-      subjects: t.subjects ? t.subjects.split('|') : [],
+      ...teacher,
       ratings,
       overall: overall(ratings)
     };
-  });
+  }).filter(Boolean);
 
   res.json({teachers: result});
 });
@@ -866,22 +1047,41 @@ app.get('/api/teacher/:id',(req,res)=>{
   const ids = commentsRaw.map(c=>String(c.id));
   const {counts, myVotes} = countVotesForCommentBulk(ids, myId);
 
+  const userCache = new Map();
+  const resolveUser = (uid) => {
+    if (!uid) return null;
+    const key = String(uid);
+    if (!userCache.has(key)) {
+      userCache.set(key, findUserById(key) || null);
+    }
+    return userCache.get(key);
+  };
+
   const comments = commentsRaw.map(c=>{
+    const authorUser = c.author_uid ? resolveUser(c.author_uid) : null;
+    const activeNick = authorUser ? getActiveNickname(authorUser.id) : null;
+    const displayAuthor = activeNick || 'Аноним';
     const base = {
       id: c.id,
       teacherId: c.teacher_id,
       ts: c.ts,
       ts_iso: c.ts_iso,
       author: c.author,
+      authorDisplay: displayAuthor,
       text: c.text,
       likes: (counts[String(c.id)]?.likes)||0,
       dislikes: (counts[String(c.id)]?.dislikes)||0,
-      myVote: myVotes[String(c.id)]||0,
+      myVote: Number(myVotes[String(c.id)] ?? 0),
       isOwn: !!(myId && c.author_uid && String(c.author_uid)===String(myId))
     };
     if (amAdmin) {
-      const au = c.author_uid ? findUserById(String(c.author_uid)) : null;
-      return { ...base, author_uid: c.author_uid||'', author_email: au?.email || '' };
+      const au = authorUser;
+      return {
+        ...base,
+        author_uid: c.author_uid||'',
+        author_email: au?.email || '',
+        author_display: displayAuthor
+      };
     }
     return base;
   });
@@ -942,10 +1142,16 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     const authorName = String(author || (u ? u.username : 'Аноним')).slice(0, 64);
     const textStr = String(text || '').trim();
 
-    const hasRatings = ratings && typeof ratings === 'object' && Object.keys(ratings).some(k => {
-      const v = Number(ratings[k]);
-      return Array.isArray(CHARACTERISTICS_KEYS) && CHARACTERISTICS_KEYS.includes(k) && v >= 1 && v <= 5;
-    });
+    const validRatingKeys = [];
+    if (ratings && typeof ratings === 'object') {
+      for (const k of Object.keys(ratings)) {
+        const v = Number(ratings[k]);
+        if (Array.isArray(CHARACTERISTICS_KEYS) && CHARACTERISTICS_KEYS.includes(k) && v >= 1 && v <= 5) {
+          validRatingKeys.push(k);
+        }
+      }
+    }
+    const hasRatings = validRatingKeys.length > 0;
 
     if (!textStr && !hasRatings) {
       return res.status(400).json({ error: 'bad_request', message: 'empty' });
@@ -1030,12 +1236,14 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       }
     }
 
+    let ratingUpdateInfo = { added: 0, updated: 0 };
     // Обновляем рейтинг (используем только новую функцию updateRatings)
     if (hasRatings) {
       try {
-        await updateRatings(teacherId, ratings);
+        ratingUpdateInfo = updateRatings(teacherId, ratings, userId || null) || ratingUpdateInfo;
       } catch (err) {
         console.error('updateRatings failed:', err && err.message ? err.message : err);
+        ratingUpdateInfo = { added: 0, updated: 0 };
         // не прерываем основной поток — вернём ответ с тем, что успели сохранить
       }
     }
@@ -1043,14 +1251,8 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     // Статистика пользователя — считаем валидные оценки и комментарии
     if (u) {
       try {
-        let validRatings = 0;
-        if (ratings && typeof ratings === 'object') {
-          for (const k of Object.keys(ratings)) {
-            const v = Number(ratings[k]);
-            if (Array.isArray(CHARACTERISTICS_KEYS) && CHARACTERISTICS_KEYS.includes(k) && v >= 1 && v <= 5) validRatings++;
-          }
-        }
-        incUserStats(u.id, { comments: textStr ? 1 : 0, ratings: validRatings });
+        const ratingDelta = ratingUpdateInfo?.added ?? (hasRatings ? validRatingKeys.length : 0);
+        incUserStats(u.id, { comments: textStr ? 1 : 0, ratings: ratingDelta });
       } catch (err) {
         console.warn('incUserStats failed:', err && err.message ? err.message : err);
       }
@@ -1339,10 +1541,7 @@ app.post('/api/admin/user/ban', requireAdmin, express.json(), (req,res)=>{
 
 app.get('/api/admin/teachers', requireAdmin, (req,res)=>{
   const teachers = getAllTeachers();
-  const result = teachers.map(t => ({
-    ...t,
-    subjects: t.subjects ? t.subjects.split('|') : []
-  }));
+  const result = teachers.map(normalizeTeacherRow).filter(Boolean);
   return res.json({ ok:true, teachers: result });
 });
 
@@ -1788,27 +1987,19 @@ app.get('/api/shop/items', (req, res) => {
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({ error: 'unauthorized' });
 
-  // Убедитесь, что этот массив существует и заполнен
-  const availableNicks = [
-    { id: 'nick-1', name: 'Умник', price: 50, category: 'nickname' },
-    { id: 'nick-2', name: 'Отличник', price: 75, category: 'nickname' },
-    { id: 'nick-3', name: 'Эрудит', price: 100, category: 'nickname' },
-    { id: 'nick-4', name: 'Профи', price: 150, category: 'nickname' },
-    { id: 'nick-5', name: 'Гуру', price: 200, category: 'nickname' },
-    { id: 'nick-6', name: 'Легенда', price: 300, category: 'nickname' },
-    { id: 'nick-7', name: 'Мастер', price: 250, category: 'nickname' },
-    { id: 'nick-8', name: 'Эксперт', price: 180, category: 'nickname' }
-  ];
+  const itemsStmt = db.prepare(`
+    SELECT id, name, price, category
+    FROM shop_items
+    WHERE is_active = 1
+    ORDER BY price ASC, name ASC
+  `);
+  const availableItems = itemsStmt.all();
 
-  console.log('🛍️ [SERVER] Отправляю товары:', availableNicks.length);
+  const purchasedRows = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ?').all(u.id);
+  const purchasedItems = new Set(purchasedRows.map(row => row.item_id));
 
-  // Получаем купленные ники пользователя
-  const purchasedStmt = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ? AND item_type = ?');
-  const purchasedItems = purchasedStmt.all(u.id, 'nickname').map(row => row.item_id);
-
-  // Получаем текущий активный ник
-  const activeNickStmt = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ? AND item_type = ? AND is_active = 1');
-  const activeNick = activeNickStmt.get(u.id, 'nickname');
+  const activeRows = db.prepare('SELECT item_id, item_type FROM user_inventory WHERE user_id = ? AND is_active = 1').all(u.id);
+  const activeByType = new Map(activeRows.map(row => [row.item_type, row.item_id]));
 
   const balance = getAvailableCoins(u);
   const earnedCoins = calculateEarnedCoins(u);
@@ -1816,10 +2007,10 @@ app.get('/api/shop/items', (req, res) => {
 
   res.json({
     ok: true,
-    items: availableNicks.map(item => ({
+    items: availableItems.map(item => ({
       ...item,
-      purchased: purchasedItems.includes(item.id),
-      isActive: activeNick ? activeNick.item_id === item.id : false
+      purchased: purchasedItems.has(item.id),
+      isActive: activeByType.get(item.category) === item.id
     })),
     balance,
     earnedCoins,
@@ -1834,19 +2025,7 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
 
-  // Определяем товары (в реальном приложении это должно быть в БД)
-  const shopItems = {
-    'nick-1': { name: 'Умник', price: 50, type: 'nickname' },
-    'nick-2': { name: 'Отличник', price: 75, type: 'nickname' },
-    'nick-3': { name: 'Эрудит', price: 100, type: 'nickname' },
-    'nick-4': { name: 'Профи', price: 150, type: 'nickname' },
-    'nick-5': { name: 'Гуру', price: 200, type: 'nickname' },
-    'nick-6': { name: 'Легенда', price: 300, type: 'nickname' },
-    'nick-7': { name: 'Мастер', price: 250, type: 'nickname' },
-    'nick-8': { name: 'Эксперт', price: 180, type: 'nickname' }
-  };
-
-  const item = shopItems[itemId];
+  const item = db.prepare('SELECT id, name, price, category FROM shop_items WHERE id = ? AND is_active = 1').get(itemId);
   if (!item) return res.status(404).json({ error: 'item_not_found' });
 
   const availableCoins = getAvailableCoins(u);
@@ -1856,7 +2035,7 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
 
   // Проверяем, не куплен ли уже этот ник
   const existingStmt = db.prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ? AND item_type = ?');
-  const existing = existingStmt.get(u.id, itemId, 'nickname');
+  const existing = existingStmt.get(u.id, itemId, item.category);
 
   if (existing) {
     return res.status(400).json({ error: 'already_purchased' });
@@ -1868,7 +2047,7 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
-  insertStmt.run(u.id, itemId, item.type, item.name, Date.now(), item.price, 0);
+  insertStmt.run(u.id, itemId, item.category, item.name, Date.now(), item.price, 0);
 
   const balanceAfter = getAvailableCoins(u);
   const spentCoins = getUserSpentCoins(u.id);
@@ -1899,9 +2078,14 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
 
+  const shopItem = db.prepare('SELECT id, category, name FROM shop_items WHERE id = ? AND is_active = 1').get(itemId);
+  if (!shopItem) {
+    return res.status(404).json({ error: 'item_not_found' });
+  }
+
   // Проверяем, есть ли у пользователя этот товар
   const itemStmt = db.prepare('SELECT id, item_name FROM user_inventory WHERE user_id = ? AND item_id = ? AND item_type = ?');
-  const item = itemStmt.get(u.id, itemId, 'nickname');
+  const item = itemStmt.get(u.id, itemId, shopItem.category);
 
   if (!item) {
     return res.status(400).json({ error: 'item_not_owned' });
@@ -1909,7 +2093,7 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
 
   // Деактивируем все ники пользователя
   const deactivateStmt = db.prepare('UPDATE user_inventory SET is_active = 0 WHERE user_id = ? AND item_type = ?');
-  deactivateStmt.run(u.id, 'nickname');
+  deactivateStmt.run(u.id, shopItem.category);
 
   // Активируем выбранный ник
   const activateStmt = db.prepare('UPDATE user_inventory SET is_active = 1 WHERE id = ?');
@@ -1918,7 +2102,8 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   logSecurityEvent('nickname_activated', {
     userId: u.id,
     itemId: itemId,
-    nickname: item.item_name
+    nickname: item.item_name,
+    category: shopItem.category
   });
 
   const balance = getAvailableCoins(u);
@@ -1928,6 +2113,46 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   res.json({
     ok: true,
     message: `Ник "${item.item_name}" теперь отображается в вашем профиле!`,
+    balance,
+    earnedCoins,
+    spentCoins
+  });
+});
+
+app.post('/api/shop/deactivate', express.json(), (req, res) => {
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+
+  const { itemId } = req.body || {};
+  if (!itemId) return res.status(400).json({ error: 'bad_request' });
+
+  const inventoryItem = db.prepare(`
+    SELECT id, item_name, item_type
+    FROM user_inventory
+    WHERE user_id = ? AND item_id = ? AND is_active = 1
+  `).get(u.id, itemId);
+
+  if (!inventoryItem) {
+    return res.status(400).json({ error: 'not_active' });
+  }
+
+  db.prepare('UPDATE user_inventory SET is_active = 0 WHERE user_id = ? AND item_type = ?')
+    .run(u.id, inventoryItem.item_type);
+
+  logSecurityEvent('nickname_deactivated', {
+    userId: u.id,
+    itemId,
+    nickname: inventoryItem.item_name,
+    category: inventoryItem.item_type
+  });
+
+  const balance = getAvailableCoins(u);
+  const spentCoins = getUserSpentCoins(u.id);
+  const earnedCoins = calculateEarnedCoins(u);
+
+  res.json({
+    ok: true,
+    message: `Ник "${inventoryItem.item_name}" деактивирован.`,
     balance,
     earnedCoins,
     spentCoins
