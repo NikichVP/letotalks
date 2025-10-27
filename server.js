@@ -467,34 +467,6 @@ function getRecentLoginAttempts(email, ip, windowMs = 3600000) {
 let ADMIN_EMAILS = new Set();
 const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
 
-function syncAdminsFromFile() {
-  const adminsPath = path.join(DATA_DIR, 'admins.csv');
-  if (!fs.existsSync(adminsPath)) return [];
-
-  try {
-    const fileContent = fs.readFileSync(adminsPath, 'utf8');
-    const emails = fileContent
-      .split(/\r?\n/)
-      .map(e => String(e || '').trim().toLowerCase())
-      .filter(e => e && e.includes('@'));
-
-    if (!emails.length) return [];
-
-    const insert = db.prepare('INSERT OR IGNORE INTO admins (email, role) VALUES (?, ?)');
-    const tx = db.transaction(list => {
-      for (const email of list) {
-        insert.run(email, 'admin');
-      }
-    });
-    tx(emails);
-
-    return emails;
-  } catch (err) {
-    console.error('Не удалось синхронизировать список админов из файла:', err);
-    return [];
-  }
-}
-
 /* Teachers */
 function loadAdminEmails() {
   const stmt = db.prepare('SELECT email FROM admins');
@@ -502,7 +474,6 @@ function loadAdminEmails() {
   ADMIN_EMAILS = new Set(rows.map(r => r.email.toLowerCase()));
 }
 
-syncAdminsFromFile();
 loadAdminEmails();
 
 function isAdminUser(u) {
