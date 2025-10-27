@@ -545,11 +545,37 @@ function overall(r){
   return cnt?tot/cnt:0;
 }
 
+const TEACHER_CACHE_TTL_MS = 1000 * 30; // 30 seconds for hot path caches
+let teacherRowsCache = { data: null, expiresAt: 0 };
+let ratingsAggregateCache = { data: null, expiresAt: 0 };
+
+function invalidateTeacherRowsCache() {
+  teacherRowsCache = { data: null, expiresAt: 0 };
+}
+
+function invalidateRatingsCache() {
+  ratingsAggregateCache = { data: null, expiresAt: 0 };
+}
+
+function invalidateTeacherCaches() {
+  invalidateTeacherRowsCache();
+  invalidateRatingsCache();
+}
+
 /* API helper functions */
 
 function getAllTeachers() {
+  const now = Date.now();
+  if (teacherRowsCache.data && teacherRowsCache.expiresAt > now) {
+    return teacherRowsCache.data;
+  }
   const stmt = db.prepare('SELECT * FROM teachers ORDER BY last_name, first_name');
-  return stmt.all();
+  const rows = stmt.all();
+  teacherRowsCache = {
+    data: rows,
+    expiresAt: now + TEACHER_CACHE_TTL_MS
+  };
+  return rows;
 }
 
 function getTeacherById(id) {
@@ -586,6 +612,10 @@ function getRatingsForTeacher(teacherId) {
 }
 
 function getAllRatings() {
+  const now = Date.now();
+  if (ratingsAggregateCache.data && ratingsAggregateCache.expiresAt > now) {
+    return ratingsAggregateCache.data;
+  }
   const stmt = db.prepare('SELECT teacher_id, key, sum, count FROM ratings');
   const rows = stmt.all();
   const map = {};
@@ -593,6 +623,10 @@ function getAllRatings() {
     if (!map[row.teacher_id]) map[row.teacher_id] = {};
     map[row.teacher_id][row.key] = { sum: row.sum, count: row.count };
   }
+  ratingsAggregateCache = {
+    data: map,
+    expiresAt: now + TEACHER_CACHE_TTL_MS
+  };
   return map;
 }
 
@@ -1116,7 +1150,11 @@ const updateRatingsTx = db.transaction((teacherId, ratings, userId) => {
 });
 
 function updateRatings(teacherId, ratings, userId = null) {
-  return updateRatingsTx(teacherId, ratings, userId);
+  const result = updateRatingsTx(teacherId, ratings, userId);
+  if (result && (result.added || result.updated)) {
+    invalidateRatingsCache();
+  }
+  return result;
 }
 
 // Votes
@@ -1254,12 +1292,16 @@ function upsertTeacher(teacher) {
 
   const stmt = db.prepare('INSERT INTO teachers (id, last_name, first_name, patronymic, department, subjects, photo) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_name = excluded.last_name, first_name = excluded.first_name, patronymic = excluded.patronymic, department = excluded.department, subjects = excluded.subjects, photo = excluded.photo');
   stmt.run(id, lastName || '', firstName || '', patronymic || '', department || '', subjectsStr, photoStr);
+  invalidateTeacherCaches();
 }
 
 function deleteTeacherById(id) {
   // Удалится также связанные комментарии, рейтинги и голоса благодаря ON DELETE CASCADE
   const stmt = db.prepare('DELETE FROM teachers WHERE id = ?');
   const info = stmt.run(id);
+  if (info.changes > 0) {
+    invalidateTeacherCaches();
+  }
   return info.changes > 0;
 }
 

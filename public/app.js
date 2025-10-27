@@ -259,9 +259,114 @@ const Auth = {
 };
 
 /* ---------- api ---------- */
+const TEACHERS_CACHE_KEY = 'letotalks:cache:teachers';
+const TEACHERS_CACHE_TTL = 1000 * 60 * 3; // 3 minutes — balance freshness vs load
+const teacherCacheState = { data: null, ts: 0, promise: null };
+
+function readTeacherCacheFromStorage() {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(TEACHERS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.data)) return null;
+    const ts = Number(parsed.ts || 0);
+    if (!Number.isFinite(ts)) return null;
+    return { data: parsed.data, ts };
+  } catch {
+    return null;
+  }
+}
+
+function writeTeacherCacheToStorage(data, ts) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(TEACHERS_CACHE_KEY, JSON.stringify({ data, ts }));
+  } catch {
+    /* ignore quota errors */
+  }
+}
+
+function clearTeacherCacheInStorage() {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(TEACHERS_CACHE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function fetchTeachersFromServer() {
+  const r = await fetch('/api/teachers', { headers: { 'Cache-Control': 'no-cache' } });
+  if (!r.ok) throw new Error('teachers_fetch_failed');
+  const jr = await r.json().catch(()=>({ teachers: [] }));
+  return Array.isArray(jr?.teachers) ? jr.teachers : [];
+}
+
 const API = {
   async departments(){ const r=await fetch('/api/departments'); return (await r.json()).departments; },
-  async teachers(){ const r=await fetch('/api/teachers'); return (await r.json()).teachers; },
+  async teachers(options = {}){
+    const { force = false } = options;
+    const now = Date.now();
+
+    if (!force && teacherCacheState.data && (now - teacherCacheState.ts) < TEACHERS_CACHE_TTL) {
+      return teacherCacheState.data;
+    }
+
+    if (!force && (!teacherCacheState.data || !teacherCacheState.data.length)) {
+      const stored = readTeacherCacheFromStorage();
+      if (stored && Array.isArray(stored.data)) {
+        teacherCacheState.data = stored.data;
+        teacherCacheState.ts = stored.ts || 0;
+        if ((now - teacherCacheState.ts) < TEACHERS_CACHE_TTL) {
+          return teacherCacheState.data;
+        }
+        if (!teacherCacheState.promise) {
+          API.teachers({ force: true }).catch(()=>{});
+        }
+        return teacherCacheState.data;
+      }
+    }
+
+    if (!force && teacherCacheState.promise) {
+      return teacherCacheState.promise;
+    }
+
+    let fetchPromise;
+    fetchPromise = (async () => {
+      try {
+        const teachers = await fetchTeachersFromServer();
+        teacherCacheState.data = teachers;
+        teacherCacheState.ts = Date.now();
+        writeTeacherCacheToStorage(teachers, teacherCacheState.ts);
+        return teachers;
+      } catch (err) {
+        if (!force && teacherCacheState.data && teacherCacheState.data.length) {
+          return teacherCacheState.data;
+        }
+        const stored = readTeacherCacheFromStorage();
+        if (stored && Array.isArray(stored.data) && stored.data.length) {
+          teacherCacheState.data = stored.data;
+          teacherCacheState.ts = stored.ts || 0;
+          return stored.data;
+        }
+        throw err;
+      } finally {
+        if (teacherCacheState.promise === fetchPromise) {
+          teacherCacheState.promise = null;
+        }
+      }
+    })();
+
+    teacherCacheState.promise = fetchPromise;
+    return fetchPromise;
+  },
+  invalidateTeachersCache(){
+    teacherCacheState.data = null;
+    teacherCacheState.ts = 0;
+    teacherCacheState.promise = null;
+    clearTeacherCacheInStorage();
+  },
   async teacher(id){ const r=await fetch(`/api/teacher/${id}`); return await r.json(); },
   async publish({teacherId, text, ratings, author}) {
     const r = await fetch('/api/comment-with-ratings', {
@@ -353,12 +458,41 @@ const Router = {
 const App = {
   ALL_TEACHERS: [],
 
+  async getTeachers(options = {}){
+    try{
+      const list = await API.teachers(options);
+      const normalized = Array.isArray(list) ? list : [];
+      this.ALL_TEACHERS = normalized;
+      return normalized;
+    }catch(err){
+      console.warn('[App] Не удалось загрузить список учителей', err);
+      return Array.isArray(this.ALL_TEACHERS) ? this.ALL_TEACHERS : [];
+    }
+  },
+
+  invalidateTeachers(){
+    this.ALL_TEACHERS = [];
+    if (API && typeof API.invalidateTeachersCache === 'function') {
+      API.invalidateTeachersCache();
+    }
+  },
+
+  async getDepartments(options = {}){
+    const teachers = await this.getTeachers(options);
+    const set = new Set();
+    for (const t of teachers) {
+      const dept = t?.department ? String(t.department).trim() : '';
+      if (dept) set.add(dept);
+    }
+    return Array.from(set).sort(collator.compare);
+  },
+
   async mountNavbar(){
     const btn  = $('#deptBtn');
     const menu = $('#deptMenu');
     if (!btn || !menu) return;
 
-    const deps = await API.departments();
+    const deps = await this.getDepartments();
     menu.innerHTML =
       `<button class="select-item" role="option" data-route="/teachers">Все учителя</button>` +
       deps.map(d=>html`<button class="select-item" role="option" data-route="/department/${encodeURIComponent(d)}">${d}</button>`).join('');
@@ -410,10 +544,11 @@ const App = {
 
 async viewHome(){
   await this.mountNavbar();
-  this.ALL_TEACHERS = await API.teachers();
+  const all = await this.getTeachers();
+  const teachers = Array.isArray(all) ? all : [];
 
   const charCards = CHARACTERISTICS.map(c=>{
-    const sorted = this.sortByValueThenAlpha([...this.ALL_TEACHERS], t=>characteristicAvg(t,c.key)).slice(0,3);
+    const sorted = this.sortByValueThenAlpha([...teachers], t=>characteristicAvg(t,c.key)).slice(0,3);
     const preview = sorted.map(t=>html`
       <div class="row" style="gap:10px;padding:8px 0">
         <div class="portrait"><img src="${t.photo||''}" alt=""></div>
@@ -436,9 +571,9 @@ async viewHome(){
       </div>`;
   }).join('');
 
-  const deps = await API.departments();
+  const deps = await this.getDepartments();
   const deptCards = deps.map(d=>{
-    const list = this.sortByValueThenAlpha(this.ALL_TEACHERS.filter(t=>t.department===d), t=>overall(t)).slice(0,3);
+    const list = this.sortByValueThenAlpha(teachers.filter(t=>t.department===d), t=>overall(t)).slice(0,3);
     if (!list.length) return '';
     const preview = list.map(t=>html`
       <div class="row" style="gap:10px;padding:8px 0">
@@ -660,8 +795,9 @@ async viewHome(){
 
   async listAll(){
     await this.mountNavbar();
-    const all = await API.teachers();
-    const sorted = this.sortByValueThenAlpha(all, t=>overall(t));
+    const all = await this.getTeachers();
+    const list = Array.isArray(all) ? all : [];
+    const sorted = this.sortByValueThenAlpha([...list], t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
@@ -676,9 +812,10 @@ async viewHome(){
 
   async listByCharacteristic(_, key){
     await this.mountNavbar();
-    const all = await API.teachers();
+    const all = await this.getTeachers();
+    const list = Array.isArray(all) ? all : [];
     const c = CHARACTERISTICS.find(x=>x.key===key); if(!c) return Router.go('/');
-    const sorted = this.sortByValueThenAlpha(all, t=>characteristicAvg(t,key));
+    const sorted = this.sortByValueThenAlpha([...list], t=>characteristicAvg(t,key));
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
@@ -693,9 +830,10 @@ async viewHome(){
 
   async listByDepartment(_, dept){
     await this.mountNavbar();
-    const all = await API.teachers();
+    const all = await this.getTeachers();
+    const list = Array.isArray(all) ? all : [];
     const name = decodeURIComponent(dept);
-    const list = this.sortByValueThenAlpha(all.filter(t=>t.department===name), t=>overall(t));
+    const filtered = this.sortByValueThenAlpha(list.filter(t=>t.department===name), t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
@@ -703,7 +841,7 @@ async viewHome(){
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
         <div class="list">
-          ${list.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('') || '<div class="empty">Пока нет учителей</div>'}
+          ${filtered.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('') || '<div class="empty">Пока нет учителей</div>'}
         </div>
       </section>`;
   },
@@ -711,8 +849,9 @@ async viewHome(){
   async listBySearch(_, query){
     await this.mountNavbar();
     const q = (decodeURIComponent(query)||'').trim().toLowerCase();
-    const all = await API.teachers();
-    const matched = all.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
+    const all = await this.getTeachers();
+    const list = Array.isArray(all) ? all : [];
+    const matched = list.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
     const sorted = this.sortByValueThenAlpha(matched, t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
@@ -1529,6 +1668,8 @@ async viewHome(){
           alert('Не удалось удалить учителя');
           return;
         }
+        App.invalidateTeachers();
+        App.getTeachers({ force:true }).catch(()=>{});
         teachers = teachers.filter(t=>t.id!==id);
         renderRows();
       }
@@ -1577,6 +1718,8 @@ async viewHome(){
       };
       const resp = await API.adminUpsertTeacher(payload);
       if (resp.ok) {
+        App.invalidateTeachers();
+        App.getTeachers({ force:true }).catch(()=>{});
         alert('Сохранено');
         Router.go('/admin/teachers');
       } else {
