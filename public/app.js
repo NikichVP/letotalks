@@ -57,7 +57,7 @@ function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); 
 /* ---------- auth (server-backed) ---------- */
 const Auth = {
   key: 'letotalks:auth',
-  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false },
+  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false },
 
   get(){ return this._state; },
   set(o){
@@ -96,13 +96,14 @@ const Auth = {
           earned_coins: Number(j.user.earned_coins ?? 0),
           spent_coins: Number(j.user.spent_coins ?? 0),
           _isAdmin: !!j.user.is_admin,
+          _isSuperAdmin: !!j.user.is_super_admin,
           _isBanned: !!j.user.is_banned
         });
       }else{
-        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false });
+        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
       }
     }catch{
-      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false });
+      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
     }
   },
 
@@ -110,7 +111,7 @@ const Auth = {
 
   async logout(){
     try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
-    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isBanned:false });
+    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
     window.Router?.match();
   },
 
@@ -418,6 +419,9 @@ const API = {
   async adminTeachers(){ const r=await fetch('/api/admin/teachers'); return await r.json(); },
   async adminUpsertTeacher(payload){ const r=await fetch('/api/admin/teacher/upsert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); return await r.json(); },
   async adminDeleteTeacher(id){ const r=await fetch('/api/admin/teacher/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); return await r.json(); },
+  async adminListAdmins(){ const r=await fetch('/api/admin/admins'); return await r.json(); },
+  async adminAddAdmin(email){ const r=await fetch('/api/admin/admins/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})}); return await r.json(); },
+  async adminRemoveAdmin(email){ const r=await fetch('/api/admin/admins/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})}); return await r.json(); },
 };
 
 /* ---------- router ---------- */
@@ -1272,6 +1276,7 @@ async viewHome(){
                 received_likes: p.user.received_likes||0,
                 received_dislikes: p.user.received_dislikes||0,
                 _isAdmin: !!p.user.is_admin,
+                _isSuperAdmin: !!p.user.is_super_admin,
                 _isBanned: !!p.user.is_banned
               });
               Router.go('/');
@@ -1321,6 +1326,9 @@ async viewHome(){
         { id:'bans', title:'Бан/разбан комментирования', route:'/admin/bans' },
         { id:'teachers', title:'Изменения базы учителей', route:'/admin/teachers' }
       ];
+      if (Auth._state._isSuperAdmin) {
+        tabs.push({ id:'admins', title:'Управление администраторами', route:'/admin/admins' });
+      }
       return html`<div class="admin-tabs">${tabs.map(t=>html`<a class="admin-tab ${active===t.id?'active':''}" href="#${t.route}">${t.title}</a>`).join('')}</div>`;
     },
 
@@ -1348,6 +1356,12 @@ async viewHome(){
             <p class="muted">Добавление, редактирование и удаление карточек учителей.</p>
             <button class="btn primary" data-route="/admin/teachers">Перейти</button>
           </div>
+          ${Auth._state._isSuperAdmin ? html`
+          <div class="card admin-card">
+            <h3>Управление администраторами</h3>
+            <p class="muted">Добавление и удаление прав администрирования.</p>
+            <button class="btn primary" data-route="/admin/admins">Перейти</button>
+          </div>` : ''}
         </div>
       </section>
     `;
@@ -1597,6 +1611,144 @@ async viewHome(){
       }
       renderColumns();
     });
+  },
+
+  async viewAdminAdmins(){
+    if (!(await this.ensureAdmin())) return;
+    if (!Auth._state._isSuperAdmin) {
+      $('#app').innerHTML = `<section class="section"><div class="empty">Доступ ограничен.</div></section>`;
+      return;
+    }
+
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Управление администраторами</h2>
+          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        </div>
+        ${this.adminTabs('admins')}
+        <div class="card" style="padding:16px; margin-bottom:16px">
+          <h3 style="margin-top:0">Добавить администратора</h3>
+          <form id="adminAddForm" class="row wrap" style="gap:12px; align-items:center">
+            <input type="email" id="adminAddEmail" class="input" placeholder="email@student.letovo.ru" required style="flex:1; min-width:240px; padding:10px 12px; border-radius:12px; border:1px solid var(--border)" autocomplete="off" />
+            <button class="btn primary" type="submit" id="adminAddBtn">Добавить</button>
+          </form>
+          <p class="muted" style="margin:12px 0 0; font-size:13px">Добавлять можно только адреса домена ${EMAIL_DOMAIN}.</p>
+          <p class="muted" id="adminAdminsStatus" style="margin:8px 0 0; font-size:13px"></p>
+        </div>
+        <div class="kv" style="padding:0; overflow:auto">
+          <table style="width:100%; border-collapse:collapse" id="adminAdminsTable">
+            <thead><tr><th>Email</th><th>Роль</th><th style="text-align:right">Действия</th></tr></thead>
+            <tbody id="adminAdminsBody"><tr><td colspan="3"><div class="empty">Загрузка…</div></td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    `;
+
+    const statusEl = $('#adminAdminsStatus');
+    const listBody = $('#adminAdminsBody');
+    const addForm = $('#adminAddForm');
+    const addInput = $('#adminAddEmail');
+    const addBtn = $('#adminAddBtn');
+
+    let admins = [];
+
+    function setStatus(message, type = 'info') {
+      if (!statusEl) return;
+      statusEl.textContent = message || '';
+      statusEl.style.color = type === 'error' ? '#c0392b' : 'var(--muted)';
+    }
+
+    function renderList() {
+      if (!listBody) return;
+      if (!admins.length) {
+        listBody.innerHTML = `<tr><td colspan="3"><div class="empty">Список администраторов пуст</div></td></tr>`;
+        return;
+      }
+      listBody.innerHTML = admins.map(a => html`
+        <tr>
+          <td>${a.email}</td>
+          <td>${a.isRoot ? 'Главный администратор' : 'Администратор'}</td>
+          <td style="text-align:right">
+            ${a.isRoot ? '<span class="muted">Нельзя удалить</span>' : `<button class="btn small outline" data-email="${a.email}">Удалить</button>`}
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    async function refreshAdmins() {
+      try {
+        const resp = await API.adminListAdmins();
+        if (!resp.ok) throw resp;
+        admins = Array.isArray(resp.admins) ? resp.admins : [];
+        renderList();
+        setStatus('');
+      } catch (err) {
+        console.error('Не удалось загрузить администраторов', err);
+        setStatus('Не удалось загрузить список администраторов. Попробуйте позже.', 'error');
+        listBody.innerHTML = `<tr><td colspan="3"><div class="empty">Ошибка загрузки</div></td></tr>`;
+      }
+    }
+
+    addForm?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = (addInput?.value || '').trim().toLowerCase();
+      if (!email) {
+        setStatus('Введите email студента.', 'error');
+        return;
+      }
+      setStatus('Добавляем администратора…');
+      addBtn.disabled = true;
+      try {
+        const resp = await API.adminAddAdmin(email);
+        if (!resp.ok) {
+          const code = resp.error || 'unknown_error';
+          if (code === 'invalid_domain') setStatus('Можно добавлять только адреса @student.letovo.ru', 'error');
+          else if (code === 'invalid_email') setStatus('Неверный email.', 'error');
+          else setStatus('Не удалось добавить администратора.', 'error');
+          return;
+        }
+        admins = Array.isArray(resp.admins) ? resp.admins : [];
+        renderList();
+        setStatus(`Администратор ${email} добавлен.`);
+        if (addInput) addInput.value = '';
+      } catch (err) {
+        console.error('Ошибка добавления администратора', err);
+        setStatus('Не удалось добавить администратора. Попробуйте позже.', 'error');
+      } finally {
+        addBtn.disabled = false;
+      }
+    });
+
+    $('#adminAdminsTable')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-email]');
+      if (!btn) return;
+      const email = btn.getAttribute('data-email');
+      if (!email) return;
+      if (!confirm(`Удалить администратора ${email}?`)) return;
+      btn.disabled = true;
+      setStatus('Удаляем администратора…');
+      try {
+        const resp = await API.adminRemoveAdmin(email);
+        if (!resp.ok) {
+          const code = resp.error || 'unknown_error';
+          if (code === 'cannot_remove_root') setStatus('Главного администратора нельзя удалить.', 'error');
+          else setStatus('Не удалось удалить администратора.', 'error');
+          btn.disabled = false;
+          return;
+        }
+        admins = Array.isArray(resp.admins) ? resp.admins : [];
+        renderList();
+        setStatus(`Права администратора для ${email} удалены.`);
+      } catch (err) {
+        console.error('Ошибка удаления администратора', err);
+        setStatus('Не удалось удалить администратора. Попробуйте позже.', 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    await refreshAdmins();
   },
 
   async viewAdminTeachersList(){
@@ -2010,6 +2162,7 @@ Router.add(/^\/teacher-request$/, (...a)=>App.viewTeacherRequest(...a));
 Router.add(/^\/admin\/teachers\/edit\/(.+)$/, (...a)=>App.viewAdminTeacherEdit(...a));
 Router.add(/^\/admin\/teachers\/new$/, (...a)=>App.viewAdminTeacherNew(...a));
 Router.add(/^\/admin\/teachers$/, (...a)=>App.viewAdminTeachersList(...a));
+Router.add(/^\/admin\/admins$/, (...a)=>App.viewAdminAdmins(...a));
 Router.add(/^\/admin\/bans$/, (...a)=>App.viewAdminBans(...a));
 Router.add(/^\/admin\/moderation$/, (...a)=>App.viewAdminModeration(...a));
 Router.add(/^\/admin$/, (...a)=>App.viewAdminHome(...a));

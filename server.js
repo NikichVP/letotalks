@@ -72,6 +72,8 @@ const TELEGRAM_WEBHOOK_SECRET = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_TOKEN || '';
 const TELEGRAM_REVIEW_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
+const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
+
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
 const SESSION_COOKIE = 'lt_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 дней
@@ -472,6 +474,9 @@ function loadAdminEmails() {
   const stmt = db.prepare('SELECT email FROM admins');
   const rows = stmt.all();
   ADMIN_EMAILS = new Set(rows.map(r => r.email.toLowerCase()));
+  if (ROOT_ADMIN_EMAIL) {
+    ADMIN_EMAILS.add(ROOT_ADMIN_EMAIL);
+  }
 }
 
 loadAdminEmails();
@@ -479,6 +484,38 @@ loadAdminEmails();
 function isAdminUser(u) {
   const email = String(u?.email || '').toLowerCase();
   return ADMIN_EMAILS.has(email);
+}
+
+function isSuperAdminUser(u) {
+  if (!ROOT_ADMIN_EMAIL) return false;
+  const email = String(u?.email || '').toLowerCase();
+  return email === ROOT_ADMIN_EMAIL;
+}
+
+function listAdminEmails() {
+  const stmt = db.prepare('SELECT email FROM admins ORDER BY email');
+  const rows = stmt.all();
+  const emails = new Set(rows.map(r => String(r.email || '').toLowerCase()).filter(Boolean));
+  if (ROOT_ADMIN_EMAIL) emails.add(ROOT_ADMIN_EMAIL);
+  return Array.from(emails).sort();
+}
+
+function addAdminEmail(email) {
+  const cleaned = String(email || '').trim().toLowerCase();
+  if (!cleaned) return false;
+  const stmt = db.prepare('INSERT OR IGNORE INTO admins (email) VALUES (?)');
+  stmt.run(cleaned);
+  loadAdminEmails();
+  return true;
+}
+
+function removeAdminEmail(email) {
+  const cleaned = String(email || '').trim().toLowerCase();
+  if (!cleaned) return false;
+  const stmt = db.prepare('DELETE FROM admins WHERE email = ?');
+  stmt.run(cleaned);
+  loadAdminEmails();
+  return true;
 }
 
 function calculateEarnedCoins(user) {
@@ -2000,7 +2037,7 @@ app.post('/api/teacher-request', (req, res) => {
 
 app.post('/api/telegram/webhook', express.json({ limit: '1mb' }), async (req, res) => {
   if (TELEGRAM_WEBHOOK_SECRET) {
-    const provided = req.query.secret || req.headers['x-telegram-secret'];
+    const provided = req.headers['x-telegram-bot-api-secret-token'];
     if (String(provided || '').trim() !== TELEGRAM_WEBHOOK_SECRET) {
       return res.status(403).json({ ok: false });
     }
@@ -2021,10 +2058,83 @@ app.post('/api/telegram/webhook', express.json({ limit: '1mb' }), async (req, re
 
 /* --- ADMIN API --- */
 
+app.get('/api/admin/admins', requireSuperAdmin, (req, res) => {
+  try {
+    const admins = listAdminEmails().map(email => ({
+      email,
+      isRoot: ROOT_ADMIN_EMAIL ? email === ROOT_ADMIN_EMAIL : false,
+    }));
+    res.json({ ok: true, admins });
+  } catch (err) {
+    console.error('Ошибка получения списка администраторов:', err);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/admins/add', requireSuperAdmin, express.json({ limit: '1mb' }), (req, res) => {
+  try {
+    const emailRaw = req.body?.email;
+    const email = String(emailRaw || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ ok: false, error: 'invalid_email' });
+    }
+    if (!email.endsWith(ALLOWED_EMAIL_DOMAIN)) {
+      return res.status(400).json({ ok: false, error: 'invalid_domain' });
+    }
+
+    addAdminEmail(email);
+    logSecurityEvent('admin_granted', {
+      email,
+      grantedBy: req.user?.email || 'unknown',
+      severity: 'info'
+    });
+
+    const admins = listAdminEmails().map(e => ({ email: e, isRoot: ROOT_ADMIN_EMAIL ? e === ROOT_ADMIN_EMAIL : false }));
+    res.json({ ok: true, admins });
+  } catch (err) {
+    console.error('Ошибка добавления администратора:', err);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/admins/remove', requireSuperAdmin, express.json({ limit: '1mb' }), (req, res) => {
+  try {
+    const emailRaw = req.body?.email;
+    const email = String(emailRaw || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ ok: false, error: 'invalid_email' });
+    }
+    if (ROOT_ADMIN_EMAIL && email === ROOT_ADMIN_EMAIL) {
+      return res.status(400).json({ ok: false, error: 'cannot_remove_root' });
+    }
+
+    removeAdminEmail(email);
+    logSecurityEvent('admin_revoked', {
+      email,
+      revokedBy: req.user?.email || 'unknown',
+      severity: 'warning'
+    });
+
+    const admins = listAdminEmails().map(e => ({ email: e, isRoot: ROOT_ADMIN_EMAIL ? e === ROOT_ADMIN_EMAIL : false }));
+    res.json({ ok: true, admins });
+  } catch (err) {
+    console.error('Ошибка удаления администратора:', err);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 function requireAdmin(req,res,next){
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({error:'unauthorized'});
   if (!isAdminUser(u)) return res.status(403).json({error:'forbidden'});
+  req.user = u;
+  next();
+}
+
+function requireSuperAdmin(req,res,next){
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error:'unauthorized' });
+  if (!isSuperAdminUser(u)) return res.status(403).json({ error:'forbidden' });
   req.user = u;
   next();
 }
@@ -2578,6 +2688,7 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
         earned_coins: calculateEarnedCoins(user),
         spent_coins: getUserSpentCoins(user.id),
         is_admin: isAdminUser(user),
+        is_super_admin: isSuperAdminUser(user),
         is_banned: isUserBanned(user.id)
       }
     });
@@ -2607,6 +2718,7 @@ app.get('/api/auth/me', (req,res)=>{
       earned_coins: calculateEarnedCoins(u),
       spent_coins: getUserSpentCoins(u.id),
       is_admin,
+      is_super_admin: isSuperAdminUser(u),
       is_banned
     }
   });
