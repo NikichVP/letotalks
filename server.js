@@ -10,9 +10,11 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const bcrypt = require('bcrypt');
+const multer = require('multer');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
+const { Blob } = require('buffer');
 
 function loadBetterSqlite3() {
   try {
@@ -61,9 +63,14 @@ const ROOT_DIR    = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const DATA_DIR    = path.join(ROOT_DIR, 'data');
 const PHOTO_DIR   = path.join(ROOT_DIR, 'photos');
+const REQUEST_PHOTO_DIR = path.join(DATA_DIR, 'teacher_request_photos');
 const DB_PATH     = process.env.LETOTALKS_DB_PATH
   ? path.resolve(process.env.LETOTALKS_DB_PATH)
   : path.join(ROOT_DIR, 'letotalks.db');
+
+const TELEGRAM_WEBHOOK_SECRET = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_TOKEN || '';
+const TELEGRAM_REVIEW_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
 const SESSION_COOKIE = 'lt_session';
@@ -89,6 +96,40 @@ const DEFAULT_SHOP_ITEMS = [
   { id: 'nick-7', name: 'Мастер', price: 250, category: 'nickname' },
   { id: 'nick-8', name: 'Эксперт', price: 180, category: 'nickname' }
 ];
+
+const TEACHER_REQUEST_STATUSES = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected'
+};
+
+const ALLOWED_REQUEST_PHOTO_TYPES = new Map([
+  ['image/jpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/webp', '.webp']
+]);
+
+const teacherRequestUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, REQUEST_PHOTO_DIR),
+    filename: (_req, file, cb) => {
+      const ext = ALLOWED_REQUEST_PHOTO_TYPES.get(file.mimetype) || (path.extname(file.originalname || '') || '.jpg');
+      const safeExt = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext.toLowerCase()) ? ext.toLowerCase() : '.jpg';
+      const name = `req_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${safeExt}`;
+      cb(null, name);
+    }
+  }),
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5 MB
+  },
+  fileFilter: (_req, file, cb) => {
+    if (!file) return cb(null, true);
+    if (ALLOWED_REQUEST_PHOTO_TYPES.has(file.mimetype)) return cb(null, true);
+    const err = new Error('unsupported_file_type');
+    err.code = 'UNSUPPORTED_FILE_TYPE';
+    cb(err);
+  }
+}).single('photo');
 
 
 app.use(express.json({ limit: '1mb' }));
@@ -150,6 +191,7 @@ const authLimiter = rateLimit({
 function ensureDirsAndDb() {
   if (!fs.existsSync(DATA_DIR))  fs.mkdirSync(DATA_DIR, {recursive:true});
   if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR, {recursive:true});
+  if (!fs.existsSync(REQUEST_PHOTO_DIR)) fs.mkdirSync(REQUEST_PHOTO_DIR, { recursive: true });
 
   const dbDir = path.dirname(DB_PATH);
   if (!fs.existsSync(dbDir)) {
@@ -256,9 +298,35 @@ function ensureUserRatingsTable() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_user_ratings_teacher ON user_ratings(teacher_id, key)`);
 }
 
+function ensureTeacherRequestsTable() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS teacher_requests (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      created_ts INTEGER NOT NULL,
+      created_iso TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      photo_filename TEXT,
+      submitter_ip TEXT,
+      submitter_agent TEXT,
+      telegram_chat_id TEXT,
+      telegram_message_id TEXT,
+      processed_ts INTEGER,
+      processed_iso TEXT,
+      processed_by TEXT,
+      processed_action TEXT,
+      teacher_id TEXT,
+      error TEXT
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_teacher_requests_status ON teacher_requests(status)`);
+}
+
 ensureInventorySchemaUpToDate();
 ensureShopItemsTable();
 ensureUserRatingsTable();
+ensureTeacherRequestsTable();
 
 console.log('⚡ Инициализация сервера...');
 console.log('✅ База данных подключена');
@@ -526,6 +594,450 @@ function getAllRatings() {
     map[row.teacher_id][row.key] = { sum: row.sum, count: row.count };
   }
   return map;
+}
+
+const CYRILLIC_TO_LATIN = {
+  'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
+  'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+  'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
+  'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu',
+  'я': 'ya', 'і': 'i', 'ї': 'yi', 'є': 'ye', 'ґ': 'g'
+};
+
+function transliterateCyrillic(value) {
+  const input = String(value || '');
+  let out = '';
+  for (const ch of input) {
+    const lower = ch.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(CYRILLIC_TO_LATIN, lower)) {
+      out += CYRILLIC_TO_LATIN[lower];
+      continue;
+    }
+    if (/[a-z0-9]/.test(lower)) {
+      out += lower;
+      continue;
+    }
+    out += ' ';
+  }
+  return out;
+}
+
+function slugifyTeacherParts(parts) {
+  const merged = transliterateCyrillic(parts.filter(Boolean).join(' '));
+  const normalized = merged.replace(/[^a-z0-9]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
+  const trimmed = normalized.slice(0, 80);
+  return trimmed || '';
+}
+
+function ensureUniqueTeacherId(baseId) {
+  let candidate = baseId;
+  let counter = 1;
+  while (getTeacherById(candidate)) {
+    counter += 1;
+    if (counter > 25) {
+      candidate = `${baseId}-${crypto.randomBytes(3).toString('hex')}`;
+      break;
+    }
+    candidate = `${baseId}-${counter}`;
+  }
+  return candidate;
+}
+
+function generateTeacherIdFromPayload(payload) {
+  const parts = [
+    payload?.lastName || payload?.last_name,
+    payload?.firstName || payload?.first_name,
+    payload?.patronymic || payload?.patronymic_name
+  ];
+  const slug = slugifyTeacherParts(parts);
+  const base = slug ? `t-${slug}` : `t-${crypto.randomBytes(4).toString('hex')}`;
+  return ensureUniqueTeacherId(base);
+}
+
+function sanitizeRequestField(value, maxLength = 160) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function sanitizeRequestMultiline(value, maxLength = 1500) {
+  const normalized = String(value || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .join('\n');
+  return normalized.slice(0, maxLength);
+}
+
+function normalizeSubjectsList(value) {
+  return String(value || '')
+    .split(/[,|\n]+/g)
+    .map(item => sanitizeRequestField(item, 80))
+    .filter(Boolean)
+    .slice(0, 15);
+}
+
+function generateRequestId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return `req_${crypto.randomUUID()}`;
+  }
+  return `req_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+function insertTeacherRequest(payload, meta = {}) {
+  const id = generateRequestId();
+  const createdTs = Date.now();
+  const stmt = db.prepare(`
+    INSERT INTO teacher_requests (id, status, created_ts, created_iso, payload, photo_filename, submitter_ip, submitter_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    id,
+    TEACHER_REQUEST_STATUSES.PENDING,
+    createdTs,
+    new Date(createdTs).toISOString(),
+    JSON.stringify(payload),
+    meta.photoFilename || null,
+    meta.ip || null,
+    meta.userAgent || null
+  );
+  return { id, createdTs };
+}
+
+function getTeacherRequestById(id) {
+  if (!id) return null;
+  const stmt = db.prepare('SELECT * FROM teacher_requests WHERE id = ?');
+  const row = stmt.get(id);
+  if (!row) return null;
+  let parsed = {};
+  try {
+    parsed = row.payload ? JSON.parse(row.payload) : {};
+  } catch {
+    parsed = {};
+  }
+  return {
+    ...row,
+    payload: parsed
+  };
+}
+
+function setTeacherRequestTelegramMeta(id, chatId, messageId) {
+  const stmt = db.prepare(`
+    UPDATE teacher_requests
+    SET telegram_chat_id = ?, telegram_message_id = ?
+    WHERE id = ?
+  `);
+  stmt.run(chatId || null, messageId || null, id);
+}
+
+function updateTeacherRequestError(id, error) {
+  if (!id) return;
+  const stmt = db.prepare('UPDATE teacher_requests SET error = ? WHERE id = ?');
+  stmt.run(error || null, id);
+}
+
+function finalizeTeacherRequest({ id, status, processedBy, action, teacherId = null, error = null }) {
+  if (!id || !status) return null;
+  const safeStatus = Object.values(TEACHER_REQUEST_STATUSES).includes(status) ? status : TEACHER_REQUEST_STATUSES.PENDING;
+  const ts = Date.now();
+  const stmt = db.prepare(`
+    UPDATE teacher_requests
+    SET status = ?, processed_ts = ?, processed_iso = ?, processed_by = ?, processed_action = ?, teacher_id = ?, error = ?
+    WHERE id = ?
+  `);
+  stmt.run(
+    safeStatus,
+    ts,
+    new Date(ts).toISOString(),
+    processedBy || null,
+    action || null,
+    teacherId || null,
+    error || null,
+    id
+  );
+  return getTeacherRequestById(id);
+}
+
+async function callTelegramApi(method, payload) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    const err = new Error('telegram_not_configured');
+    err.code = 'TELEGRAM_NOT_CONFIGURED';
+    throw err;
+  }
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+  const isFormData = typeof FormData !== 'undefined' && payload instanceof FormData;
+  const options = {
+    method: 'POST',
+    body: isFormData ? payload : JSON.stringify(payload)
+  };
+  if (!isFormData) {
+    options.headers = { 'Content-Type': 'application/json' };
+  }
+  const resp = await fetch(url, options);
+
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch {
+    data = null;
+  }
+
+  if (!resp.ok || (data && data.ok === false)) {
+    const err = new Error('telegram_failed');
+    err.code = 'TELEGRAM_FAILED';
+    err.description = data?.description || resp.statusText || 'telegram_failed';
+    err.statusCode = resp.status;
+    throw err;
+  }
+
+  return data?.result ?? data;
+}
+
+function moveRequestPhotoToGallery(filename, teacherId) {
+  if (!filename || !teacherId) return null;
+  const srcPath = path.join(REQUEST_PHOTO_DIR, filename);
+  if (!fs.existsSync(srcPath)) return null;
+
+  const ext = (path.extname(filename) || '.jpg').toLowerCase();
+  const safeExt = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext) ? ext : '.jpg';
+
+  let destName = `${teacherId}${safeExt}`;
+  let destPath = path.join(PHOTO_DIR, destName);
+  let counter = 1;
+  while (fs.existsSync(destPath)) {
+    destName = `${teacherId}-${counter}${safeExt}`;
+    destPath = path.join(PHOTO_DIR, destName);
+    counter += 1;
+  }
+
+  try {
+    fs.renameSync(srcPath, destPath);
+    return destName;
+  } catch (err) {
+    console.error('Не удалось переместить фото заявки учителя:', err);
+    return null;
+  }
+}
+
+function deleteRequestPhoto(filename) {
+  if (!filename) return;
+  const filePath = path.join(REQUEST_PHOTO_DIR, filename);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (err) {
+    console.warn('Не удалось удалить фото отклонённой заявки учителя:', err && err.message ? err.message : err);
+  }
+}
+
+function describeTelegramUser(user) {
+  if (!user) return '';
+  if (user.username) return `@${user.username}`;
+  const parts = [user.first_name, user.last_name].filter(Boolean);
+  if (parts.length) return parts.join(' ');
+  return String(user.id || '');
+}
+
+async function sendTelegramPhotoMessage({ chatId, filePath, fileName, mimeType, caption, replyMarkup }) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    const err = new Error('telegram_not_configured');
+    err.code = 'TELEGRAM_NOT_CONFIGURED';
+    throw err;
+  }
+  if (!fs.existsSync(filePath)) {
+    const err = new Error('photo_not_found');
+    err.code = 'PHOTO_NOT_FOUND';
+    throw err;
+  }
+  const buffer = fs.readFileSync(filePath);
+  const blob = new Blob([buffer], { type: mimeType || 'application/octet-stream' });
+  const form = new FormData();
+  form.append('chat_id', chatId);
+  if (caption) form.append('caption', caption);
+  if (replyMarkup) form.append('reply_markup', JSON.stringify(replyMarkup));
+  form.append('photo', blob, fileName || path.basename(filePath));
+  return callTelegramApi('sendPhoto', form);
+}
+
+async function safeAnswerCallback(callback, text, showAlert = false) {
+  if (!callback?.id) return;
+  try {
+    await callTelegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: text || '',
+      show_alert: !!showAlert
+    });
+  } catch (err) {
+    console.warn('Не удалось ответить на callback Telegram:', err && err.message ? err.message : err);
+  }
+}
+
+function composeRequestDecisionText(originalText, statusLine) {
+  const base = String(originalText || '').trimEnd();
+  if (!statusLine) return base || 'Заявка обработана.';
+  if (base.includes('Статус:')) {
+    return base.replace(/Статус:.*$/s, `Статус: ${statusLine}`);
+  }
+  return `${base}\n\nСтатус: ${statusLine}`;
+}
+
+async function updateRequestMessage(callback, request, statusLine) {
+  const chatId = callback?.message?.chat?.id ??
+    (request?.telegram_chat_id ? Number(request.telegram_chat_id) || request.telegram_chat_id : null);
+  const messageId = callback?.message?.message_id ??
+    (request?.telegram_message_id ? Number(request.telegram_message_id) || request.telegram_message_id : null);
+  if (!chatId || !messageId) return;
+
+  const hasCaption = typeof callback?.message?.caption === 'string';
+  const originalText = hasCaption
+    ? callback.message.caption
+    : (callback?.message?.text || '');
+  let newText = composeRequestDecisionText(originalText, statusLine);
+
+  try {
+    const payload = {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [] }
+    };
+    let method = 'editMessageText';
+    if (hasCaption) {
+      method = 'editMessageCaption';
+      if (newText.length > 1024) {
+        const statusIdx = newText.indexOf('Статус:');
+        if (statusIdx >= 0) {
+          const statusPart = newText.slice(statusIdx);
+          const maxPrefixLength = Math.max(0, 1024 - statusPart.length - 1);
+          const prefix = newText.slice(0, maxPrefixLength).trimEnd();
+          newText = prefix ? `${prefix}\n${statusPart}` : statusPart.slice(0, 1024);
+          if (newText.length > 1024) {
+            newText = `${newText.slice(0, 1019)}…`;
+          }
+        } else {
+          newText = `${newText.slice(0, 1019)}…`;
+        }
+      }
+      payload.caption = newText;
+    } else {
+      payload.text = newText;
+      payload.disable_web_page_preview = true;
+    }
+    await callTelegramApi(method, payload);
+  } catch (err) {
+    if (err && err.description && /message is not modified/i.test(err.description)) return;
+    console.warn('Не удалось обновить сообщение заявки в Telegram:', err && err.message ? err.message : err);
+  }
+}
+
+async function processTeacherRequestApproval(request, callback) {
+  const payload = request?.payload || {};
+  const actor = describeTelegramUser(callback?.from);
+
+  const subjects = Array.isArray(payload.subjects)
+    ? payload.subjects.map(s => sanitizeRequestField(s, 80)).filter(Boolean)
+    : normalizeSubjectsList(payload.subjects);
+
+  if (!payload.lastName || !payload.firstName || !payload.department || !subjects.length) {
+    await safeAnswerCallback(callback, 'В заявке не хватает данных для создания учителя', true);
+    updateTeacherRequestError(request.id, 'missing_fields_for_approval');
+    return null;
+  }
+
+  const teacherId = generateTeacherIdFromPayload(payload);
+  let photoFile = null;
+
+  if (request.photo_filename) {
+    photoFile = moveRequestPhotoToGallery(request.photo_filename, teacherId);
+  }
+
+  try {
+    upsertTeacher({
+      id: teacherId,
+      lastName: payload.lastName,
+      firstName: payload.firstName,
+      patronymic: payload.patronymic || '',
+      department: payload.department,
+      subjects,
+      photo: photoFile
+    });
+  } catch (err) {
+    console.error('Не удалось сохранить учителя из заявки:', err);
+    updateTeacherRequestError(request.id, err && err.message ? err.message : 'db_error');
+    await safeAnswerCallback(callback, 'Не удалось сохранить в базу. Проверьте логи сервера.', true);
+    return null;
+  }
+
+  finalizeTeacherRequest({
+    id: request.id,
+    status: TEACHER_REQUEST_STATUSES.APPROVED,
+    processedBy: actor,
+    action: 'approve',
+    teacherId,
+    error: null
+  });
+
+  const statusLine = `✅ Одобрено ${actor || ''} • добавлен как ${teacherId}`;
+  await safeAnswerCallback(callback, 'Учитель добавлен в базу');
+  await updateRequestMessage(callback, request, statusLine.trim());
+
+  return teacherId;
+}
+
+async function processTeacherRequestRejection(request, callback) {
+  const actor = describeTelegramUser(callback?.from);
+  if (request.photo_filename) {
+    deleteRequestPhoto(request.photo_filename);
+  }
+
+  finalizeTeacherRequest({
+    id: request.id,
+    status: TEACHER_REQUEST_STATUSES.REJECTED,
+    processedBy: actor,
+    action: 'reject',
+    teacherId: null,
+    error: null
+  });
+
+  const statusLine = `🚫 Отклонено ${actor || ''}`;
+  await safeAnswerCallback(callback, 'Заявка отклонена');
+  await updateRequestMessage(callback, request, statusLine.trim());
+}
+
+async function handleTeacherRequestCallback(callback) {
+  const data = String(callback?.data || '');
+  if (!data.startsWith('teacher_req:')) return false;
+
+  const [, action, ...rest] = data.split(':');
+  const requestId = rest.join(':');
+  if (!requestId) {
+    await safeAnswerCallback(callback, 'Не удалось распознать заявку', true);
+    return true;
+  }
+
+  const request = getTeacherRequestById(requestId);
+  if (!request) {
+    await safeAnswerCallback(callback, 'Заявка не найдена или уже удалена', true);
+    return true;
+  }
+
+  if (request.status !== TEACHER_REQUEST_STATUSES.PENDING) {
+    const statusLine = request.status === TEACHER_REQUEST_STATUSES.APPROVED ? 'уже одобрена' : 'уже обработана';
+    await safeAnswerCallback(callback, `Заявка ${statusLine}`);
+    await updateRequestMessage(callback, request, request.status === TEACHER_REQUEST_STATUSES.APPROVED ? '✅ Уже одобрено' : '🚫 Уже отклонено');
+    return true;
+  }
+
+  if (action === 'approve') {
+    await processTeacherRequestApproval(request, callback);
+    return true;
+  }
+  if (action === 'reject') {
+    await processTeacherRequestRejection(request, callback);
+    return true;
+  }
+
+  await safeAnswerCallback(callback, 'Неизвестное действие', true);
+  return true;
 }
 
 function getCommentsForTeacher(teacherId) {
@@ -1319,6 +1831,181 @@ app.post('/api/comment/vote', (req,res)=>{
   res.json({ok:true, likes:cnt.likes, dislikes:cnt.dislikes, myVote:newVote});
 });
 
+app.post('/api/teacher-request', (req, res) => {
+  teacherRequestUpload(req, res, async uploadErr => {
+    if (uploadErr) {
+      const code = uploadErr?.code || uploadErr?.message;
+      if (code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ ok: false, error: 'photo_too_large' });
+      }
+      if (code === 'UNSUPPORTED_FILE_TYPE' || uploadErr.message === 'unsupported_file_type') {
+        return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
+      }
+      console.error('Ошибка загрузки файла заявки учителя:', uploadErr);
+      return res.status(500).json({ ok: false, error: 'upload_failed' });
+    }
+
+    try {
+      const fields = req.body || {};
+      const lastName = sanitizeRequestField(fields.lastName, 120);
+      const firstName = sanitizeRequestField(fields.firstName, 120);
+      const patronymic = sanitizeRequestField(fields.patronymic, 120);
+      const department = sanitizeRequestField(fields.department, 160);
+      const subjects = normalizeSubjectsList(fields.subjects);
+      const submitterName = sanitizeRequestField(fields.submitterName, 160);
+      const submitterContact = sanitizeRequestField(fields.submitterContact, 160);
+      const notes = sanitizeRequestMultiline(fields.notes, 1500);
+
+      if (!lastName || !firstName) {
+        return res.status(400).json({ ok: false, error: 'missing_name' });
+      }
+      if (!department) {
+        return res.status(400).json({ ok: false, error: 'missing_department' });
+      }
+      if (!subjects.length) {
+        return res.status(400).json({ ok: false, error: 'missing_subjects' });
+      }
+
+      const payload = {
+        lastName,
+        firstName,
+        patronymic,
+        department,
+        subjects,
+        submitterName,
+        submitterContact,
+        notes,
+        source: 'public_form',
+        photoOriginalName: req.file?.originalname || null,
+        photoMime: req.file?.mimetype || null
+      };
+
+      const meta = {
+        photoFilename: req.file?.filename || null,
+        ip: req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',')[0].trim() : req.ip,
+        userAgent: req.headers['user-agent'] || ''
+      };
+
+      const { id } = insertTeacherRequest(payload, meta);
+
+      if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_REVIEW_CHAT_ID) {
+        updateTeacherRequestError(id, 'telegram_not_configured');
+        return res.status(503).json({ ok: false, error: 'telegram_not_configured', requestId: id });
+      }
+
+      const fio = [lastName, firstName, patronymic].filter(Boolean).join(' ');
+      const summaryLines = [
+        '🆕 Запрос на добавление учителя',
+        `ID: ${id}`,
+        `ФИО: ${fio}`,
+        `Кафедра: ${department}`,
+        `Предметы: ${subjects.join(', ') || '—'}`
+      ];
+      if (submitterName) summaryLines.push(`Отправитель: ${submitterName}`);
+      if (submitterContact) summaryLines.push(`Контакт: ${submitterContact}`);
+      const fullSummaryText = summaryLines.join('\n');
+      const summaryText = fullSummaryText.length > 1024 ? `${fullSummaryText.slice(0, 1019)}…` : fullSummaryText;
+
+      const detailsLines = [];
+      if (notes) {
+        const truncatedNotes = notes.length > 3500 ? `${notes.slice(0, 3495)}…` : notes;
+        detailsLines.push('Комментарий:');
+        detailsLines.push(truncatedNotes);
+      }
+      let detailsText = detailsLines.join('\n').trim();
+      if (detailsText.length > 4096) {
+        detailsText = `${detailsText.slice(0, 4090)}…`;
+      }
+
+      const replyMarkup = {
+        inline_keyboard: [
+          [
+            { text: '✅ Одобрить', callback_data: `teacher_req:approve:${id}` },
+            { text: '🚫 Отклонить', callback_data: `teacher_req:reject:${id}` }
+          ]
+        ]
+      };
+
+      try {
+        let message = null;
+        if (req.file) {
+          const photoPath = path.join(REQUEST_PHOTO_DIR, req.file.filename);
+          let caption = summaryText;
+          if (caption.length > 1024) {
+            caption = `${caption.slice(0, 1019)}…`;
+          }
+          message = await sendTelegramPhotoMessage({
+            chatId: TELEGRAM_REVIEW_CHAT_ID,
+            filePath: photoPath,
+            fileName: req.file.originalname || req.file.filename,
+            mimeType: req.file.mimetype || 'image/jpeg',
+            caption,
+            replyMarkup
+          });
+          if (detailsText) {
+            await callTelegramApi('sendMessage', {
+              chat_id: TELEGRAM_REVIEW_CHAT_ID,
+              text: detailsText,
+              disable_web_page_preview: true
+            });
+          }
+        } else {
+          let text = [fullSummaryText, detailsText].filter(Boolean).join('\n\n');
+          if (text.length > 4096) {
+            text = `${text.slice(0, 4090)}…`;
+          }
+          message = await callTelegramApi('sendMessage', {
+            chat_id: TELEGRAM_REVIEW_CHAT_ID,
+            text,
+            disable_web_page_preview: true,
+            reply_markup: replyMarkup
+          });
+        }
+
+        const telegramChatId = message?.chat?.id ? String(message.chat.id) : TELEGRAM_REVIEW_CHAT_ID;
+        const telegramMessageId = message?.message_id ? String(message.message_id) : null;
+        setTeacherRequestTelegramMeta(id, telegramChatId, telegramMessageId);
+
+        res.json({ ok: true, requestId: id });
+      } catch (err) {
+        updateTeacherRequestError(id, err?.description || err?.message || 'telegram_failed');
+        if (err && err.code === 'TELEGRAM_FAILED') {
+          return res.status(502).json({ ok: false, error: 'telegram_failed', description: err.description || 'telegram_failed', requestId: id });
+        }
+        if (err && err.code === 'TELEGRAM_NOT_CONFIGURED') {
+          return res.status(503).json({ ok: false, error: 'telegram_not_configured', requestId: id });
+        }
+        console.error('Ошибка отправки заявки в Telegram:', err);
+        return res.status(500).json({ ok: false, error: 'telegram_failed', requestId: id });
+      }
+    } catch (err) {
+      console.error('Ошибка обработки заявки на добавление учителя:', err);
+      return res.status(500).json({ ok: false, error: 'server_error' });
+    }
+  });
+});
+
+app.post('/api/telegram/webhook', express.json({ limit: '1mb' }), async (req, res) => {
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const provided = req.query.secret || req.headers['x-telegram-secret'];
+    if (String(provided || '').trim() !== TELEGRAM_WEBHOOK_SECRET) {
+      return res.status(403).json({ ok: false });
+    }
+  }
+
+  const update = req.body || {};
+
+  try {
+    if (update.callback_query) {
+      await handleTeacherRequestCallback(update.callback_query);
+    }
+  } catch (err) {
+    console.error('Ошибка обработки Telegram webhook:', err);
+  }
+
+  res.json({ ok: true });
+});
+
 /* --- ADMIN API --- */
 
 function requireAdmin(req,res,next){
@@ -1482,38 +2169,25 @@ app.post('/api/report-comment', express.json(), async (req, res) => {
   const msg = messageParts.join('\n');
 
   try {
-    const BOT_TOKEN = process.env.TELEGRAM_TOKEN;
-    const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-    if (!BOT_TOKEN || !CHAT_ID) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_REVIEW_CHAT_ID) {
       console.warn('TELEGRAM_TOKEN или CHAT_ID не заданы');
       return res.status(503).json({ ok: false, error: 'telegram_not_configured' });
     }
 
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-    const tgResponse = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text: msg
-      })
+    await callTelegramApi('sendMessage', {
+      chat_id: TELEGRAM_REVIEW_CHAT_ID,
+      text: msg
     });
-
-    let tgData = null;
-    try {
-      tgData = await tgResponse.json();
-    } catch (parseErr) {
-      console.warn('Не удалось прочитать ответ Telegram:', parseErr);
-    }
-
-    if (!tgResponse.ok || (tgData && tgData.ok === false)) {
-      const description = tgData?.description || tgResponse.statusText || 'telegram_failed';
-      console.warn('Telegram вернул ошибку при отправке жалобы:', description);
-      return res.status(502).json({ ok: false, error: 'telegram_failed', description });
-    }
 
     res.json({ ok: true });
   } catch (err) {
+    if (err && err.code === 'TELEGRAM_FAILED') {
+      console.warn('Telegram вернул ошибку при отправке жалобы:', err.description || err.message);
+      return res.status(502).json({ ok: false, error: 'telegram_failed', description: err.description || 'telegram_failed' });
+    }
+    if (err && err.code === 'TELEGRAM_NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, error: 'telegram_not_configured' });
+    }
     console.error('Ошибка отправки в Telegram:', err);
     res.status(500).json({ ok: false, error: 'telegram_failed' });
   }

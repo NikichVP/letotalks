@@ -286,6 +286,21 @@ const API = {
     return await r.json();
   },
   async myStats(){ const r = await fetch('/api/user/stats'); return await r.json(); },
+  async teacherRequest(formData){
+    const r = await fetch('/api/teacher-request', {
+      method: 'POST',
+      body: formData
+    });
+    let data = null;
+    try { data = await r.json(); } catch { data = null; }
+    if (!r.ok || !data || data.ok === false) {
+      const err = new Error(data?.error || 'teacher_request_failed');
+      err.response = data;
+      err.status = r.status;
+      throw err;
+    }
+    return data;
+  },
 
   // --- admin ---
   async adminComments(limit=100){ const r=await fetch(`/api/admin/comments?limit=${limit}`); return await r.json(); },
@@ -450,8 +465,198 @@ async viewHome(){
   $('#app').innerHTML = html`
     <section class="section"><h2>Топ по характеристикам</h2><div class="grid">${charCards}</div></section>
     <section class="section"><h2>По кафедрам</h2><div class="grid">${deptCards}</div></section>
+    <section class="section teacher-request-cta">
+      <div class="cta-card">
+        <div class="cta-text">
+          <h2>Не нашли своего учителя?</h2>
+          <p class="muted">Отправьте заявку, и администраторы проверят информацию и добавят нового учителя в каталог.</p>
+        </div>
+        <a class="btn primary" href="#/teacher-request">Добавить учителя</a>
+      </div>
+    </section>
   `;
 },
+
+  async viewTeacherRequest(){
+    await this.mountNavbar();
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="row space-between wrap">
+          <h2>Добавить учителя</h2>
+          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        </div>
+        <div class="teacher-request-card">
+          <p class="muted">Заполните форму ниже. Мы отправим вашу заявку администраторам в Telegram и добавим учителя после подтверждения.</p>
+          <form id="teacherRequestForm" class="teacher-request-form" novalidate>
+            <div class="teacher-request-grid">
+              <div class="teacher-request-field">
+                <label for="reqLastName">Фамилия*</label>
+                <input id="reqLastName" name="lastName" type="text" maxlength="120" required placeholder="Иванов">
+              </div>
+              <div class="teacher-request-field">
+                <label for="reqFirstName">Имя*</label>
+                <input id="reqFirstName" name="firstName" type="text" maxlength="120" required placeholder="Иван">
+              </div>
+              <div class="teacher-request-field">
+                <label for="reqPatronymic">Отчество</label>
+                <input id="reqPatronymic" name="patronymic" type="text" maxlength="120" placeholder="Иванович">
+              </div>
+              <div class="teacher-request-field">
+                <label for="reqDepartment">Кафедра*</label>
+                <input id="reqDepartment" name="department" type="text" maxlength="160" required placeholder="Математика">
+              </div>
+              <div class="teacher-request-field">
+                <label for="reqSubjects">Предметы*</label>
+                <input id="reqSubjects" name="subjects" type="text" maxlength="240" required placeholder="Алгебра, Геометрия">
+                <div class="teacher-request-hint">Укажите через запятую или с новой строки.</div>
+              </div>
+              <div class="teacher-request-field">
+                <label for="reqSubmitterName">Как к вам обращаться</label>
+                <input id="reqSubmitterName" name="submitterName" type="text" maxlength="160" placeholder="Имя или класс">
+              </div>
+              <div class="teacher-request-field">
+                <label for="reqSubmitterContact">Контакт для связи</label>
+                <input id="reqSubmitterContact" name="submitterContact" type="text" maxlength="160" placeholder="Почта или Telegram (по желанию)">
+              </div>
+            </div>
+            <div class="teacher-request-field">
+              <label for="reqNotes">Комментарий или дополнительная информация</label>
+              <textarea id="reqNotes" name="notes" rows="4" maxlength="1500" placeholder="Расскажите, чему обучает учитель, какие у него особенности или достижения."></textarea>
+            </div>
+            <div class="teacher-request-field">
+              <label for="reqPhoto">Фото учителя (до 5 МБ, JPG/PNG/WebP)</label>
+              <input id="reqPhoto" name="photo" type="file" accept="image/jpeg,image/png,image/webp">
+            </div>
+            <div class="teacher-request-actions">
+              <button type="submit" class="btn primary" id="teacherRequestSubmit">Отправить заявку</button>
+              <button type="button" class="btn outline" id="teacherRequestCancel">Отмена</button>
+            </div>
+            <div class="teacher-request-note muted">* — обязательные поля. Отправляя заявку, вы подтверждаете корректность данных.</div>
+          </form>
+          <div id="teacherRequestFeedback" class="teacher-request-feedback"></div>
+        </div>
+      </section>
+    `;
+    this.bindTeacherRequestForm();
+  },
+
+  bindTeacherRequestForm(){
+    const form = $('#teacherRequestForm');
+    if (!form) return;
+    this.setTeacherRequestFeedback('');
+    form.addEventListener('submit', (e)=>{
+      e.preventDefault();
+      this.submitTeacherRequestForm(form);
+    });
+    $('#teacherRequestCancel')?.addEventListener('click', ()=>Router.go('/'));
+  },
+
+  setTeacherRequestFeedback(message, type=''){
+    const box = $('#teacherRequestFeedback');
+    if (!box) return;
+    box.textContent = message || '';
+    box.classList.remove('success','error');
+    if (type) box.classList.add(type);
+  },
+
+  teacherRequestErrorText(code, description){
+    const map = {
+      missing_name: 'Укажите фамилию и имя учителя.',
+      missing_department: 'Укажите кафедру учителя.',
+      missing_subjects: 'Добавьте хотя бы один предмет.',
+      photo_too_large: 'Фото превышает лимит в 5 МБ.',
+      unsupported_photo_type: 'Допускаются только изображения в форматах JPG, PNG или WebP.',
+      telegram_not_configured: 'Сервис временно недоступен. Попробуйте позже.',
+      telegram_failed: 'Не удалось связаться с Telegram. Попробуйте ещё раз чуть позже.',
+      upload_failed: 'Не удалось загрузить файл. Попробуйте выбрать фото заново.',
+      teacher_request_failed: 'Не удалось отправить заявку.',
+      server_error: 'На сервере произошла ошибка. Попробуйте позже.'
+    };
+    return map[code] || description || 'Не удалось отправить заявку. Попробуйте ещё раз позже.';
+  },
+
+  async submitTeacherRequestForm(form){
+    const submitBtn = $('#teacherRequestSubmit');
+    if (submitBtn?.disabled) return;
+
+    this.setTeacherRequestFeedback('');
+
+    if (!form.reportValidity()) {
+      return;
+    }
+
+    const lastName = $('#reqLastName')?.value?.trim() || '';
+    const firstName = $('#reqFirstName')?.value?.trim() || '';
+    const patronymic = $('#reqPatronymic')?.value?.trim() || '';
+    const department = $('#reqDepartment')?.value?.trim() || '';
+    const subjectsRaw = $('#reqSubjects')?.value || '';
+    const subjectsValue = subjectsRaw.trim();
+    const submitterName = $('#reqSubmitterName')?.value?.trim() || '';
+    const submitterContact = $('#reqSubmitterContact')?.value?.trim() || '';
+    const notes = $('#reqNotes')?.value?.trim() || '';
+    const subjectsClean = subjectsValue.split(/[,|\n]+/).map(s=>s.trim()).filter(Boolean).join(', ');
+
+    if (!subjectsClean) {
+      this.setTeacherRequestFeedback('Добавьте хотя бы один предмет.', 'error');
+      $('#reqSubjects')?.focus();
+      return;
+    }
+
+    const photoInput = $('#reqPhoto');
+    const file = photoInput?.files && photoInput.files[0] ? photoInput.files[0] : null;
+    if (file) {
+      const allowed = ['image/jpeg','image/png','image/webp'];
+      if (!allowed.includes(file.type)) {
+        this.setTeacherRequestFeedback('Допускаются только изображения в форматах JPG, PNG или WebP.', 'error');
+        return;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        this.setTeacherRequestFeedback('Фото слишком большое (лимит 5 МБ).', 'error');
+        return;
+      }
+    }
+
+    const formData = new FormData();
+    formData.append('lastName', lastName);
+    formData.append('firstName', firstName);
+    if (patronymic) formData.append('patronymic', patronymic);
+    formData.append('department', department);
+    formData.append('subjects', subjectsValue);
+    if (submitterName) formData.append('submitterName', submitterName);
+    if (submitterContact) formData.append('submitterContact', submitterContact);
+    if (notes) formData.append('notes', notes);
+    if (file) formData.append('photo', file, file.name);
+
+    const resetButton = () => {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Отправить заявку';
+      }
+    };
+
+    try {
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Отправка...';
+      }
+      const response = await API.teacherRequest(formData);
+      form.reset();
+      this.setTeacherRequestFeedback(`Готово! Заявка отправлена модераторам${response?.requestId ? ` (ID: ${response.requestId})` : ''}.`, 'success');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err) {
+      const code = err?.response?.error || err?.message;
+      const description = err?.response?.description;
+      const requestId = err?.response?.requestId;
+      let message = this.teacherRequestErrorText(code, description);
+      if (requestId) {
+        message += ` (ID: ${requestId})`;
+      }
+      this.setTeacherRequestFeedback(message, 'error');
+      console.warn('teacher request failed', err);
+    } finally {
+      resetButton();
+    }
+  },
 
   async listAll(){
     await this.mountNavbar();
@@ -1658,6 +1863,7 @@ Router.add(/^\/search\?q=(.*)$/, (...a)=>App.listBySearch(...a));
 Router.add(/^\/teacher\/(t[\w\-]+)$/, (...a)=>App.teacherProfile(...a));
 Router.add(/^\/policy$/, (...a)=>App.viewPolicy(...a));
 Router.add(/^\/login$/, (...a)=>App.viewLogin(...a));
+Router.add(/^\/teacher-request$/, (...a)=>App.viewTeacherRequest(...a));
 Router.add(/^\/admin\/teachers\/edit\/(.+)$/, (...a)=>App.viewAdminTeacherEdit(...a));
 Router.add(/^\/admin\/teachers\/new$/, (...a)=>App.viewAdminTeacherNew(...a));
 Router.add(/^\/admin\/teachers$/, (...a)=>App.viewAdminTeachersList(...a));
