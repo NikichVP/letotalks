@@ -42,6 +42,159 @@ function coinsOf(u){
   return normalized;
 }
 
+/* ---------- Глобальное поведение кликов: "последний запрос побеждает" ---------- */
+// Идея:
+// - Любой клик по кнопке/ссылке создаёт "группу запроса" с AbortController.
+// - Все fetch-запросы, начатые во время обработки этого клика, получают общий AbortSignal этой группы.
+// - Новый клик абортирует предыдущую группу (тем самым отменяя старые запросы), т. е. последний клик выигрывает.
+// - Кнопка/ссылка временно блокируется (anti-double-click) до завершения всех запросов этой группы или по таймауту.
+// Реализация максимально ненавязчивая: без изменения существующих вызовов fetch/обработчиков.
+
+(function setupLatestClickWins(){
+  if (typeof window === 'undefined') return;
+  if (window.__latestClickWinsInstalled) return;
+  window.__latestClickWinsInstalled = true;
+
+  // Утилита для слияния AbortSignal-ов
+  function mergeSignals() {
+    const signals = Array.from(arguments).filter(Boolean);
+    if (signals.length === 0) return undefined;
+    // Если один из сигналов уже абортирован — вернём контроллер с абортом
+    const ctrl = new AbortController();
+    const abortNow = ()=>{ try{ ctrl.abort(); }catch{} };
+    let aborted = false;
+    for (const s of signals){
+      if (s.aborted){ aborted = true; break; }
+    }
+    if (aborted){ abortNow(); return ctrl.signal; }
+    const onAbort = ()=>{ abortNow(); };
+    for (const s of signals){
+      try{ s.addEventListener('abort', onAbort, { once:true }); }catch{}
+    }
+    return ctrl.signal;
+  }
+
+  const state = {
+    currentGroup: null,   // { id, controller, active, el, restoreTimer }
+    nextId: 1,
+    // флаг указывает, что сейчас выполняется обработка клика и запросы относятся к currentGroup
+    inClickPhase: false,
+  };
+
+  function restoreElement(el){
+    if (!el) return;
+    try{
+      if (el.dataset._lcwWasDisabled === '1'){
+        // Это кнопка/инпут
+        el.disabled = false;
+      }
+      if (el.dataset._lcwWasAriaDisabled === '1'){
+        el.removeAttribute('aria-disabled');
+      }
+      if (el.dataset._lcwPrevPointerEvents !== undefined){
+        el.style.pointerEvents = el.dataset._lcwPrevPointerEvents;
+      }
+    }catch{}
+    delete el?.dataset._lcwWasDisabled;
+    delete el?.dataset._lcwWasAriaDisabled;
+    delete el?.dataset._lcwPrevPointerEvents;
+  }
+
+  function disableElement(el){
+    if (!el) return;
+    // Кнопки и input[type=button|submit] — ставим disabled
+    if ((el.tagName === 'BUTTON') ||
+        (el.tagName === 'INPUT' && ['button','submit'].includes((el.getAttribute('type')||'').toLowerCase()))) {
+      if (!el.disabled){ el.dataset._lcwWasDisabled = '1'; el.disabled = true; }
+      return;
+    }
+    // Для ссылок и элементов с role=button — блокируем клики визуально
+    const prev = el.style.pointerEvents;
+    el.dataset._lcwPrevPointerEvents = prev;
+    el.style.pointerEvents = 'none';
+    el.dataset._lcwWasAriaDisabled = '1';
+    el.setAttribute('aria-disabled','true');
+  }
+
+  function createNewGroup(clickedEl){
+    // Абортируем предыдущую группу
+    if (state.currentGroup){
+      try{ state.currentGroup.controller.abort(); }catch{}
+      // Восстановим предыдущую кнопку — даже если запросы ещё не стартовали
+      clearTimeout(state.currentGroup.restoreTimer);
+      restoreElement(state.currentGroup.el);
+    }
+    const grp = {
+      id: state.nextId++,
+      controller: new AbortController(),
+      active: 0,
+      el: clickedEl || null,
+      restoreTimer: null,
+    };
+    state.currentGroup = grp;
+    return grp;
+  }
+
+  // Патчим fetch один раз
+  if (!window.__originalFetch){
+    window.__originalFetch = window.fetch.bind(window);
+    window.fetch = function(input, init){
+      const i = init || {};
+      const grp = state.inClickPhase ? state.currentGroup : null;
+      let signal = i.signal;
+      if (grp){
+        // объединяем пользовательский сигнал и сигнал группы
+        signal = mergeSignals(i.signal, grp.controller.signal);
+        grp.active++;
+      }
+      const nextInit = signal ? { ...i, signal } : i;
+      const p = window.__originalFetch(input, nextInit);
+      if (grp){
+        const finalize = ()=>{
+          grp.active = Math.max(0, grp.active - 1);
+          // Если все запросы группы завершены — восстановим элемент
+          if (grp.active === 0){
+            // Восстановление может быть вызвано синхронно — чуть отложим
+            queueMicrotask(()=>{
+              // Восстанавливаем только если это всё ещё актуальная группа
+              if (state.currentGroup && state.currentGroup.id === grp.id){
+                restoreElement(grp.el);
+                clearTimeout(grp.restoreTimer);
+              }
+            });
+          }
+        };
+        p.finally(finalize);
+      }
+      return p;
+    };
+  }
+
+  // Глобальный перехват кликов (capture), чтобы он сработал раньше других
+  document.addEventListener('click', (e)=>{
+    try{
+      // Ищем кликабельную цель
+      const clickable = e.target && (e.target.closest('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+      // Создаём новую группу в любом случае — требование: для всех кнопок и действий
+      const grp = createNewGroup(clickable || null);
+      // Anti-double-click: временно блокируем элемент
+      disableElement(clickable);
+      state.inClickPhase = true;
+      // Если в рамках этого клика не начались никакие запросы, снимаем блокировку через таймаут
+      grp.restoreTimer = setTimeout(()=>{
+        if (state.currentGroup && state.currentGroup.id === grp.id && grp.active === 0){
+          restoreElement(grp.el);
+        }
+      }, 1500);
+      // По завершении текущего стека вызовов считаем, что "фаза клика" закончилась
+      queueMicrotask(()=>{ state.inClickPhase = false; });
+    }catch(err){
+      // Безопасно игнорируем ошибки перехвата
+      state.inClickPhase = false;
+    }
+  }, true); // capture
+})();
+
 /* ---------- client-side предмодерация (минимальная, но умная) ---------- */
 const BW_STEMS = ['бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон','пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'];
 const LAT2CYR = { a:'а',b:'в',c:'с',e:'е',h:'н',k:'к',m:'м',o:'о',p:'р',t:'т',x:'х',y:'у' };
