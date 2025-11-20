@@ -2339,8 +2339,7 @@ addEventListener('DOMContentLoaded', ()=>{
 
   $('#year').textContent = new Date().getFullYear();
   Auth.render();
-  Router.init();
-
-  // Узнаём состояние по cookie-сессии
   Auth.me();
+  Router.init();
+  
 });
