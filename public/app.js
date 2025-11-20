@@ -459,6 +459,45 @@ async function fetchTeachersFromServer() {
 
 const API = {
   async departments(){ const r=await fetch('/api/departments'); return (await r.json()).departments; },
+
+  /**
+   * Лёгкий запрос для главной страницы.
+   * Возвращает только минимально необходимый набор:
+   *  - top-3 по каждой характеристике
+   *  - top-3 по каждой кафедре
+   * Это позволяет не тянуть весь список учителей при первом посещении.
+   *
+   * @returns {Promise<{characteristics: Object<string, any[]>, departments: {name:string, list:any[]}[]}>}
+   */
+  async home(){
+    const r = await fetch('/api/home', { headers: { 'Cache-Control': 'no-cache' } });
+    if (!r.ok) throw new Error('home_fetch_failed');
+    return await r.json(); // { characteristics: {key:[]}, departments: [{name,list:[]}] }
+  },
+
+  /**
+   * Пагинированная выборка учителей.
+   * Используется для страницы «Все учителя» и аналогичных лент с бесконечной подгрузкой.
+   *
+   * @param {Object} [opts]
+   * @param {number} [opts.limit=30] - размер страницы (макс. 200 на сервере)
+   * @param {number} [opts.offset=0] - смещение
+   * @param {string} [opts.q=''] - строка поиска по ФИО
+   * @param {string} [opts.department=''] - фильтр по кафедре (точное совпадение)
+   * @returns {Promise<{teachers:any[], total:number}>}
+   */
+  async teachersPage({ limit = 30, offset = 0, q = '', department = '' } = {}){
+    const p = new URLSearchParams();
+    if (limit) p.set('limit', String(limit));
+    if (offset) p.set('offset', String(offset));
+    if (q) p.set('q', String(q));
+    if (department) p.set('department', String(department));
+    const r = await fetch(`/api/teachers?${p.toString()}`, { headers: { 'Cache-Control': 'no-cache' } });
+    if (!r.ok) throw new Error('teachers_page_fetch_failed');
+    const j = await r.json().catch(()=>({ teachers: [], total: 0 }));
+    return { teachers: Array.isArray(j?.teachers) ? j.teachers : [], total: Number(j?.total||0) };
+  },
+
   async teachers(options = {}){
     const { force = false } = options;
     const now = Date.now();
@@ -634,14 +673,17 @@ const App = {
     }
   },
 
-  async getDepartments(options = {}){
-    const teachers = await this.getTeachers(options);
-    const set = new Set();
-    for (const t of teachers) {
-      const dept = t?.department ? String(t.department).trim() : '';
-      if (dept) set.add(dept);
+  /**
+   * Список кафедр берём напрямую с сервера,
+   * чтобы не требовать предварительной загрузки всех учителей.
+   */
+  async getDepartments(){
+    try{
+      const list = await API.departments();
+      return Array.isArray(list) ? list : [];
+    }catch{
+      return [];
     }
-    return Array.from(set).sort(collator.compare);
   },
 
   async mountNavbar(){
@@ -699,14 +741,19 @@ const App = {
     });
   },
 
+  /**
+   * Главная страница: используем лёгкий API-пакет через API.home(),
+   * чтобы не загружать полный список учителей при первом визите.
+   */
 async viewHome(){
   await this.mountNavbar();
-  const all = await this.getTeachers();
-  const teachers = Array.isArray(all) ? all : [];
+  // Лёгкая загрузка данных для главной страницы
+  let homeData = null;
+  try{ homeData = await API.home(); }catch{ homeData = { characteristics:{}, departments:[] }; }
 
   const charCards = CHARACTERISTICS.map(c=>{
-    const sorted = this.sortByValueThenAlpha([...teachers], t=>characteristicAvg(t,c.key)).slice(0,3);
-    const preview = sorted.map(t=>html`
+    const list = Array.isArray(homeData?.characteristics?.[c.key]) ? homeData.characteristics[c.key] : [];
+    const preview = list.map(t=>html`
       <div class="row" style="gap:10px;padding:8px 0">
         <div class="portrait"><img src="${t.photo||''}" alt=""></div>
         <div style="flex:1">
@@ -728,9 +775,9 @@ async viewHome(){
       </div>`;
   }).join('');
 
-  const deps = await this.getDepartments();
-  const deptCards = deps.map(d=>{
-    const list = this.sortByValueThenAlpha(teachers.filter(t=>t.department===d), t=>overall(t)).slice(0,3);
+  // Карточки по кафедрам берём уже подготовленными на сервере (первые 3 по каждой)
+  const deptCards = (Array.isArray(homeData?.departments)?homeData.departments:[]).map(d=>{
+    const list = Array.isArray(d.list)?d.list:[];
     if (!list.length) return '';
     const preview = list.map(t=>html`
       <div class="row" style="gap:10px;padding:8px 0">
@@ -744,8 +791,8 @@ async viewHome(){
     return html`
       <div class="card">
         <div class="card-header">
-          <h3>${d}</h3>
-          <a class="btn small primary" href="#/department/${encodeURIComponent(d)}">Все учителя</a>
+          <h3>${d.name}</h3>
+          <a class="btn small primary" href="#/department/${encodeURIComponent(d.name)}">Все учителя</a>
         </div>
         <div class="card-content">
           <div class="hr"></div>
@@ -950,21 +997,79 @@ async viewHome(){
     }
   },
 
+  /**
+   * Страница «Все учителя» с бесконечной подгрузкой.
+   * Сначала грузим первые 30 элементов с сервера, далее — порциями по 30
+   * при пересечении наблюдаемого «сентинела» (IntersectionObserver).
+   */
   async listAll(){
     await this.mountNavbar();
-    const all = await this.getTeachers();
-    const list = Array.isArray(all) ? all : [];
-    const sorted = this.sortByValueThenAlpha([...list], t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
           <h2>Все учителя</h2>
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
-        <div class="list">
-          ${sorted.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('') || '<div class="empty">Пока нет учителей</div>'}
+        <div id="teacherList" class="list"></div>
+        <div id="infiniteFooter" class="muted" style="text-align:center;padding:12px 0">
+          <span id="loader">Загрузка…</span>
+          <span id="end" style="display:none">Это все</span>
+          <div id="sentinel" style="height:1px"></div>
         </div>
       </section>`;
+
+    // Узлы интерфейса списка и «футер» с индикаторами
+    const container = $('#teacherList');
+    const loader = $('#loader');
+    const endMark = $('#end');
+    const sentinel = $('#sentinel');
+
+    // Параметры пагинации и состояние
+    let limit = 30;
+    let offset = 0;
+    let total = Infinity;
+    let loading = false;
+    let list = [];
+
+    // Полная перерисовка текущего накопленного списка
+    const render = () => {
+      if (!list.length && offset===0 && total===0) {
+        container.innerHTML = '<div class="empty">Пока нет учителей</div>';
+      } else {
+        container.innerHTML = list.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('');
+      }
+    };
+
+    // Загрузить следующую страницу, если не идёт активная загрузка
+    const loadMore = async () => {
+      if (loading) return;
+      if (list.length >= total) return;
+      loading = true;
+      loader.style.display = '';
+      endMark.style.display = 'none';
+      try{
+        const { teachers, total: tot } = await API.teachersPage({ limit, offset });
+        total = Number.isFinite(tot) ? tot : tot || total;
+        list = list.concat(teachers);
+        offset += teachers.length;
+        render();
+      } finally {
+        loading = false;
+        loader.style.display = list.length < total ? '' : 'none';
+        endMark.style.display = list.length >= total && total>0 ? '' : 'none';
+      }
+    };
+
+    // Наблюдаем за «сентинелом» внизу списка и подгружаем при приближении
+    const io = new IntersectionObserver((entries)=>{
+      for (const e of entries){
+        if (e.isIntersecting) loadMore();
+      }
+    }, { rootMargin: '200px 0px' });
+    io.observe(sentinel);
+
+    // initial chunk
+    loadMore();
   },
 
   async listByCharacteristic(_, key){

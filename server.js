@@ -1574,11 +1574,29 @@ app.get('/api/departments',(req,res)=>{
   res.json({departments:[...set].sort(new Intl.Collator('ru',{sensitivity:'base'}).compare)});
 });
 
+/**
+ * GET /api/teachers
+ * Возвращает список учителей с предрассчитанными рейтингами и общим баллом.
+ * Поддерживает базовые фильтры и пагинацию, чтобы не отдавать весь массив целиком.
+ *
+ * Query-параметры:
+ *  - q: string — поиск по ФИО (регистр игнорируется)
+ *  - department: string — точное совпадение по названию кафедры
+ *  - limit: number (0..200) — размер страницы; если 0 или не задан, отдаётся весь список (не рекомендуется)
+ *  - offset: number (>=0) — смещение для пагинации
+ *
+ * Ответ:
+ *  {
+ *    teachers: Teacher[], // отфильтрованный и отсортированный срез (если задан limit)
+ *    total: number        // общее количество элементов после применения фильтров (без учёта limit/offset)
+ *  }
+ */
 app.get('/api/teachers',(req,res)=>{
   const teachers = getAllTeachers();
   const ratingsMap = getAllRatings();
 
-  const result = teachers.map(row=>{
+  // Нормализуем строки из БД и прикрепляем рассчитанные рейтинги/overall к каждому учителю
+  let list = teachers.map(row=>{
     const teacher = normalizeTeacherRow(row);
     if (!teacher) return null;
     const ratings = {};
@@ -1592,7 +1610,95 @@ app.get('/api/teachers',(req,res)=>{
     };
   }).filter(Boolean);
 
-  res.json({teachers: result});
+  // Применяем необязательные базовые фильтры (строка поиска по ФИО и фильтр по кафедре)
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (q) {
+    list = list.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
+  }
+  const dept = String(req.query.department || '').trim();
+  if (dept) {
+    list = list.filter(t => String(t.department) === dept);
+  }
+
+  // Сортировка по убыванию общего рейтинга, затем по ФИО (стабильный вид списка)
+  list.sort((a,b)=>{
+    const dv = (b.overall||0) - (a.overall||0);
+    if (dv !== 0) return dv;
+    const an = `${a.lastName||''} ${a.firstName||''}`.trim();
+    const bn = `${b.lastName||''} ${b.firstName||''}`.trim();
+    return new Intl.Collator('ru',{sensitivity:'base'}).compare(an,bn);
+  });
+
+  // Пагинация: ограничиваем размер страницы и вычисляем смещение
+  const total = list.length;
+  const limit = Math.max(0, Math.min(200, Number(req.query.limit||0)));
+  const offset = Math.max(0, Number(req.query.offset||0));
+  const paged = limit ? list.slice(offset, offset + limit) : list;
+
+  res.json({teachers: paged, total});
+});
+
+/**
+ * GET /api/home
+ * Лёгкий payload для главной страницы: отдаём только то, что нужно для карточек.
+ *  - Топ-3 учителя по каждой характеристике
+ *  - Топ-3 учителя по каждой кафедре (по overall)
+ * Это позволяет на главной не загружать весь список учителей.
+ *
+ * Ответ:
+ *  {
+ *    characteristics: { [key: string]: Teacher[] },
+ *    departments: { name: string, list: Teacher[] }[]
+ *  }
+ */
+app.get('/api/home', (req, res) => {
+  const teachers = getAllTeachers();
+  const ratingsMap = getAllRatings();
+
+  // Нормализуем учителей и прикрепляем рассчитанные рейтинги по всем характеристикам
+  const norm = teachers.map(row => {
+    const t = normalizeTeacherRow(row);
+    if (!t) return null;
+    const ratings = {};
+    for (const k of CHARACTERISTICS_KEYS){
+      ratings[k] = ratingsMap[row.id]?.[k] || {sum:0,count:0};
+    }
+    return {
+      ...t,
+      ratings,
+      overall: overall(ratings)
+    };
+  }).filter(Boolean);
+
+  const collator = new Intl.Collator('ru',{sensitivity:'base'});
+  // Вспомогательный компаратор: сперва по значению, затем по алфавиту по ФИО
+  const byValueThenName = (getVal) => (a,b)=>{
+    const dv = (getVal(b)||0) - (getVal(a)||0);
+    if (dv !== 0) return dv;
+    const an = `${a.lastName||''} ${a.firstName||''}`.trim();
+    const bn = `${b.lastName||''} ${b.firstName||''}`.trim();
+    return collator.compare(an,bn);
+  };
+
+  // Собираем топ-3 по каждой характеристике
+  const characteristics = {};
+  for (const k of CHARACTERISTICS_KEYS){
+    const sorted = [...norm].sort(byValueThenName(t=>{
+      const r = t.ratings?.[k];
+      const sum = Number(r?.sum||0), cnt = Number(r?.count||0);
+      return cnt>0 ? (sum/cnt) : 0;
+    })).slice(0,3);
+    characteristics[k] = sorted;
+  }
+
+  // Собираем топ-3 по каждой кафедре, сортируя по overall
+  const departmentsSet = new Set(norm.map(t=>t.department).filter(Boolean));
+  const departments = Array.from(departmentsSet).sort(collator.compare).map(name => {
+    const list = norm.filter(t=>t.department===name).sort(byValueThenName(t=>t.overall)).slice(0,3);
+    return { name, list };
+  }).filter(d=>d.list.length>0);
+
+  res.json({ characteristics, departments });
 });
 
 app.get('/api/teacher/:id',(req,res)=>{
