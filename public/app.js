@@ -102,18 +102,21 @@ function coinsOf(u){
 
   function disableElement(el){
     if (!el) return;
-    // Кнопки и input[type=button|submit] — ставим disabled
-    if ((el.tagName === 'BUTTON') ||
-        (el.tagName === 'INPUT' && ['button','submit'].includes((el.getAttribute('type')||'').toLowerCase()))) {
-      if (!el.disabled){ el.dataset._lcwWasDisabled = '1'; el.disabled = true; }
-      return;
-    }
-    // Для ссылок и элементов с role=button — блокируем клики визуально
+    // Кнопки/инпуты могли быть реально disabled — не трогаем их состояние
+    const isButton = (el.tagName === 'BUTTON') ||
+      (el.tagName === 'INPUT' && ['button','submit'].includes((el.getAttribute('type')||'').toLowerCase()));
+    if (isButton && el.disabled) return;
+
+    // Вместо выставления disabled (что ломает обработчики) временно блокируем pointer-events
     const prev = el.style.pointerEvents;
-    el.dataset._lcwPrevPointerEvents = prev;
+    if (el.dataset._lcwPrevPointerEvents === undefined) {
+      el.dataset._lcwPrevPointerEvents = prev;
+    }
     el.style.pointerEvents = 'none';
-    el.dataset._lcwWasAriaDisabled = '1';
-    el.setAttribute('aria-disabled','true');
+    if (!el.hasAttribute('aria-disabled')) {
+      el.dataset._lcwWasAriaDisabled = '1';
+      el.setAttribute('aria-disabled','true');
+    }
   }
 
   function createNewGroup(clickedEl){

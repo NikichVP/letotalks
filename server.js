@@ -8,50 +8,14 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 const { Blob } = require('buffer');
-
-function loadBetterSqlite3() {
-  try {
-    return require('better-sqlite3');
-  } catch (err) {
-    const needsRebuild = err && err.code === 'ERR_DLOPEN_FAILED' && /NODE_MODULE_VERSION/.test(String(err.message || ''));
-    if (!needsRebuild) throw err;
-    console.warn('⚠️  Обнаружено несовпадение версии native-модуля better-sqlite3. Пытаюсь пересобрать под текущую версию Node...');
-    try {
-      const rebuildArgs = ['rebuild', 'better-sqlite3'];
-      if (process.env.npm_execpath) {
-        execFileSync(process.execPath, [process.env.npm_execpath, ...rebuildArgs], {
-          cwd: __dirname,
-          stdio: 'inherit'
-        });
-      } else {
-        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-        execFileSync(npmCmd, rebuildArgs, {
-          cwd: __dirname,
-          stdio: 'inherit'
-        });
-      }
-      // Удаляем кэш на случай, если модуль уже закеширован
-      try {
-        delete require.cache[require.resolve('better-sqlite3')];
-      } catch {}
-      console.log('✅ better-sqlite3 успешно пересобран. Повторная загрузка...');
-      return require('better-sqlite3');
-    } catch (rebuildErr) {
-      console.error('❌ Автоматически пересобрать better-sqlite3 не удалось. Выполните вручную: npm rebuild better-sqlite3');
-      console.error(rebuildErr);
-      throw err;
-    }
-  }
-}
-
-const Database = loadBetterSqlite3();
+const { ensureDirsAndDb, createDbProcessing } = require('./db_processing');
+const { COMMENT_DECISIONS, moderateComment } = require('./comment_moderation');
 
 dotenv.config({ path: path.join(__dirname, '.env') });
 
@@ -112,6 +76,105 @@ const ALLOWED_REQUEST_PHOTO_TYPES = new Map([
   ['image/webp', '.webp']
 ]);
 
+ensureDirsAndDb({
+  dataDir: DATA_DIR,
+  photoDir: PHOTO_DIR,
+  requestPhotoDir: REQUEST_PHOTO_DIR,
+  dbPath: DB_PATH
+});
+
+const dbCtx = createDbProcessing({
+  dbPath: DB_PATH,
+  defaultPhoto: DEFAULT_PHOTO,
+  defaultShopItems: DEFAULT_SHOP_ITEMS,
+  characteristicsKeys: CHARACTERISTICS_KEYS,
+  teacherRequestStatuses: TEACHER_REQUEST_STATUSES,
+  rootAdminEmail: ROOT_ADMIN_EMAIL,
+  sessionConfig: {
+    sessionTtlMs: SESSION_TTL_MS,
+    maxSessionsPerUser: MAX_SESSIONS_PER_USER
+  }
+});
+
+const {
+  db,
+  loadAdminEmails,
+  isAdminUser,
+  isSuperAdminUser,
+  listAdminEmails,
+  addAdminEmail,
+  removeAdminEmail,
+  calculateEarnedCoins,
+  getUserSpentCoins,
+  getAvailableCoins,
+  coinsOf,
+  overall,
+  getAllTeachers,
+  getTeacherById,
+  normalizeTeacherRow,
+  getRatingsForTeacher,
+  getAllRatings,
+  ensureUniqueTeacherId,
+  updateRatings,
+  getCommentsForTeacher,
+  getAllComments,
+  getCommentById,
+  addComment,
+  deleteComment,
+  getAllCommentsByUser,
+  getUserVote,
+  setUserVote,
+  countVotesForCommentBulk,
+  getActiveNickname,
+  findUserByEmail,
+  findUserById,
+  upsertUserOnLogin,
+  incUserStats,
+  isUserBanned,
+  setBanStatus,
+  upsertTeacher,
+  deleteTeacherById,
+  logSecurityEvent,
+  recordLoginAttempt,
+  getRecentLoginAttempts,
+  getUserFromSessionTokenHash,
+  updateSessionActivity,
+  countActiveSessions,
+  deleteOldestSession,
+  insertSession,
+  deactivateSessionByHash,
+  deactivateSessionsByUser,
+  cleanupExpiredSessions: cleanupSessionsDb,
+  cleanupOldLogs,
+  insertLoginEvent,
+  insertTeacherRequest,
+  getTeacherRequestById,
+  setTeacherRequestTelegramMeta,
+  updateTeacherRequestError,
+  finalizeTeacherRequest,
+  getSecurityLogs,
+  getActiveSessionsList,
+  getLoginAttempts,
+  getUserSessions,
+  revokeOtherSessions,
+  getUserList,
+  getAdminComments,
+  getShopItems,
+  getUserPurchasedItems,
+  getActiveInventoryForUser,
+  getShopItemById,
+  getExistingInventoryItem,
+  insertInventoryItem,
+  getShopItemMeta,
+  getInventoryItem,
+  deactivateUserInventory,
+  activateInventoryItemById,
+  getActiveInventoryItem,
+  deactivateUserInventoryByType,
+  getInventoryForUser,
+  getStartupStats
+} = dbCtx;
+
 const teacherRequestUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, REQUEST_PHOTO_DIR),
@@ -138,34 +201,6 @@ const teacherRequestUpload = multer({
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(PUBLIC_DIR));
 app.use('/photo', express.static(PHOTO_DIR));
-// --- Проверка токсичности через локальный Python API (uvicorn на 127.0.0.1:8001) ---
-async function isToxicComment(text) {
-  if (!text || !String(text).trim()) return false;
-  try {
-    const resp = await fetch('http://127.0.0.1:8001/toxicity', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: String(text) })
-    });
-    if (!resp.ok) {
-      console.warn('toxicity API returned', resp.status);
-      return false; // на время падения сервера — не блокируем публикацию
-    }
-    const data = await resp.json();
-    // data формат зависит от твоего python-сервера; подстроил порог:
-    // пример ожидаемого: { label: 'toxic'|'neutral'|'insult', score: 0.92 }
-    const label = String(data.label || '').toLowerCase();
-    const score = Number(data.score || 0);
-    // считаем токсичным, если label содержит 'toxic' или score >= 0.6
-    if (label.includes('toxic') || score >= 0.6) return true;
-    return false;
-  } catch (err) {
-    console.warn('Ошибка запроса к toxicity API:', err && err.message ? err.message : err);
-    // если сервер упал — лучше не блокировать комментарии; верни false
-    return false;
-  }
-}
-
 
 // === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
 if (SECURITY_HEADERS_ENABLED) {
@@ -189,233 +224,6 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: true,
   trustProxy: false
 });
-
-// Проверка и инициализация
-function ensureDirsAndDb() {
-  if (!fs.existsSync(DATA_DIR))  fs.mkdirSync(DATA_DIR, {recursive:true});
-  if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR, {recursive:true});
-  if (!fs.existsSync(REQUEST_PHOTO_DIR)) fs.mkdirSync(REQUEST_PHOTO_DIR, { recursive: true });
-
-  const dbDir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
-  }
-
-  if (!fs.existsSync(DB_PATH)) {
-    console.error('❌ База данных не найдена!');
-    console.log('Запустите миграцию: npm run migrate');
-    process.exit(1);
-  }
-}
-ensureDirsAndDb();
-
-// Подключаемся к БД
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-
-// Создаем таблицу для инвентаря пользователей
-db.exec(`
-  CREATE TABLE IF NOT EXISTS user_inventory (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    item_id TEXT NOT NULL,
-    item_type TEXT NOT NULL,
-    item_name TEXT NOT NULL,
-    purchase_date INTEGER NOT NULL,
-    price INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  )`);
-
-// Индексы для быстрого поиска
-db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_user_id ON user_inventory(user_id)`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_item_id ON user_inventory(item_id)`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_active ON user_inventory(user_id, is_active) WHERE is_active = 1`);
-
-function ensureInventorySchemaUpToDate() {
-  try {
-    const columns = db.prepare('PRAGMA table_info(user_inventory)').all();
-    const hasPrice = columns.some(col => col.name === 'price');
-    if (!hasPrice) {
-      db.exec('ALTER TABLE user_inventory ADD COLUMN price INTEGER NOT NULL DEFAULT 0');
-    }
-  } catch (err) {
-    console.error('Не удалось обновить схему user_inventory:', err);
-  }
-}
-
-function ensureShopItemsTable() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS shop_items (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      price INTEGER NOT NULL,
-      category TEXT NOT NULL,
-      is_active INTEGER NOT NULL DEFAULT 1
-    )
-  `);
-
-  try {
-    const columns = db.prepare('PRAGMA table_info(shop_items)').all();
-    const hasIsActive = columns.some(col => col.name === 'is_active');
-    if (!hasIsActive) {
-      db.exec('ALTER TABLE shop_items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
-    }
-  } catch (err) {
-    console.error('Не удалось обновить схему shop_items:', err);
-  }
-
-  const upsert = db.prepare(`
-    INSERT OR IGNORE INTO shop_items (id, name, price, category, is_active)
-    VALUES (?, ?, ?, ?, 1)
-  `);
-  const updateMeta = db.prepare(`
-    UPDATE shop_items
-    SET name = ?, category = ?, is_active = 1
-    WHERE id = ?
-  `);
-
-  for (const item of DEFAULT_SHOP_ITEMS) {
-    const info = upsert.run(item.id, item.name, item.price, item.category);
-    if (!info.changes) {
-      updateMeta.run(item.name, item.category, item.id);
-    }
-  }
-}
-
-function ensureUserRatingsTable() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS user_ratings (
-      user_id TEXT NOT NULL,
-      teacher_id TEXT NOT NULL,
-      key TEXT NOT NULL,
-      value INTEGER NOT NULL,
-      updated_ts INTEGER NOT NULL,
-      PRIMARY KEY (user_id, teacher_id, key),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
-    )
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_user_ratings_teacher ON user_ratings(teacher_id, key)`);
-}
-
-function ensureTeacherRequestsTable() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS teacher_requests (
-      id TEXT PRIMARY KEY,
-      status TEXT NOT NULL,
-      created_ts INTEGER NOT NULL,
-      created_iso TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      photo_filename TEXT,
-      submitter_ip TEXT,
-      submitter_agent TEXT,
-      telegram_chat_id TEXT,
-      telegram_message_id TEXT,
-      processed_ts INTEGER,
-      processed_iso TEXT,
-      processed_by TEXT,
-      processed_action TEXT,
-      teacher_id TEXT,
-      error TEXT
-    )
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_teacher_requests_status ON teacher_requests(status)`);
-}
-
-ensureInventorySchemaUpToDate();
-ensureShopItemsTable();
-ensureUserRatingsTable();
-ensureTeacherRequestsTable();
-
-console.log('⚡ Инициализация сервера...');
-console.log('✅ База данных подключена');
-
-const ensureAggregateRatingRowStmt = db.prepare(`
-  INSERT OR IGNORE INTO ratings (teacher_id, key, sum, count)
-  VALUES (?, ?, 0, 0)
-`);
-const updateAggregateRatingStmt = db.prepare(`
-  UPDATE ratings
-  SET sum = sum + ?, count = count + ?
-  WHERE teacher_id = ? AND key = ?
-`);
-const selectUserRatingStmt = db.prepare(`
-  SELECT value FROM user_ratings
-  WHERE user_id = ? AND teacher_id = ? AND key = ?
-`);
-const insertUserRatingStmt = db.prepare(`
-  INSERT INTO user_ratings (user_id, teacher_id, key, value, updated_ts)
-  VALUES (?, ?, ?, ?, ?)
-`);
-const updateUserRatingStmt = db.prepare(`
-  UPDATE user_ratings
-  SET value = ?, updated_ts = ?
-  WHERE user_id = ? AND teacher_id = ? AND key = ?
-`);
-
-// === БЕЗОПАСНОСТЬ: Создание таблиц для сессий и логов ===
-function initSecurityTables() {
-  // Таблица сессий
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      token_hash TEXT NOT NULL UNIQUE,
-      user_id TEXT NOT NULL,
-      created_ts INTEGER NOT NULL,
-      last_activity_ts INTEGER NOT NULL,
-      expires_ts INTEGER NOT NULL,
-      ip TEXT,
-      user_agent TEXT,
-      is_active INTEGER DEFAULT 1,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_ts)`);
-
-  // Таблица логов безопасности
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS security_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts INTEGER NOT NULL,
-      ts_iso TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      user_id TEXT,
-      email TEXT,
-      ip TEXT,
-      user_agent TEXT,
-      details TEXT,
-      severity TEXT DEFAULT 'info'
-    )
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_ts ON security_log(ts)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_user ON security_log(user_id)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_security_log_type ON security_log(event_type)`);
-
-  // Таблица попыток входа (для защиты от брутфорса)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS login_attempts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL,
-      ip TEXT NOT NULL,
-      ts INTEGER NOT NULL,
-      success INTEGER DEFAULT 0
-    )
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email, ts)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, ts)`);
-}
-
-initSecurityTables();
-
 // === БЕЗОПАСНОСТЬ: Функции для работы с хешированными токенами ===
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -425,219 +233,8 @@ function generateSecureToken() {
   return crypto.randomBytes(32).toString('base64url');
 }
 
-function logSecurityEvent(eventType, details = {}) {
-  try {
-    const stmt = db.prepare(`
-      INSERT INTO security_log (ts, ts_iso, event_type, user_id, email, ip, user_agent, details, severity)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      Date.now(),
-      new Date().toISOString(),
-      eventType,
-      details.userId || null,
-      details.email || null,
-      details.ip || null,
-      details.userAgent || null,
-      JSON.stringify(details),
-      details.severity || 'info'
-    );
-  } catch (err) {
-    console.error('Ошибка записи security log:', err);
-  }
-}
-
-function recordLoginAttempt(email, ip, success) {
-  try {
-    const stmt = db.prepare('INSERT INTO login_attempts (email, ip, ts, success) VALUES (?, ?, ?, ?)');
-    stmt.run(email, ip, Date.now(), success ? 1 : 0);
-  } catch (err) {
-    console.error('Ошибка записи login attempt:', err);
-  }
-}
-
-function getRecentLoginAttempts(email, ip, windowMs = 3600000) {
-  const cutoff = Date.now() - windowMs;
-  const stmt = db.prepare(`
-    SELECT COUNT(*) as count, SUM(success) as successful
-    FROM login_attempts
-    WHERE (email = ? OR ip = ?) AND ts > ?
-  `);
-  return stmt.get(email, ip, cutoff) || { count: 0, successful: 0 };
-}
-
-/* --- In-memory caches --- */
-let ADMIN_EMAILS = new Set();
 const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
-
-/* Teachers */
-function loadAdminEmails() {
-  const stmt = db.prepare('SELECT email FROM admins');
-  const rows = stmt.all();
-  ADMIN_EMAILS = new Set(rows.map(r => r.email.toLowerCase()));
-  if (ROOT_ADMIN_EMAIL) {
-    ADMIN_EMAILS.add(ROOT_ADMIN_EMAIL);
-  }
-}
-
-loadAdminEmails();
-
-function isAdminUser(u) {
-  const email = String(u?.email || '').toLowerCase();
-  return ADMIN_EMAILS.has(email);
-}
-
-function isSuperAdminUser(u) {
-  if (!ROOT_ADMIN_EMAIL) return false;
-  const email = String(u?.email || '').toLowerCase();
-  return email === ROOT_ADMIN_EMAIL;
-}
-
-function listAdminEmails() {
-  const stmt = db.prepare('SELECT email FROM admins ORDER BY email');
-  const rows = stmt.all();
-  const emails = new Set(rows.map(r => String(r.email || '').toLowerCase()).filter(Boolean));
-  if (ROOT_ADMIN_EMAIL) emails.add(ROOT_ADMIN_EMAIL);
-  return Array.from(emails).sort();
-}
-
-function addAdminEmail(email) {
-  const cleaned = String(email || '').trim().toLowerCase();
-  if (!cleaned) return false;
-  const stmt = db.prepare('INSERT OR IGNORE INTO admins (email) VALUES (?)');
-  stmt.run(cleaned);
-  loadAdminEmails();
-  return true;
-}
-
-function removeAdminEmail(email) {
-  const cleaned = String(email || '').trim().toLowerCase();
-  if (!cleaned) return false;
-  const stmt = db.prepare('DELETE FROM admins WHERE email = ?');
-  stmt.run(cleaned);
-  loadAdminEmails();
-  return true;
-}
-
-function calculateEarnedCoins(user) {
-  if (!user) return 0;
-  const comments = Number(user.comment_count || 0);
-  const ratings = Number(user.rating_count || 0);
-  const receivedLikes = Number(user.received_likes || 0);
-  const receivedDislikes = Number(user.received_dislikes || 0);
-  return (comments * 5) + ratings + receivedLikes - receivedDislikes;
-}
-
-function getUserSpentCoins(userId) {
-  if (!userId) return 0;
-  const row = db.prepare('SELECT COALESCE(SUM(price), 0) as total FROM user_inventory WHERE user_id = ?').get(userId);
-  return Number(row?.total || 0);
-}
-
-function getAvailableCoins(user) {
-  if (!user) return 0;
-  const earned = calculateEarnedCoins(user);
-  const spent = getUserSpentCoins(user.id);
-  return Math.max(0, earned - spent);
-}
-
-function coinsOf(user) {
-  return getAvailableCoins(user);
-}
-
-function overall(r){
-  let tot=0,cnt=0;
-  for(const k of CHARACTERISTICS_KEYS){
-    const v=r[k];
-    if(v&&v.count){ tot+=v.sum/v.count; cnt++; }
-  }
-  return cnt?tot/cnt:0;
-}
-
-const TEACHER_CACHE_TTL_MS = 1000 * 30; // 30 seconds for hot path caches
-let teacherRowsCache = { data: null, expiresAt: 0 };
-let ratingsAggregateCache = { data: null, expiresAt: 0 };
-
-function invalidateTeacherRowsCache() {
-  teacherRowsCache = { data: null, expiresAt: 0 };
-}
-
-function invalidateRatingsCache() {
-  ratingsAggregateCache = { data: null, expiresAt: 0 };
-}
-
-function invalidateTeacherCaches() {
-  invalidateTeacherRowsCache();
-  invalidateRatingsCache();
-}
-
-/* API helper functions */
-
-function getAllTeachers() {
-  const now = Date.now();
-  if (teacherRowsCache.data && teacherRowsCache.expiresAt > now) {
-    return teacherRowsCache.data;
-  }
-  const stmt = db.prepare('SELECT * FROM teachers ORDER BY last_name, first_name');
-  const rows = stmt.all();
-  teacherRowsCache = {
-    data: rows,
-    expiresAt: now + TEACHER_CACHE_TTL_MS
-  };
-  return rows;
-}
-
-function getTeacherById(id) {
-  const stmt = db.prepare('SELECT * FROM teachers WHERE id = ?');
-  return stmt.get(id);
-}
-
-function normalizeTeacherRow(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    lastName: row.last_name || '',
-    firstName: row.first_name || '',
-    patronymic: row.patronymic || '',
-    department: row.department || '',
-    photo: row.photo || DEFAULT_PHOTO,
-    subjects: row.subjects ? row.subjects.split('|').filter(Boolean) : []
-  };
-}
-
-function getRatingsForTeacher(teacherId) {
-  const stmt = db.prepare('SELECT key, sum, count FROM ratings WHERE teacher_id = ?');
-  const rows = stmt.all(teacherId);
-  const result = {};
-  for (const k of CHARACTERISTICS_KEYS) {
-    result[k] = { sum: 0, count: 0 };
-  }
-  for (const row of rows) {
-    if (CHARACTERISTICS_KEYS.includes(row.key)) {
-      result[row.key] = { sum: row.sum, count: row.count };
-    }
-  }
-  return result;
-}
-
-function getAllRatings() {
-  const now = Date.now();
-  if (ratingsAggregateCache.data && ratingsAggregateCache.expiresAt > now) {
-    return ratingsAggregateCache.data;
-  }
-  const stmt = db.prepare('SELECT teacher_id, key, sum, count FROM ratings');
-  const rows = stmt.all();
-  const map = {};
-  for (const row of rows) {
-    if (!map[row.teacher_id]) map[row.teacher_id] = {};
-    map[row.teacher_id][row.key] = { sum: row.sum, count: row.count };
-  }
-  ratingsAggregateCache = {
-    data: map,
-    expiresAt: now + TEACHER_CACHE_TTL_MS
-  };
-  return map;
-}
+const PENDING_COMMENT_REVIEWS = new Map(); // reviewId -> pending comment awaiting admin decision
 
 const CYRILLIC_TO_LATIN = {
   'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
@@ -672,20 +269,6 @@ function slugifyTeacherParts(parts) {
   return trimmed || '';
 }
 
-function ensureUniqueTeacherId(baseId) {
-  let candidate = baseId;
-  let counter = 1;
-  while (getTeacherById(candidate)) {
-    counter += 1;
-    if (counter > 25) {
-      candidate = `${baseId}-${crypto.randomBytes(3).toString('hex')}`;
-      break;
-    }
-    candidate = `${baseId}-${counter}`;
-  }
-  return candidate;
-}
-
 function generateTeacherIdFromPayload(payload) {
   const parts = [
     payload?.lastName || payload?.last_name,
@@ -717,87 +300,6 @@ function normalizeSubjectsList(value) {
     .map(item => sanitizeRequestField(item, 80))
     .filter(Boolean)
     .slice(0, 15);
-}
-
-function generateRequestId() {
-  if (typeof crypto.randomUUID === 'function') {
-    return `req_${crypto.randomUUID()}`;
-  }
-  return `req_${crypto.randomBytes(8).toString('hex')}`;
-}
-
-function insertTeacherRequest(payload, meta = {}) {
-  const id = generateRequestId();
-  const createdTs = Date.now();
-  const stmt = db.prepare(`
-    INSERT INTO teacher_requests (id, status, created_ts, created_iso, payload, photo_filename, submitter_ip, submitter_agent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(
-    id,
-    TEACHER_REQUEST_STATUSES.PENDING,
-    createdTs,
-    new Date(createdTs).toISOString(),
-    JSON.stringify(payload),
-    meta.photoFilename || null,
-    meta.ip || null,
-    meta.userAgent || null
-  );
-  return { id, createdTs };
-}
-
-function getTeacherRequestById(id) {
-  if (!id) return null;
-  const stmt = db.prepare('SELECT * FROM teacher_requests WHERE id = ?');
-  const row = stmt.get(id);
-  if (!row) return null;
-  let parsed = {};
-  try {
-    parsed = row.payload ? JSON.parse(row.payload) : {};
-  } catch {
-    parsed = {};
-  }
-  return {
-    ...row,
-    payload: parsed
-  };
-}
-
-function setTeacherRequestTelegramMeta(id, chatId, messageId) {
-  const stmt = db.prepare(`
-    UPDATE teacher_requests
-    SET telegram_chat_id = ?, telegram_message_id = ?
-    WHERE id = ?
-  `);
-  stmt.run(chatId || null, messageId || null, id);
-}
-
-function updateTeacherRequestError(id, error) {
-  if (!id) return;
-  const stmt = db.prepare('UPDATE teacher_requests SET error = ? WHERE id = ?');
-  stmt.run(error || null, id);
-}
-
-function finalizeTeacherRequest({ id, status, processedBy, action, teacherId = null, error = null }) {
-  if (!id || !status) return null;
-  const safeStatus = Object.values(TEACHER_REQUEST_STATUSES).includes(status) ? status : TEACHER_REQUEST_STATUSES.PENDING;
-  const ts = Date.now();
-  const stmt = db.prepare(`
-    UPDATE teacher_requests
-    SET status = ?, processed_ts = ?, processed_iso = ?, processed_by = ?, processed_action = ?, teacher_id = ?, error = ?
-    WHERE id = ?
-  `);
-  stmt.run(
-    safeStatus,
-    ts,
-    new Date(ts).toISOString(),
-    processedBy || null,
-    action || null,
-    teacherId || null,
-    error || null,
-    id
-  );
-  return getTeacherRequestById(id);
 }
 
 async function callTelegramApi(method, payload) {
@@ -1083,149 +585,154 @@ async function handleTeacherRequestCallback(callback) {
   return true;
 }
 
-function getCommentsForTeacher(teacherId) {
-  const stmt = db.prepare('SELECT * FROM comments WHERE teacher_id = ? ORDER BY ts DESC');
-  return stmt.all(teacherId);
+function generateCommentReviewId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return `c_rev_${crypto.randomUUID()}`;
+  }
+  return `c_rev_${crypto.randomBytes(8).toString('hex')}`;
 }
 
-function getAllComments() {
-  const stmt = db.prepare('SELECT * FROM comments ORDER BY ts DESC');
-  return stmt.all();
-}
+async function queueCommentForReview({ teacherRow, teacherId, text, authorName, userId }) {
+  const reviewId = generateCommentReviewId();
+  const normalizedTeacher = teacherRow ? normalizeTeacherRow(teacherRow) : null;
+  const teacherLabel = normalizedTeacher
+    ? `${normalizedTeacher.lastName || ''} ${normalizedTeacher.firstName || ''}`.trim() || normalizedTeacher.id
+    : String(teacherId || '');
 
-function getCommentById(commentId) {
-  const stmt = db.prepare('SELECT * FROM comments WHERE id = ?');
-  return stmt.get(commentId);
-}
+  const lines = [
+    '📝 Новый комментарий на модерацию',
+    `ID: ${reviewId}`,
+    `Учитель: ${teacherLabel || teacherId}`,
+    `Автор: ${authorName || 'Аноним'}`,
+    `Текст: ${text || '(пусто)'}`
+  ];
 
-function getNextCommentId() {
-  const stmt = db.prepare('SELECT MAX(id) as maxId FROM comments');
-  const row = stmt.get();
-  return (row.maxId || 0) + 1;
-}
+  let telegramMeta = { chatId: null, messageId: null };
 
-function addComment({ teacherId, author = 'Аноним', text, author_uid = '' }) {
-  const ts = Date.now();
-  const id = getNextCommentId();
-  const stmt = db.prepare('INSERT INTO comments (id, teacher_id, ts, ts_iso, author, text, author_uid) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  stmt.run(id, teacherId, ts, new Date(ts).toISOString(), author, text, author_uid);
-  return id;
-}
-
-function deleteComment(commentId) {
-  const stmt = db.prepare('DELETE FROM comments WHERE id = ?');
-  const info = stmt.run(commentId);
-  return info.changes > 0;
-}
-
-const updateRatingsTx = db.transaction((teacherId, ratings, userId) => {
-  let added = 0;
-  let updated = 0;
-  if (!teacherId || !ratings || typeof ratings !== 'object') {
-    return { added, updated };
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_REVIEW_CHAT_ID) {
+    try {
+      const message = await callTelegramApi('sendMessage', {
+        chat_id: TELEGRAM_REVIEW_CHAT_ID,
+        text: lines.join('\n'),
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Опубликовать', callback_data: `comment_review:approve:${reviewId}` },
+              { text: '🚫 Отклонить', callback_data: `comment_review:reject:${reviewId}` }
+            ]
+          ]
+        }
+      });
+      telegramMeta = {
+        chatId: message?.chat?.id ? String(message.chat.id) : TELEGRAM_REVIEW_CHAT_ID,
+        messageId: message?.message_id ? String(message.message_id) : null
+      };
+    } catch (err) {
+      console.warn('Не удалось отправить комментарий в Telegram на модерацию:', err && err.message ? err.message : err);
+    }
   }
 
-  const ts = Date.now();
+  PENDING_COMMENT_REVIEWS.set(reviewId, {
+    id: reviewId,
+    teacherId,
+    text,
+    authorName,
+    userId,
+    createdTs: Date.now(),
+    telegramMeta
+  });
 
-  for (const key of Object.keys(ratings)) {
-    if (!CHARACTERISTICS_KEYS.includes(key)) continue;
-    const value = Number(ratings[key]);
-    if (!(value >= 1 && value <= 5)) continue;
+  logSecurityEvent('comment_queued_for_review', {
+    teacherId,
+    userId: userId || null,
+    reviewId,
+    reason: 'needs_review',
+    severity: 'info'
+  });
 
-    ensureAggregateRatingRowStmt.run(teacherId, key);
+  return { reviewId, telegramMeta };
+}
 
-    if (!userId) {
-      updateAggregateRatingStmt.run(value, 1, teacherId, key);
-      added++;
-      continue;
-    }
+async function handleCommentReviewCallback(callback) {
+  const data = String(callback?.data || '');
+  if (!data.startsWith('comment_review:')) return false;
 
-    const prev = selectUserRatingStmt.get(userId, teacherId, key);
-    if (!prev) {
-      insertUserRatingStmt.run(userId, teacherId, key, value, ts);
-      updateAggregateRatingStmt.run(value, 1, teacherId, key);
-      added++;
-    } else {
-      const prevValue = Number(prev.value);
-      updateUserRatingStmt.run(value, ts, userId, teacherId, key);
-      if (prevValue !== value) {
-        updateAggregateRatingStmt.run(value - prevValue, 0, teacherId, key);
-        updated++;
+  const [, action, reviewId] = data.split(':');
+  const pending = PENDING_COMMENT_REVIEWS.get(reviewId);
+  if (!pending) {
+    await safeAnswerCallback(callback, 'Комментарий уже обработан или не найден', true);
+    return true;
+  }
+
+  const clearButtons = async () => {
+    const chatId = callback?.message?.chat?.id ?? pending.telegramMeta?.chatId;
+    const messageId = callback?.message?.message_id ?? pending.telegramMeta?.messageId;
+    if (chatId && messageId) {
+      try {
+        await callTelegramApi('editMessageReplyMarkup', {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: [] }
+        });
+      } catch (err) {
+        if (err && err.description && /message is not modified/i.test(err.description)) return;
+        console.warn('Не удалось убрать кнопки модерации комментария:', err && err.message ? err.message : err);
       }
     }
+  };
+
+  if (action === 'reject') {
+    PENDING_COMMENT_REVIEWS.delete(reviewId);
+    logSecurityEvent('comment_rejected', {
+      reviewId,
+      teacherId: pending.teacherId,
+      userId: pending.userId || null,
+      severity: 'info'
+    });
+    await safeAnswerCallback(callback, 'Комментарий отклонён');
+    await clearButtons();
+    return true;
   }
 
-  return { added, updated };
-});
-
-function updateRatings(teacherId, ratings, userId = null) {
-  const result = updateRatingsTx(teacherId, ratings, userId);
-  if (result && (result.added || result.updated)) {
-    invalidateRatingsCache();
-  }
-  return result;
-}
-
-// Votes
-function getUserVote(commentId, userId) {
-  const stmt = db.prepare('SELECT vote FROM comment_votes WHERE comment_id = ? AND user_id = ?');
-  const row = stmt.get(commentId, userId);
-  return row ? row.vote : 0;
-}
-
-function setUserVote(commentId, userId, newVote) {
-  if (newVote === 0) {
-    const stmt = db.prepare('DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?');
-    stmt.run(commentId, userId);
-  } else {
-    const stmt = db.prepare('INSERT INTO comment_votes (comment_id, user_id, vote, ts) VALUES (?, ?, ?, ?) ON CONFLICT(comment_id, user_id) DO UPDATE SET vote = excluded.vote, ts = excluded.ts');
-    stmt.run(commentId, userId, newVote, Date.now());
-  }
-}
-
-function countVotesForCommentBulk(commentIds, myUserId = null) {
-  if (!commentIds.length) return { counts: {}, myVotes: {} };
-
-  const placeholders = commentIds.map(() => '?').join(',');
-  const stmt = db.prepare(`SELECT comment_id, user_id, vote FROM comment_votes WHERE comment_id IN (${placeholders})`);
-  const rows = stmt.all(...commentIds);
-
-  const counts = {};
-  const myVotes = {};
-  const userIdStr = myUserId ? String(myUserId) : null;
-
-  for (const cid of commentIds) {
-    counts[String(cid)] = { likes: 0, dislikes: 0 };
-  }
-
-  for (const row of rows) {
-    const key = String(row.comment_id);
-    if (!counts[key]) counts[key] = { likes: 0, dislikes: 0 };
-
-    if (row.vote === 1) counts[key].likes++;
-    else if (row.vote === -1) counts[key].dislikes++;
-
-    if (userIdStr && row.user_id === userIdStr) {
-      myVotes[key] = Number(row.vote) || 0;
+  if (action === 'approve') {
+    const teacherRow = getTeacherById(pending.teacherId);
+    if (!teacherRow) {
+      PENDING_COMMENT_REVIEWS.delete(reviewId);
+      await safeAnswerCallback(callback, 'Учитель не найден', true);
+      await clearButtons();
+      return true;
     }
+
+    try {
+      addComment({
+        teacherId: pending.teacherId,
+        author: pending.authorName || 'Аноним',
+        text: pending.text,
+        author_uid: pending.userId || ''
+      });
+      if (pending.userId) {
+        incUserStats(String(pending.userId), { comments: 1 });
+      }
+      logSecurityEvent('comment_published_after_review', {
+        reviewId,
+        teacherId: pending.teacherId,
+        userId: pending.userId || null
+      });
+      PENDING_COMMENT_REVIEWS.delete(reviewId);
+      await safeAnswerCallback(callback, 'Комментарий опубликован');
+      await clearButtons();
+    } catch (err) {
+      console.error('Не удалось сохранить комментарий после одобрения:', err);
+      await safeAnswerCallback(callback, 'Не удалось сохранить комментарий', true);
+    }
+    return true;
   }
 
-  return { counts, myVotes };
+  await safeAnswerCallback(callback, 'Неизвестное действие', true);
+  return true;
 }
 
 // Users
-
-const activeNicknameStmt = db.prepare(`
-  SELECT item_name FROM user_inventory
-  WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
-  LIMIT 1
-`);
-
-function getActiveNickname(userId) {
-  if (!userId) return null;
-  const row = activeNicknameStmt.get(userId);
-  return row ? row.item_name : null;
-}
 
 // Функция для получения отображаемого имени пользователя (с учетом купленных ников)
 function getDisplayName(user) {
@@ -1238,87 +745,6 @@ function getDisplayName(user) {
 
   // Иначе используем стандартное имя
   return (user.username || user.email || 'Student').split('@')[0];
-}
-
-function findUserByEmail(email) {
-  const stmt = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)');
-  return stmt.get(email);
-}
-
-function findUserById(userId) {
-  const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
-  return stmt.get(userId);
-}
-
-function upsertUserOnLogin(email) {
-  const now = Date.now();
-  const username = String(email).split('@')[0];
-
-  let user = findUserByEmail(email);
-
-  if (!user) {
-    const id = 'u-' + crypto.randomBytes(8).toString('hex');
-    const stmt = db.prepare('INSERT INTO users (id, email, username, created_ts, last_login_ts, login_count, comment_count, rating_count, cast_likes, cast_dislikes, received_likes, received_dislikes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    stmt.run(id, email, username, now, now, 1, 0, 0, 0, 0, 0, 0);
-    user = findUserById(id);
-  } else {
-    const stmt = db.prepare('UPDATE users SET username = ?, last_login_ts = ?, login_count = login_count + 1 WHERE id = ?');
-    stmt.run(username, now, user.id);
-    user = findUserById(user.id);
-  }
-
-  return user;
-}
-
-function incUserStats(userId, { comments = 0, ratings = 0, cast_like = 0, cast_dislike = 0, recv_like = 0, recv_dislike = 0 } = {}) {
-  const stmt = db.prepare(`UPDATE users SET
-    comment_count = comment_count + ?,
-    rating_count = rating_count + ?,
-    cast_likes = cast_likes + ?,
-    cast_dislikes = cast_dislikes + ?,
-    received_likes = received_likes + ?,
-    received_dislikes = received_dislikes + ?
-    WHERE id = ?`);
-  stmt.run(comments, ratings, cast_like, cast_dislike, recv_like, recv_dislike, userId);
-}
-
-function isUserBanned(userId) {
-  const stmt = db.prepare('SELECT is_banned FROM banned_users WHERE user_id = ?');
-  const row = stmt.get(userId);
-  return row ? !!row.is_banned : false;
-}
-
-function setBanStatus(userId, banned, reason = '') {
-  const stmt = db.prepare('INSERT INTO banned_users (user_id, is_banned, reason, ts) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET is_banned = excluded.is_banned, reason = excluded.reason, ts = excluded.ts');
-  stmt.run(userId, banned ? 1 : 0, reason, Date.now());
-}
-
-// Teachers CRUD
-function upsertTeacher(teacher) {
-  const { id, lastName, firstName, patronymic, department, subjects, photo } = teacher;
-  const subjectsStr = Array.isArray(subjects) ? subjects.join('|') : String(subjects || '');
-  const rawPhoto = typeof photo === 'string' ? photo.trim() : (photo ? String(photo).trim() : '');
-  const photoStr = (() => {
-    if (!rawPhoto) return DEFAULT_PHOTO;
-    if (rawPhoto.startsWith('/photo/')) return rawPhoto;
-    if (rawPhoto.startsWith('/photos/')) return rawPhoto.replace('/photos/', '/photo/');
-    if (/^https?:\/\//i.test(rawPhoto)) return rawPhoto;
-    return `/photo/${rawPhoto}`;
-  })();
-
-  const stmt = db.prepare('INSERT INTO teachers (id, last_name, first_name, patronymic, department, subjects, photo) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_name = excluded.last_name, first_name = excluded.first_name, patronymic = excluded.patronymic, department = excluded.department, subjects = excluded.subjects, photo = excluded.photo');
-  stmt.run(id, lastName || '', firstName || '', patronymic || '', department || '', subjectsStr, photoStr);
-  invalidateTeacherCaches();
-}
-
-function deleteTeacherById(id) {
-  // Удалится также связанные комментарии, рейтинги и голоса благодаря ON DELETE CASCADE
-  const stmt = db.prepare('DELETE FROM teachers WHERE id = ?');
-  const info = stmt.run(id);
-  if (info.changes > 0) {
-    invalidateTeacherCaches();
-  }
-  return info.changes > 0;
 }
 
 /* Sessions & Auth */
@@ -1368,10 +794,9 @@ function createSession(userId, req){
   const sessionId = 'ses-' + crypto.randomBytes(12).toString('hex');
 
   // Ограничение количества сессий на пользователя
-  const existingSessions = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE user_id = ? AND is_active = 1').get(userId);
-  if (existingSessions && existingSessions.count >= MAX_SESSIONS_PER_USER) {
-    // Удаляем самую старую сессию
-    db.prepare('DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE user_id = ? AND is_active = 1 ORDER BY last_activity_ts ASC LIMIT 1)').run(userId);
+  const existingSessions = countActiveSessions(userId);
+  if (existingSessions >= MAX_SESSIONS_PER_USER) {
+    deleteOldestSession(userId);
 
     logSecurityEvent('session_limit_reached', {
       userId,
@@ -1381,12 +806,16 @@ function createSession(userId, req){
     });
   }
 
-  const stmt = db.prepare(`
-    INSERT INTO sessions (id, token_hash, user_id, created_ts, last_activity_ts, expires_ts, ip, user_agent, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-  `);
-
-  stmt.run(sessionId, tokenHash, userId, now, now, expiresTs, ip, ua);
+  insertSession({
+    id: sessionId,
+    tokenHash,
+    userId,
+    createdTs: now,
+    lastActivityTs: now,
+    expiresTs,
+    ip,
+    userAgent: ua
+  });
 
   logSecurityEvent('session_created', {
     userId,
@@ -1404,12 +833,7 @@ function getUserFromRequest(req){
   if (!token) return null;
 
   const tokenHash = hashToken(token);
-  const stmt = db.prepare(`
-    SELECT * FROM sessions
-    WHERE token_hash = ? AND is_active = 1 AND expires_ts > ?
-  `);
-
-  const session = stmt.get(tokenHash, Date.now());
+  const session = getUserFromSessionTokenHash(tokenHash);
   if (!session) return null;
 
   // Проверка IP (опционально, для усиленной безопасности)
@@ -1425,7 +849,7 @@ function getUserFromRequest(req){
   }
 
   // Обновляем время последней активности
-  db.prepare('UPDATE sessions SET last_activity_ts = ? WHERE id = ?').run(Date.now(), session.id);
+  updateSessionActivity(session.id, Date.now());
 
   const user = findUserById(session.user_id);
   return user || null;
@@ -1434,35 +858,20 @@ function getUserFromRequest(req){
 function invalidateSession(token) {
   if (!token) return;
   const tokenHash = hashToken(token);
-  db.prepare('UPDATE sessions SET is_active = 0 WHERE token_hash = ?').run(tokenHash);
+  deactivateSessionByHash(tokenHash);
 }
 
 function invalidateAllUserSessions(userId) {
-  db.prepare('UPDATE sessions SET is_active = 0 WHERE user_id = ?').run(userId);
+  deactivateSessionsByUser(userId);
   logSecurityEvent('all_sessions_invalidated', {
     userId,
     severity: 'warning'
   });
 }
 
-// Автоматическая очистка истекших сессий
-function cleanupExpiredSessions() {
-  const deleted = db.prepare('DELETE FROM sessions WHERE expires_ts < ? OR is_active = 0').run(Date.now());
-  if (deleted.changes > 0) {
-    console.log(`🧹 Очищено ${deleted.changes} истекших сессий`);
-  }
-}
-
-// Очистка старых логов (старше 90 дней)
-function cleanupOldLogs() {
-  const cutoff = Date.now() - (90 * 24 * 60 * 60 * 1000);
-  db.prepare('DELETE FROM security_log WHERE ts < ?').run(cutoff);
-  db.prepare('DELETE FROM login_attempts WHERE ts < ?').run(cutoff);
-}
-
 // Запускаем очистку периодически
 const cleanupTimer = setInterval(() => {
-  cleanupExpiredSessions();
+  cleanupSessionsDb();
   cleanupOldLogs();
 }, SESSION_CLEANUP_INTERVAL);
 
@@ -1774,32 +1183,6 @@ app.get('/api/teacher/:id',(req,res)=>{
 
 
 /* Сильная модерация мата */
-// Нормализация и проверка: кир/лат, 1337, пробелы/символы, удвоения
-const BAD_STEMS = [
-  'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
-  'пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'
-];
-const LAT2CYR = { 'a':'а','b':'в','c':'с','e':'е','h':'н','k':'к','m':'м','o':'о','p':'р','t':'т','x':'х','y':'у' };
-const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
-/* --- Модель токсичности RuBERT --- */
-
-
-/* --- Проверка мата --- */
-function normalizeForBadWords(s) {
-  let t = String(s || '').toLowerCase();
-  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
-  t = t.replace(/[a-z]/g, ch => LAT2CYR[ch] || ch); // латиница → кириллица
-  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g, ''); // убрать разделители
-  t = t.replace(/(.)\1{2,}/g, '$1$1'); // сжать длинные повторения
-  return t;
-}
-
-function hasBadWords(text) {
-  const norm = normalizeForBadWords(text);
-  return BAD_STEMS.some(st => norm.includes(st));
-}
-
-
 // Комментарии + рейтинг + модерация (локальная + опциональная модель)
 app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) => {
   try {
@@ -1834,77 +1217,54 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       return res.status(403).json({ error: 'banned', message: 'commenting_banned' });
     }
 
-    // Локальная проверка мата
-    if (textStr && hasBadWords(textStr)) {
-      return res.status(400).json({ error: 'profanity_forbidden' });
+    const moderationResult = textStr
+      ? await moderateComment(textStr, {
+          toxicityUrl: typeof TOXICITY_SERVER_URL !== 'undefined'
+            ? TOXICITY_SERVER_URL
+            : 'http://127.0.0.1:8001/toxicity',
+          reviewThreshold: 0.6,
+          blockThreshold: typeof TOXICITY_THRESHOLD !== 'undefined' ? TOXICITY_THRESHOLD : 0.8
+        })
+      : { decision: COMMENT_DECISIONS.ALLOW };
+
+    if (textStr && moderationResult.decision === COMMENT_DECISIONS.DELETE) {
+      return res.status(400).json({
+        error: 'comment_blocked',
+        reason: moderationResult.reason || 'forbidden',
+        score: moderationResult.score || 0
+      });
     }
 
-    // Вызов внешней модели токсичности (опционально, если fetch доступен и задан URL)
-    if (textStr) {
-      let toxicScore = 0;
-      try {
-        if (typeof fetch === 'function') {
-          const toxxUrl = typeof TOXICITY_SERVER_URL !== 'undefined' ? TOXICITY_SERVER_URL : 'http://127.0.0.1:8001/toxicity';
-          const r = await fetch(toxxUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: textStr })
-          });
-
-          if (r.ok) {
-            const jr = await r.json();
-
-            // Универсальный разбор возможных форматов ответа
-            if (jr && Array.isArray(jr.probs) && jr.probs.length >= 2) {
-              toxicScore = Number(jr.probs[1]) || 0;
-            } else if (jr && Array.isArray(jr.logits) && jr.logits.length >= 2) {
-              try {
-                const l0 = Number(jr.logits[0]) || 0;
-                const l1 = Number(jr.logits[1]) || 0;
-                const max = Math.max(l0, l1);
-                const e0 = Math.exp(l0 - max);
-                const e1 = Math.exp(l1 - max);
-                toxicScore = e1 / (e0 + e1);
-              } catch (e) { toxicScore = 0; }
-            } else if (Array.isArray(jr) && jr.length > 0 && jr[0].label) {
-              for (const it of jr) {
-                const lab = String(it.label || '').toLowerCase();
-                const sc = Number(it.score || 0);
-                if (lab.includes('tox') || lab === 'label_1' || lab === 'label1') toxicScore = Math.max(toxicScore, sc);
-              }
-              if (!toxicScore && jr.length === 1) {
-                const lab = String(jr[0].label || '').toLowerCase();
-                if (lab.includes('tox')) toxicScore = Number(jr[0].score || 0);
-              }
-            } else if (jr && (jr.toxic === true || jr.is_toxic === true || String(jr.label||'').toLowerCase().includes('tox'))) {
-              toxicScore = 1;
-            }
-          } else {
-            console.warn('toxicity server returned non-ok', r.status);
-          }
-        } else {
-          // fetch отсутствует — пропускаем вызов модели (локальная модерация уже выполнена)
-          console.warn('fetch is not available — skipping toxicity server call');
-        }
-      } catch (err) {
-        console.warn('failed to call toxicity server:', err && err.message ? err.message : err);
-        // фоллбек: при ошибке модели не блокируем (как ты и просила — локальная модерация остаётся)
-      }
-
-      const thresh = typeof TOXICITY_THRESHOLD !== 'undefined' ? TOXICITY_THRESHOLD : 0.8;
-      if (toxicScore >= thresh) {
-        return res.status(400).json({ error: 'toxic_comment', message: 'Комментарий отклонён как токсичный', score: toxicScore });
-      }
-    }
+    let queuedReviewId = null;
+    let commentAdded = false;
 
     // Сохраняем комментарий (используем только новую функцию addComment)
     if (textStr) {
-      try {
-        // предполагается, что addComment может быть async и вернуть id или объект
-        await addComment({ teacherId, author: authorName, text: textStr, author_uid: userId || '' });
-      } catch (err) {
-        console.error('addComment failed:', err && err.message ? err.message : err);
-        return res.status(500).json({ error: 'server_error', message: 'failed_to_save_comment' });
+      if (moderationResult.decision === COMMENT_DECISIONS.REVIEW) {
+        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_REVIEW_CHAT_ID) {
+          return res.status(503).json({ error: 'moderation_unavailable' });
+        }
+        try {
+          const { reviewId } = await queueCommentForReview({
+            teacherRow: t,
+            teacherId,
+            text: textStr,
+            authorName,
+            userId
+          });
+          queuedReviewId = reviewId;
+        } catch (err) {
+          console.error('Не удалось поставить комментарий в очередь модерации:', err && err.message ? err.message : err);
+          return res.status(500).json({ error: 'server_error', message: 'moderation_queue_failed' });
+        }
+      } else if (moderationResult.decision === COMMENT_DECISIONS.ALLOW) {
+        try {
+          await addComment({ teacherId, author: authorName, text: textStr, author_uid: userId || '' });
+          commentAdded = true;
+        } catch (err) {
+          console.error('addComment failed:', err && err.message ? err.message : err);
+          return res.status(500).json({ error: 'server_error', message: 'failed_to_save_comment' });
+        }
       }
     }
 
@@ -1924,7 +1284,7 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     if (u) {
       try {
         const ratingDelta = ratingUpdateInfo?.added ?? (hasRatings ? validRatingKeys.length : 0);
-        incUserStats(u.id, { comments: textStr ? 1 : 0, ratings: ratingDelta });
+        incUserStats(u.id, { comments: commentAdded ? 1 : 0, ratings: ratingDelta });
       } catch (err) {
         console.warn('incUserStats failed:', err && err.message ? err.message : err);
       }
@@ -1938,6 +1298,8 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
 
     return res.json({
       ok: true,
+      pendingReview: !!queuedReviewId,
+      reviewId: queuedReviewId || undefined,
       teacher: {
         ...teacher,
         ratings: retRatings,
@@ -2153,7 +1515,10 @@ app.post('/api/telegram/webhook', express.json({ limit: '1mb' }), async (req, re
 
   try {
     if (update.callback_query) {
-      await handleTeacherRequestCallback(update.callback_query);
+      const handledReview = await handleCommentReviewCallback(update.callback_query);
+      if (!handledReview) {
+        await handleTeacherRequestCallback(update.callback_query);
+      }
     }
   } catch (err) {
     console.error('Ошибка обработки Telegram webhook:', err);
@@ -2257,8 +1622,7 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
     lastTs[uid] = Math.max(lastTs[uid]||0, Number(c.ts)||0);
   }
 
-  const stmt = db.prepare('SELECT * FROM users');
-  const users = stmt.all();
+  const users = getUserList();
   const out = [];
 
   for (const u of users) {
@@ -2287,8 +1651,7 @@ app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
   const userId = String(req.query.userId||'').trim();
   if (!userId) return res.status(400).json({ error:'bad_request' });
 
-  const stmt = db.prepare('SELECT * FROM comments WHERE author_uid = ? ORDER BY ts DESC');
-  const all = stmt.all(userId);
+  const all = getAllCommentsByUser(userId);
 
   const teachers = getAllTeachers();
   const teacherMap = new Map(teachers.map(t=>[t.id, t]));
@@ -2320,8 +1683,7 @@ app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
 });
 
 app.get('/api/admin/users', requireAdmin, (req,res)=>{
-  const stmt = db.prepare('SELECT * FROM users ORDER BY email');
-  const users = stmt.all();
+  const users = getUserList();
 
   const out = users.map(u=>({
     id: u.id,
@@ -2337,8 +1699,7 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
 
 app.get('/api/admin/comments', requireAdmin, (req,res)=>{
   const limit = Math.max(1, Math.min(500, Number(req.query.limit||100)));
-  const stmt = db.prepare('SELECT * FROM comments ORDER BY ts DESC LIMIT ?');
-  const all = stmt.all(limit);
+  const all = getAdminComments(limit);
 
   const out = all.map(c=>{
     const u = c.author_uid ? findUserById(String(c.author_uid)) : null;
@@ -2469,19 +1830,7 @@ app.get('/api/admin/security/logs', requireAdmin, (req,res)=>{
   const offset = parseInt(req.query.offset) || 0;
   const severity = req.query.severity || null;
 
-  let query = 'SELECT * FROM security_log';
-  let params = [];
-
-  if (severity) {
-    query += ' WHERE severity = ?';
-    params.push(severity);
-  }
-
-  query += ' ORDER BY ts DESC LIMIT ? OFFSET ?';
-  params.push(limit, offset);
-
-  const logs = db.prepare(query).all(...params);
-  const total = db.prepare('SELECT COUNT(*) as count FROM security_log').get();
+  const { logs, total } = getSecurityLogs({ limit, offset, severity });
 
   res.json({
     ok: true,
@@ -2489,7 +1838,7 @@ app.get('/api/admin/security/logs', requireAdmin, (req,res)=>{
       ...log,
       details: log.details ? JSON.parse(log.details) : null
     })),
-    total: total.count,
+    total,
     limit,
     offset
   });
@@ -2497,14 +1846,7 @@ app.get('/api/admin/security/logs', requireAdmin, (req,res)=>{
 
 // Просмотр активных сессий
 app.get('/api/admin/security/sessions', requireAdmin, (req,res)=>{
-  const sessions = db.prepare(`
-    SELECT s.id, s.user_id, s.created_ts, s.last_activity_ts, s.expires_ts, s.ip, s.user_agent, s.is_active,
-           u.email, u.username
-    FROM sessions s
-    LEFT JOIN users u ON s.user_id = u.id
-    WHERE s.is_active = 1 AND s.expires_ts > ?
-    ORDER BY s.last_activity_ts DESC
-  `).all(Date.now());
+  const sessions = getActiveSessionsList();
 
   res.json({
     ok: true,
@@ -2548,14 +1890,7 @@ app.get('/api/admin/security/login-attempts', requireAdmin, (req,res)=>{
   const windowMs = parseInt(req.query.window) || 3600000; // По умолчанию последний час
   const cutoff = Date.now() - windowMs;
 
-  const attempts = db.prepare(`
-    SELECT email, ip, COUNT(*) as total, SUM(success) as successful, MAX(ts) as last_attempt
-    FROM login_attempts
-    WHERE ts > ?
-    GROUP BY email, ip
-    ORDER BY total DESC
-    LIMIT 100
-  `).all(cutoff);
+  const attempts = getLoginAttempts({ cutoff, limit: 100 });
 
   res.json({
     ok: true,
@@ -2578,12 +1913,7 @@ app.get('/api/user/sessions', (req,res)=>{
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({error:'unauthorized'});
 
-  const sessions = db.prepare(`
-    SELECT id, created_ts, last_activity_ts, expires_ts, ip, user_agent
-    FROM sessions
-    WHERE user_id = ? AND is_active = 1 AND expires_ts > ?
-    ORDER BY last_activity_ts DESC
-  `).all(u.id, Date.now());
+  const sessions = getUserSessions(u.id);
 
   res.json({
     ok: true,
@@ -2609,11 +1939,7 @@ app.post('/api/user/revoke-other-sessions', (req,res)=>{
   const currentTokenHash = currentToken ? hashToken(currentToken) : null;
 
   if (currentTokenHash) {
-    db.prepare(`
-      UPDATE sessions
-      SET is_active = 0
-      WHERE user_id = ? AND token_hash != ? AND is_active = 1
-    `).run(u.id, currentTokenHash);
+    revokeOtherSessions(u.id, currentTokenHash);
   }
 
   logSecurityEvent('user_revoked_other_sessions', {
@@ -2766,8 +2092,12 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
     setSessionCookie(res, token);
 
     try{
-      const stmt = db.prepare('INSERT INTO login_events (ts, ts_iso, action, email, ip, ua) VALUES (?, ?, ?, ?, ?, ?)');
-      stmt.run(Date.now(), new Date().toISOString(), 'login', user.email, getClientIp(req), req.headers['user-agent']||'');
+      insertLoginEvent({
+        action: 'login',
+        email: user.email,
+        ip: getClientIp(req),
+        ua: req.headers['user-agent'] || ''
+      });
     }catch{}
 
     logSecurityEvent('login_successful', {
@@ -2843,8 +2173,12 @@ app.post('/api/auth/logout', (req,res)=>{
 
   try{
     if (u){
-      const stmt = db.prepare('INSERT INTO login_events (ts, ts_iso, action, email, ip, ua) VALUES (?, ?, ?, ?, ?, ?)');
-      stmt.run(Date.now(), new Date().toISOString(), 'logout', u.email, getClientIp(req), req.headers['user-agent']||'');
+      insertLoginEvent({
+        action: 'logout',
+        email: u.email,
+        ip: getClientIp(req),
+        ua: req.headers['user-agent'] || ''
+      });
 
       logSecurityEvent('logout', {
         userId: u.id,
@@ -2892,19 +2226,9 @@ app.get('/api/shop/items', (req, res) => {
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({ error: 'unauthorized' });
 
-  const itemsStmt = db.prepare(`
-    SELECT id, name, price, category
-    FROM shop_items
-    WHERE is_active = 1
-    ORDER BY price ASC, name ASC
-  `);
-  const availableItems = itemsStmt.all();
-
-  const purchasedRows = db.prepare('SELECT item_id FROM user_inventory WHERE user_id = ?').all(u.id);
-  const purchasedItems = new Set(purchasedRows.map(row => row.item_id));
-
-  const activeRows = db.prepare('SELECT item_id, item_type FROM user_inventory WHERE user_id = ? AND is_active = 1').all(u.id);
-  const activeByType = new Map(activeRows.map(row => [row.item_type, row.item_id]));
+  const availableItems = getShopItems();
+  const purchasedItems = new Set(getUserPurchasedItems(u.id).map(row => row.item_id));
+  const activeByType = new Map(getActiveInventoryForUser(u.id).map(row => [row.item_type, row.item_id]));
 
   const balance = getAvailableCoins(u);
   const earnedCoins = calculateEarnedCoins(u);
@@ -2930,7 +2254,7 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
 
-  const item = db.prepare('SELECT id, name, price, category FROM shop_items WHERE id = ? AND is_active = 1').get(itemId);
+  const item = getShopItemById(itemId);
   if (!item) return res.status(404).json({ error: 'item_not_found' });
 
   const availableCoins = getAvailableCoins(u);
@@ -2939,20 +2263,20 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   }
 
   // Проверяем, не куплен ли уже этот ник
-  const existingStmt = db.prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ? AND item_type = ?');
-  const existing = existingStmt.get(u.id, itemId, item.category);
+  const existing = getExistingInventoryItem(u.id, itemId, item.category);
 
   if (existing) {
     return res.status(400).json({ error: 'already_purchased' });
   }
 
   // Покупаем товар
-  const insertStmt = db.prepare(`
-    INSERT INTO user_inventory (user_id, item_id, item_type, item_name, purchase_date, price, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  insertStmt.run(u.id, itemId, item.category, item.name, Date.now(), item.price, 0);
+  insertInventoryItem({
+    userId: u.id,
+    itemId,
+    category: item.category,
+    name: item.name,
+    price: item.price
+  });
 
   const balanceAfter = getAvailableCoins(u);
   const spentCoins = getUserSpentCoins(u.id);
@@ -2983,26 +2307,23 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
 
-  const shopItem = db.prepare('SELECT id, category, name FROM shop_items WHERE id = ? AND is_active = 1').get(itemId);
+  const shopItem = getShopItemMeta(itemId);
   if (!shopItem) {
     return res.status(404).json({ error: 'item_not_found' });
   }
 
   // Проверяем, есть ли у пользователя этот товар
-  const itemStmt = db.prepare('SELECT id, item_name FROM user_inventory WHERE user_id = ? AND item_id = ? AND item_type = ?');
-  const item = itemStmt.get(u.id, itemId, shopItem.category);
+  const item = getInventoryItem(u.id, itemId, shopItem.category);
 
   if (!item) {
     return res.status(400).json({ error: 'item_not_owned' });
   }
 
   // Деактивируем все ники пользователя
-  const deactivateStmt = db.prepare('UPDATE user_inventory SET is_active = 0 WHERE user_id = ? AND item_type = ?');
-  deactivateStmt.run(u.id, shopItem.category);
+  deactivateUserInventory(u.id, shopItem.category);
 
   // Активируем выбранный ник
-  const activateStmt = db.prepare('UPDATE user_inventory SET is_active = 1 WHERE id = ?');
-  activateStmt.run(item.id);
+  activateInventoryItemById(item.id);
 
   logSecurityEvent('nickname_activated', {
     userId: u.id,
@@ -3031,18 +2352,13 @@ app.post('/api/shop/deactivate', express.json(), (req, res) => {
   const { itemId } = req.body || {};
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
 
-  const inventoryItem = db.prepare(`
-    SELECT id, item_name, item_type
-    FROM user_inventory
-    WHERE user_id = ? AND item_id = ? AND is_active = 1
-  `).get(u.id, itemId);
+  const inventoryItem = getActiveInventoryItem(u.id, itemId);
 
   if (!inventoryItem) {
     return res.status(400).json({ error: 'not_active' });
   }
 
-  db.prepare('UPDATE user_inventory SET is_active = 0 WHERE user_id = ? AND item_type = ?')
-    .run(u.id, inventoryItem.item_type);
+  deactivateUserInventoryByType(u.id, inventoryItem.item_type);
 
   logSecurityEvent('nickname_deactivated', {
     userId: u.id,
@@ -3068,14 +2384,7 @@ app.get('/api/shop/my-items', (req, res) => {
   const u = getUserFromRequest(req);
   if (!u) return res.status(401).json({ error: 'unauthorized' });
 
-  const stmt = db.prepare(`
-    SELECT item_id, item_name, item_type, purchase_date, is_active
-    FROM user_inventory
-    WHERE user_id = ?
-    ORDER BY purchase_date DESC
-  `);
-
-  const items = stmt.all(u.id);
+  const items = getInventoryForUser(u.id);
 
   const balance = getAvailableCoins(u);
   const earnedCoins = calculateEarnedCoins(u);
@@ -3096,11 +2405,7 @@ app.get(/^\/(?!.*\.).*$/, (req, res) => {
 });
 
 function printStartupInfo(port = PORT) {
-  const teachersCount = db.prepare('SELECT COUNT(*) as count FROM teachers').get().count;
-  const usersCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
-  const commentsCount = db.prepare('SELECT COUNT(*) as count FROM comments').get().count;
-
-  const inventoryCount = db.prepare('SELECT COUNT(*) as count FROM user_inventory').get().count;
+  const stats = getStartupStats();
 
   console.log('\n' + '='.repeat(60));
   console.log('🎓  LETO TALKS — Платформа рейтинга учителей');
@@ -3111,10 +2416,10 @@ function printStartupInfo(port = PORT) {
   console.log('🔒  Безопасность:  Helmet + Rate Limiting');
   console.log('');
   console.log('📈  Статистика:');
-  console.log('    👨‍🏫 Учителя:    ' + teachersCount);
-  console.log('    👥 Пользователи: ' + usersCount);
-  console.log('    💬 Комментарии:  ' + commentsCount);
-  console.log('    🛡️  Администраторы: ' + ADMIN_EMAILS.size);
+  console.log('    👨‍🏫 Учителя:    ' + stats.teachersCount);
+  console.log('    👥 Пользователи: ' + stats.usersCount);
+  console.log('    💬 Комментарии:  ' + stats.commentsCount);
+  console.log('    🛡️  Администраторы: ' + stats.adminCount);
   console.log('');
   console.log('✅  Сервер готов к работе!');
   console.log('='.repeat(60));
