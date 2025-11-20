@@ -44,7 +44,7 @@ const SESSION_COOKIE = 'lt_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 дней
 const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут
 const AUTH_CHECK_INTERVAL_MS = 5000;
-const MAX_SESSIONS_PER_USER = 5; // Максимум одновременных сессий
+const MAX_SESSIONS_PER_USER = 1; // Максимум одна одновременная сессия
 const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый час
 const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 10; // За час
@@ -793,16 +793,12 @@ function createSession(userId, req){
   const ua = req.headers['user-agent'] || '';
   const sessionId = 'ses-' + crypto.randomBytes(12).toString('hex');
 
-  // Ограничение количества сессий на пользователя
   const existingSessions = countActiveSessions(userId);
-  if (existingSessions >= MAX_SESSIONS_PER_USER) {
-    deleteOldestSession(userId);
-
-    logSecurityEvent('session_limit_reached', {
-      userId,
-      ip,
-      userAgent: ua,
-      severity: 'warning'
+  if (existingSessions > 0) {
+    deactivateSessionsByUser(userId, {
+      eventType: 'login_session_replaced',
+      severity: 'info',
+      details: { ip, userAgent: ua }
     });
   }
 
@@ -862,7 +858,7 @@ function invalidateSession(token) {
 }
 
 function invalidateAllUserSessions(userId) {
-  deactivateSessionsByUser(userId);
+  deactivateSessionsByUser(userId, { logEvent: false });
   logSecurityEvent('all_sessions_invalidated', {
     userId,
     severity: 'warning'

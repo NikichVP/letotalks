@@ -752,9 +752,11 @@ function createDbProcessing({
     db.prepare('UPDATE sessions SET is_active = 0 WHERE token_hash = ?').run(tokenHash);
   }
 
-  function deactivateSessionsByUser(userId) {
+  function deactivateSessionsByUser(userId, { eventType = 'all_sessions_invalidated', severity = 'warning', logEvent = true, details = {} } = {}) {
     db.prepare('UPDATE sessions SET is_active = 0 WHERE user_id = ?').run(userId);
-    logSecurityEvent('all_sessions_invalidated', { userId, severity: 'warning' });
+    if (logEvent) {
+      logSecurityEvent(eventType, { userId, ...details, severity });
+    }
   }
 
   function cleanupExpiredSessions() {

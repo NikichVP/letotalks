@@ -214,6 +214,10 @@ function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); 
 const Auth = {
   key: 'letotalks:auth',
   _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false },
+  clearPersisted(){
+    if (typeof localStorage === 'undefined') return;
+    try{ localStorage.removeItem(this.key); }catch{}
+  },
 
   get(){ return this._state; },
   set(o){
@@ -226,7 +230,7 @@ const Auth = {
       merged.spent_coins = Math.max(0, merged.earned_coins - merged.available_coins);
     }
     this._state = merged;
-    try{ localStorage.setItem(this.key, JSON.stringify({ email: this._state.email })); }catch{}
+    this.clearPersisted();
     this.render();
     this.renderProfilePopover(); // обновление поповера
   },
@@ -692,7 +696,35 @@ const App = {
   async mountNavbar(){
     const btn  = $('#deptBtn');
     const menu = $('#deptMenu');
+    const searchInput = $('#searchInput');
     if (!btn || !menu) return;
+
+    const defaultDeptLabel = 'Кафедры…';
+    let currentPath = '/';
+    let currentSearch = '';
+    let currentDepartment = '';
+
+    try{
+      const hash = (location.hash || '').slice(1) || '/';
+      const navUrl = new URL(hash.startsWith('/') ? hash : `/${hash}`, location.origin);
+      currentPath = navUrl.pathname || '/';
+      if (currentPath === '/search') {
+        currentSearch = navUrl.searchParams.get('q') || '';
+      }
+      if (currentPath.startsWith('/department/')) {
+        currentDepartment = decodeURIComponent(currentPath.replace('/department/',''));
+      }
+    }catch{}
+
+    if (searchInput) {
+      searchInput.value = currentPath === '/search' ? currentSearch : '';
+    }
+
+    if (btn) {
+      btn.textContent = currentDepartment || defaultDeptLabel;
+      btn.setAttribute('aria-expanded','false');
+    }
+    menu.classList.add('hidden');
 
     const deps = await this.getDepartments();
     menu.innerHTML =
