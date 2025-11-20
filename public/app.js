@@ -753,15 +753,18 @@ async viewHome(){
 
   const charCards = CHARACTERISTICS.map(c=>{
     const list = Array.isArray(homeData?.characteristics?.[c.key]) ? homeData.characteristics[c.key] : [];
-    const preview = list.map(t=>html`
+    const preview = list.map(t=>{
+      const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
+      return html`
       <div class="row" style="gap:10px;padding:8px 0">
         <div class="portrait"><img src="${t.photo||''}" alt=""></div>
         <div style="flex:1">
-          <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
           <div class="tdept">${t.department}</div>
         </div>
         <div>${fmtStars(characteristicAvg(t,c.key))}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     return html`
       <div class="card">
         <div class="card-header">
@@ -779,15 +782,18 @@ async viewHome(){
   const deptCards = (Array.isArray(homeData?.departments)?homeData.departments:[]).map(d=>{
     const list = Array.isArray(d.list)?d.list:[];
     if (!list.length) return '';
-    const preview = list.map(t=>html`
+    const preview = list.map(t=>{
+      const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
+      return html`
       <div class="row" style="gap:10px;padding:8px 0">
         <div class="portrait"><img src="${t.photo||''}" alt=""></div>
         <div style="flex:1">
-          <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
           <div class="tdept">${t.department}</div>
         </div>
         <div>${fmtStars(overall(t))}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     return html`
       <div class="card">
         <div class="card-header">
@@ -1468,16 +1474,17 @@ async viewHome(){
           </div>
 
           <div id="stageActive" class="hidden">
-            <div class="row wrap" style="gap:12px; align-items:flex-start">
-              <div>
-                <div class="muted">Временный адрес</div>
-                <div id="tmpEmail" class="badge" style="user-select:all"></div>
+            <div class="row wrap" style="gap:20px; align-items:flex-start">
+              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 200px;">
+                <div class="muted" style="margin-bottom: 4px;">Временный адрес</div>
+                <div id="tmpEmail" class="badge" style="user-select:all; margin-bottom: 4px;"></div>
+                <button id="copyEmail" class="btn small outline">Скопировать адрес</button>
               </div>
-              <div>
-                <div class="muted">Ваш код</div>
-                <div id="tmpCode" class="badge" style="user-select:all"></div>
+              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 140px;">
+                <div class="muted" style="margin-bottom: 4px;">Ваш код</div>
+                <div id="tmpCode" class="badge" style="user-select:all; margin-bottom: 4px;"></div>
+                <button id="copyCode" class="btn small outline">Скопировать код</button>
               </div>
-              <button id="copyAll" class="btn small outline">Скопировать адрес и код</button>
             </div>
 
             <div class="empty" id="statusLine" style="margin-top:10px">Ждём письмо…</div>
@@ -1559,10 +1566,18 @@ async viewHome(){
       sessionId = null; $email.textContent=''; $code.textContent='';
     });
 
-    $('#copyAll')?.addEventListener('click', async ()=>{
+    $('#copyEmail')?.addEventListener('click', async ()=>{
       try{
-        await navigator.clipboard.writeText(`Временный адрес: ${$email.textContent}\nКод: ${$code.textContent}`);
-        $status.textContent = 'Скопировано!';
+        await navigator.clipboard.writeText($email.textContent);
+        $status.textContent = 'Адрес скопирован!';
+        setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
+      }catch{}
+    });
+
+    $('#copyCode')?.addEventListener('click', async ()=>{
+      try{
+        await navigator.clipboard.writeText($code.textContent);
+        $status.textContent = 'Код скопирован!';
         setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
       }catch{}
     });

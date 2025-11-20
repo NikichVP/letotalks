@@ -64,6 +64,7 @@ const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const DATA_DIR    = path.join(ROOT_DIR, 'data');
 const PHOTO_DIR   = path.join(ROOT_DIR, 'photos');
 const REQUEST_PHOTO_DIR = path.join(DATA_DIR, 'teacher_request_photos');
+const DEFAULT_PHOTO = '/photo/default_photo.png';
 const DB_PATH     = process.env.LETOTALKS_DB_PATH
   ? path.resolve(process.env.LETOTALKS_DB_PATH)
   : path.join(ROOT_DIR, 'letotalks.db');
@@ -599,7 +600,7 @@ function normalizeTeacherRow(row) {
     firstName: row.first_name || '',
     patronymic: row.patronymic || '',
     department: row.department || '',
-    photo: row.photo || null,
+    photo: row.photo || DEFAULT_PHOTO,
     subjects: row.subjects ? row.subjects.split('|').filter(Boolean) : []
   };
 }
@@ -1296,7 +1297,14 @@ function setBanStatus(userId, banned, reason = '') {
 function upsertTeacher(teacher) {
   const { id, lastName, firstName, patronymic, department, subjects, photo } = teacher;
   const subjectsStr = Array.isArray(subjects) ? subjects.join('|') : String(subjects || '');
-  const photoStr = photo ? (photo.startsWith('/photo/') ? photo : `/photo/${photo}`) : null;
+  const rawPhoto = typeof photo === 'string' ? photo.trim() : (photo ? String(photo).trim() : '');
+  const photoStr = (() => {
+    if (!rawPhoto) return DEFAULT_PHOTO;
+    if (rawPhoto.startsWith('/photo/')) return rawPhoto;
+    if (rawPhoto.startsWith('/photos/')) return rawPhoto.replace('/photos/', '/photo/');
+    if (/^https?:\/\//i.test(rawPhoto)) return rawPhoto;
+    return `/photo/${rawPhoto}`;
+  })();
 
   const stmt = db.prepare('INSERT INTO teachers (id, last_name, first_name, patronymic, department, subjects, photo) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_name = excluded.last_name, first_name = excluded.first_name, patronymic = excluded.patronymic, department = excluded.department, subjects = excluded.subjects, photo = excluded.photo');
   stmt.run(id, lastName || '', firstName || '', patronymic || '', department || '', subjectsStr, photoStr);
@@ -1754,14 +1762,10 @@ app.get('/api/teacher/:id',(req,res)=>{
     return base;
   });
 
+  const teacher = normalizeTeacherRow(t);
+
   res.json({
-    id: t.id,
-    lastName: t.last_name,
-    firstName: t.first_name,
-    patronymic: t.patronymic,
-    department: t.department,
-    photo: t.photo,
-    subjects: t.subjects ? t.subjects.split('|') : [],
+    ...teacher,
     ratings,
     comments,
     overall: overall(ratings)
@@ -1930,16 +1934,12 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     const retRatings = typeof getRatingsForTeacher === 'function' ? getRatingsForTeacher(teacherId) : {};
     const comments = typeof getCommentsForTeacher === 'function' ? getCommentsForTeacher(teacherId) : [];
 
+    const teacher = normalizeTeacherRow(t);
+
     return res.json({
       ok: true,
       teacher: {
-        id: t.id,
-        lastName: t.last_name,
-        firstName: t.first_name,
-        patronymic: t.patronymic,
-        department: t.department,
-        photo: t.photo,
-        subjects: t.subjects ? t.subjects.split('|') : [],
+        ...teacher,
         ratings: retRatings,
         comments,
         overall: typeof overall === 'function' ? overall(retRatings) : null
