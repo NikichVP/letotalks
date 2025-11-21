@@ -2389,8 +2389,38 @@ async viewHome(){
     this.renderTeacherForm({ teacher, isNew:false });
   },
 
+  normalizeShopState(raw) {
+    const src = raw && typeof raw === 'object' ? (raw.shop ?? raw) : null;
+    if (!src) return null;
+    const toNum = (v, def = 0) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : def;
+    };
+    const items = Array.isArray(src.items) ? src.items : [];
+    return {
+      items,
+      balance: toNum(src.balance ?? src.available_coins, toNum(Auth._state.available_coins, 0)),
+      earnedCoins: toNum(src.earnedCoins ?? src.earned_coins, toNum(Auth._state.earned_coins, 0)),
+      spentCoins: toNum(src.spentCoins ?? src.spent_coins, toNum(Auth._state.spent_coins, 0)),
+      activeNickname: src.activeNickname || src.active_nickname || null
+    };
+  },
+
+  applyShopStateToAuth(shopState) {
+    if (!shopState) return;
+    const update = {
+      available_coins: Number(shopState.balance ?? Auth._state.available_coins),
+      earned_coins: Number(shopState.earnedCoins ?? Auth._state.earned_coins),
+      spent_coins: Number(shopState.spentCoins ?? Auth._state.spent_coins)
+    };
+    if (shopState.activeNickname) {
+      update.display_name = shopState.activeNickname;
+    }
+    Auth.set(update);
+  },
+
   // --- Магазин ---
-  async viewShop() {
+  async viewShop(options = {}) {
     await this.mountNavbar();
 
     if (!Auth.isLogged()) {
@@ -2401,31 +2431,31 @@ async viewHome(){
       return;
     }
 
-    let shopData = {
+    const fromOptions = this.normalizeShopState(options.prefetched);
+    let shopData = fromOptions || {
       items: [],
       balance: coinsOf(Auth._state),
       earnedCoins: Auth._state.earned_coins || 0,
-      spentCoins: Auth._state.spent_coins || 0
+      spentCoins: Auth._state.spent_coins || 0,
+      activeNickname: Auth._state.display_name || null
     };
 
-    try {
-      const response = await fetch('/api/shop/items');
-      const data = await response.json();
-      if (data.ok) {
-        shopData = {
-          items: Array.isArray(data.items) ? data.items : [],
-          balance: Number(data.balance || 0),
-          earnedCoins: Number(data.earnedCoins || 0),
-          spentCoins: Number(data.spentCoins || 0)
-        };
-        Auth.set({
-          available_coins: shopData.balance,
-          earned_coins: shopData.earnedCoins,
-          spent_coins: shopData.spentCoins
-        });
+    if (!fromOptions) {
+      try {
+        const response = await fetch('/api/shop/items');
+        const data = await response.json();
+        if (data && data.ok !== false) {
+          const normalized = this.normalizeShopState(data);
+          if (normalized) {
+            shopData = normalized;
+            this.applyShopStateToAuth(normalized);
+          }
+        }
+      } catch (error) {
+        console.error('Ошибка загрузки магазина:', error);
       }
-    } catch (error) {
-      console.error('Ошибка загрузки магазина:', error);
+    } else {
+      this.applyShopStateToAuth(shopData);
     }
 
     const purchasedItems = shopData.items.filter(item => item.purchased);
@@ -2535,34 +2565,43 @@ async viewHome(){
   },
 
   async buyItem(itemId) {
-  if (!Auth.isLogged()) return;
+    if (!Auth.isLogged()) return;
 
-  try {
-    const response = await fetch('/api/shop/buy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId })
-    });
-
-    const result = await response.json();
-
-    if (result.ok) {
-      alert(result.message);
-      Auth.set({
-        available_coins: Number(result.balance ?? Auth._state.available_coins),
-        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+    try {
+      const response = await fetch('/api/shop/buy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemId })
       });
-      await this.viewShop();
-      await Auth.me();
-    } else {
-      alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
-            result.error === 'already_purchased' ? 'Этот ник уже куплен' : 'Ошибка сервера'));
+
+      const result = await response.json();
+      const shopState = this.normalizeShopState(result);
+
+      if (result.ok) {
+        alert(result.message);
+        if (shopState) {
+          this.applyShopStateToAuth(shopState);
+        } else {
+          Auth.set({
+            available_coins: Number(result.balance ?? Auth._state.available_coins),
+            earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+            spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+          });
+        }
+        await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+        if (!shopState) await Auth.me();
+      } else {
+        if (result.error === 'already_purchased' && shopState) {
+          this.applyShopStateToAuth(shopState);
+          await this.viewShop({ prefetched: shopState });
+        }
+        alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
+              result.error === 'already_purchased' ? 'Этот ник уже куплен' : 'Ошибка сервера'));
+      }
+    } catch (error) {
+      alert('Ошибка сети при покупке');
     }
-  } catch (error) {
-    alert('Ошибка сети при покупке');
-  }
-},
+  },
 
 async activateItem(itemId) {
   if (!Auth.isLogged()) return;
@@ -2575,16 +2614,21 @@ async activateItem(itemId) {
     });
 
     const result = await response.json();
+    const shopState = this.normalizeShopState(result);
 
     if (result.ok) {
       alert(result.message);
-      Auth.set({
-        available_coins: Number(result.balance ?? Auth._state.available_coins),
-        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-      });
-      await this.viewShop();
-      await Auth.me();
+      if (shopState) {
+        this.applyShopStateToAuth(shopState);
+      } else {
+        Auth.set({
+          available_coins: Number(result.balance ?? Auth._state.available_coins),
+          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+        });
+      }
+      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+      if (!shopState) await Auth.me();
     } else {
       alert('Ошибка при активации: ' + (result.error === 'item_not_owned' ? 'Этот ник не куплен' : 'Ошибка сервера'));
     }
@@ -2604,16 +2648,21 @@ async deactivateItem(itemId) {
     });
 
     const result = await response.json();
+    const shopState = this.normalizeShopState(result);
 
     if (result.ok) {
       alert(result.message);
-      Auth.set({
-        available_coins: Number(result.balance ?? Auth._state.available_coins),
-        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-      });
-      await this.viewShop();
-      await Auth.me();
+      if (shopState) {
+        this.applyShopStateToAuth(shopState);
+      } else {
+        Auth.set({
+          available_coins: Number(result.balance ?? Auth._state.available_coins),
+          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+        });
+      }
+      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+      if (!shopState) await Auth.me();
     } else {
       const msg = result.error === 'not_active'
         ? 'Этот ник уже отключен'

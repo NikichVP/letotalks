@@ -950,7 +950,15 @@ function createDbProcessing({
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
 
-    insertStmt.run(userId, itemId, category, name, Date.now(), price, 0);
+    const info = insertStmt.run(userId, itemId, category, name, Date.now(), price, 0);
+    const insertedId = Number(info?.lastInsertRowid || 0);
+    if (!Number.isFinite(insertedId) || insertedId <= 0) return null;
+
+    return db.prepare(`
+      SELECT id, user_id, item_id, item_type, item_name, purchase_date, price, is_active
+      FROM user_inventory
+      WHERE id = ?
+    `).get(insertedId);
   }
 
   function getShopItemMeta(itemId) {

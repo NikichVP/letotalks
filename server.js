@@ -2350,20 +2350,19 @@ app.get('/api/user/stats', (req,res)=>{
 
 /* --- SHOP API --- */
 
-app.get('/api/shop/items', (req, res) => {
-  const u = getUserFromRequest(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
+function buildShopStateForUser(user) {
+  if (!user) return null;
 
   const availableItems = getShopItems();
-  const purchasedItems = new Set(getUserPurchasedItems(u.id).map(row => row.item_id));
-  const activeByType = new Map(getActiveInventoryForUser(u.id).map(row => [row.item_type, row.item_id]));
+  const purchasedItems = new Set(getUserPurchasedItems(user.id).map(row => row.item_id));
+  const activeByType = new Map(getActiveInventoryForUser(user.id).map(row => [row.item_type, row.item_id]));
 
-  const balance = getAvailableCoins(u);
-  const earnedCoins = calculateEarnedCoins(u);
-  const spentCoins = getUserSpentCoins(u.id);
+  const balance = getAvailableCoins(user);
+  const earnedCoins = calculateEarnedCoins(user);
+  const spentCoins = getUserSpentCoins(user.id);
+  const activeNickname = getActiveNickname(user.id);
 
-  res.json({
-    ok: true,
+  return {
     items: availableItems.map(item => ({
       ...item,
       purchased: purchasedItems.has(item.id),
@@ -2371,7 +2370,20 @@ app.get('/api/shop/items', (req, res) => {
     })),
     balance,
     earnedCoins,
-    spentCoins
+    spentCoins,
+    activeNickname
+  };
+}
+
+app.get('/api/shop/items', (req, res) => {
+  const u = getUserFromRequest(req);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+
+  const shopState = buildShopStateForUser(u);
+
+  res.json({
+    ok: true,
+    ...(shopState || {})
   });
 });
 
@@ -2394,11 +2406,14 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   const existing = getExistingInventoryItem(u.id, itemId, item.category);
 
   if (existing) {
-    return res.status(400).json({ error: 'already_purchased' });
+    const shopState = buildShopStateForUser(u);
+    return res.status(400).json({ error: 'already_purchased', shop: shopState || null });
   }
 
+  const hadActiveInCategory = getActiveInventoryForUser(u.id).some(row => row.item_type === item.category);
+
   // Покупаем товар
-  insertInventoryItem({
+  const newInventoryRow = insertInventoryItem({
     userId: u.id,
     itemId,
     category: item.category,
@@ -2406,9 +2421,16 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
     price: item.price
   });
 
-  const balanceAfter = getAvailableCoins(u);
-  const spentCoins = getUserSpentCoins(u.id);
-  const earnedCoins = calculateEarnedCoins(u);
+  if (!newInventoryRow) {
+    return res.status(500).json({ error: 'cannot_save_purchase' });
+  }
+
+  // Если это первый ник в категории — активируем сразу, чтобы он отобразился в профиле
+  if (!hadActiveInCategory) {
+    activateInventoryItemById(newInventoryRow.id);
+  }
+
+  const shopState = buildShopStateForUser(u);
 
   logSecurityEvent('shop_purchase', {
     userId: u.id,
@@ -2416,15 +2438,17 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
     itemName: item.name,
     price: item.price,
     balanceBefore: availableCoins,
-    balanceAfter
+    balanceAfter: shopState?.balance ?? availableCoins
   });
 
   res.json({
     ok: true,
     message: `Ник "${item.name}" успешно приобретен!`,
-    balance: balanceAfter,
-    earnedCoins,
-    spentCoins
+    balance: shopState?.balance ?? getAvailableCoins(u),
+    earnedCoins: shopState?.earnedCoins ?? calculateEarnedCoins(u),
+    spentCoins: shopState?.spentCoins ?? getUserSpentCoins(u.id),
+    activeNickname: shopState?.activeNickname || null,
+    shop: shopState || null
   });
 });
 
@@ -2460,16 +2484,16 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
     category: shopItem.category
   });
 
-  const balance = getAvailableCoins(u);
-  const spentCoins = getUserSpentCoins(u.id);
-  const earnedCoins = calculateEarnedCoins(u);
+  const shopState = buildShopStateForUser(u);
 
   res.json({
     ok: true,
     message: `Ник "${item.item_name}" теперь отображается в вашем профиле!`,
-    balance,
-    earnedCoins,
-    spentCoins
+    balance: shopState?.balance ?? getAvailableCoins(u),
+    earnedCoins: shopState?.earnedCoins ?? calculateEarnedCoins(u),
+    spentCoins: shopState?.spentCoins ?? getUserSpentCoins(u.id),
+    activeNickname: shopState?.activeNickname || null,
+    shop: shopState || null
   });
 });
 
@@ -2495,16 +2519,16 @@ app.post('/api/shop/deactivate', express.json(), (req, res) => {
     category: inventoryItem.item_type
   });
 
-  const balance = getAvailableCoins(u);
-  const spentCoins = getUserSpentCoins(u.id);
-  const earnedCoins = calculateEarnedCoins(u);
+  const shopState = buildShopStateForUser(u);
 
   res.json({
     ok: true,
     message: `Ник "${inventoryItem.item_name}" деактивирован.`,
-    balance,
-    earnedCoins,
-    spentCoins
+    balance: shopState?.balance ?? getAvailableCoins(u),
+    earnedCoins: shopState?.earnedCoins ?? calculateEarnedCoins(u),
+    spentCoins: shopState?.spentCoins ?? getUserSpentCoins(u.id),
+    activeNickname: shopState?.activeNickname || null,
+    shop: shopState || null
   });
 });
 
