@@ -2259,7 +2259,10 @@ app.post('/api/auth/password', authLimiter, async (req, res) => {
 
 app.get('/api/auth/me', (req,res)=>{
   const u = getUserFromRequest(req);
-  if (!u) return res.json({ loggedIn:false });
+  if (!u) {
+    clearSessionCookie(res);
+    return res.json({ loggedIn:false });
+  }
   const is_admin = isAdminUser(u);
   const is_banned = isUserBanned(u.id);
   return res.json({

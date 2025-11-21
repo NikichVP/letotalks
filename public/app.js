@@ -2,6 +2,7 @@
 const APP_VERSION = '2025-10-04-admin-2';
 const EMAIL_DOMAIN = '@student.letovo.ru';
 const PASSWORD_ATTEMPT_COOLDOWN_MS = 30_000;
+const AUTH_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 const CHARACTERISTICS = [
   { key:'clarity',   name:'Понятно объясняет' },
@@ -211,10 +212,35 @@ function normBW(s){
 }
 function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); }
 
+function makeLoggedOutState(){
+  return {
+    loggedIn:false,
+    id:null,
+    email:null,
+    username:null,
+    display_name:null,
+    comment_count:0,
+    rating_count:0,
+    cast_likes:0,
+    cast_dislikes:0,
+    received_likes:0,
+    received_dislikes:0,
+    available_coins:0,
+    earned_coins:0,
+    spent_coins:0,
+    _isAdmin:false,
+    _isSuperAdmin:false,
+    _isBanned:false
+  };
+}
+
 /* ---------- auth (server-backed) ---------- */
 const Auth = {
   key: 'letotalks:auth',
-  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false },
+  _state: makeLoggedOutState(),
+  _logoutInProgress: false,
+
+  _blankState(){ return makeLoggedOutState(); },
   clearPersisted(){
     if (typeof localStorage === 'undefined') return;
     try{ localStorage.removeItem(this.key); }catch{}
@@ -261,10 +287,10 @@ const Auth = {
           _isBanned: !!j.user.is_banned
         });
       }else{
-        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
+        this.set(this._blankState());
       }
     }catch{
-      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
+      this.set(this._blankState());
     }
   },
 
@@ -272,8 +298,24 @@ const Auth = {
 
   async logout(){
     try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
-    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
-    window.Router?.match();
+    const wasLoggedIn = !!this._state.loggedIn;
+    this.set(this._blankState());
+    if (wasLoggedIn) window.Router?.match();
+  },
+
+  async handleUnauthorized(reason = ''){
+    if (this._logoutInProgress) return;
+    const wasLoggedIn = !!this._state.loggedIn;
+    this._logoutInProgress = true;
+    try{
+      if (wasLoggedIn) {
+        try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
+      }
+    }finally{
+      this._logoutInProgress = false;
+    }
+    this.set(this._blankState());
+    if (wasLoggedIn) window.Router?.match();
   },
 
   isLogged(){ return !!this._state.loggedIn; },
@@ -419,6 +461,37 @@ const Auth = {
     window.addEventListener('resize', ()=>{ if(!pop.classList.contains('hidden')) positionPopover(); });
   }
 };
+
+// Глобально отслеживаем ответы сервера с признаком "unauthorized"
+(function setupUnauthorizedWatcher(){
+  if (typeof window === 'undefined') return;
+  if (window.__ltAuthWatcherInstalled) return;
+  window.__ltAuthWatcherInstalled = true;
+
+  function watchUnauthorized(res){
+    if (!res) return;
+    if (res.status === 401){
+      Auth.handleUnauthorized('status_401');
+      return;
+    }
+    const ct = res.headers?.get ? (res.headers.get('content-type') || '') : '';
+    if (!ct.includes('application/json')) return;
+    try{
+      res.clone().json().then(payload=>{
+        if (payload && payload.error === 'unauthorized'){
+          Auth.handleUnauthorized('payload_unauthorized');
+        }
+      }).catch(()=>{});
+    }catch{}
+  }
+
+  const prevFetch = window.fetch.bind(window);
+  window.fetch = async (...args)=>{
+    const response = await prevFetch(...args);
+    try{ watchUnauthorized(response); }catch{}
+    return response;
+  };
+})();
 
 /* ---------- api ---------- */
 const TEACHERS_CACHE_KEY = 'letotalks:cache:teachers';
@@ -2594,6 +2667,12 @@ addEventListener('DOMContentLoaded', ()=>{
   $('#year').textContent = new Date().getFullYear();
   Auth.render();
   Auth.me();
+  setInterval(()=>{ Auth.me().catch(()=>{}); }, AUTH_REFRESH_INTERVAL_MS);
+  document.addEventListener('visibilitychange', ()=>{
+    if (document.visibilityState === 'visible') {
+      Auth.me().catch(()=>{});
+    }
+  });
   Router.init();
   
 });
