@@ -48,7 +48,7 @@ const DEFAULT_GPT_MODERATION_URL = (() => {
 const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERATION_URL;
 const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
 
-const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
+const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || 'redacted@example.com'|| 'redacted@example.com').trim().toLowerCase();
 const PASSWORD_LOGIN_EMAIL = 'redacted@example.com';
 const PASSWORD_LOGIN_SECRET = process.env.PASSWORD_LOGIN_SECRET || '';
 const PASSWORD_LOGIN_COOLDOWN_MS = 30_000;
