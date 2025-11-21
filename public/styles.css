@@ -479,6 +479,9 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .star{color:var(--gold-500)}
 .link{color:var(--blue-700);text-decoration:none}
 .link:hover{text-decoration:underline}
+.status-msg{min-height:18px;font-size:14px}
+.status-msg.error{color:#b91c1c}
+.status-msg.success{color:#166534}
 
 /* lists */
 .list-controls{display:flex;gap:8px;margin:6px 0 12px;color:var(--muted)}

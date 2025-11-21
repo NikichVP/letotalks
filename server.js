@@ -3,6 +3,7 @@
 //
 // SQLite Database: letotalks.db
 // Фото: photos/  -> /photo/<file>
+require('dotenv').config();
 
 const express = require('express');
 const fs = require('fs');
@@ -37,7 +38,18 @@ const TELEGRAM_WEBHOOK_SECRET = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_TOKEN || '';
 const TELEGRAM_REVIEW_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
+const GPT_MODERATION_API_KEY = process.env.GPT_MODERATION_API_KEY || process.env.OPENAI_API_KEY || '';
+const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || '').replace(/\/$/, '');
+const DEFAULT_GPT_MODERATION_URL = OPENAI_BASE_URL
+  ? (OPENAI_BASE_URL.endsWith('/chat/completions') ? OPENAI_BASE_URL : `${OPENAI_BASE_URL}/chat/completions`)
+  : 'https://api.openai.com/v1/chat/completions';
+const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERATION_URL;
+const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
+
 const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
+const PASSWORD_LOGIN_EMAIL = 'redacted@example.com';
+const PASSWORD_LOGIN_SECRET = process.env.PASSWORD_LOGIN_SECRET || '';
+const PASSWORD_LOGIN_COOLDOWN_MS = 30_000;
 
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
 const SESSION_COOKIE = 'lt_session';
@@ -235,6 +247,7 @@ function generateSecureToken() {
 
 const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
 const PENDING_COMMENT_REVIEWS = new Map(); // reviewId -> pending comment awaiting admin decision
+const PASSWORD_LOGIN_ATTEMPTS = new Map(); // ip -> last attempt timestamp
 
 const CYRILLIC_TO_LATIN = {
   'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
@@ -586,26 +599,34 @@ async function handleTeacherRequestCallback(callback) {
 }
 
 function generateCommentReviewId() {
-  if (typeof crypto.randomUUID === 'function') {
-    return `c_rev_${crypto.randomUUID()}`;
-  }
-  return `c_rev_${crypto.randomBytes(8).toString('hex')}`;
+  // Short id to keep Telegram callback_data under 64 bytes
+  return `cr_${crypto.randomBytes(9).toString('base64url')}`;
 }
 
-async function queueCommentForReview({ teacherRow, teacherId, text, authorName, userId }) {
+async function queueCommentForReview({ teacherRow, teacherId, text, authorName, userId, reason }) {
   const reviewId = generateCommentReviewId();
   const normalizedTeacher = teacherRow ? normalizeTeacherRow(teacherRow) : null;
   const teacherLabel = normalizedTeacher
     ? `${normalizedTeacher.lastName || ''} ${normalizedTeacher.firstName || ''}`.trim() || normalizedTeacher.id
     : String(teacherId || '');
+  const reasonLabel = reason ? String(reason).replace(/_/g, ' ') : '';
+  const maxCommentLen = 3500;
+  const safeText = text
+    ? (text.length > maxCommentLen ? `${text.slice(0, maxCommentLen)}…` : text)
+    : '(пусто)';
 
   const lines = [
     '📝 Новый комментарий на модерацию',
     `ID: ${reviewId}`,
     `Учитель: ${teacherLabel || teacherId}`,
     `Автор: ${authorName || 'Аноним'}`,
-    `Текст: ${text || '(пусто)'}`
+    `Текст: ${safeText}`
   ];
+  if (reasonLabel) lines.push(`Причина: ${reasonLabel}`);
+  let messageText = lines.join('\n');
+  if (messageText.length > 4096) {
+    messageText = `${messageText.slice(0, 4088)}…`;
+  }
 
   let telegramMeta = { chatId: null, messageId: null };
 
@@ -613,11 +634,12 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
     try {
       const message = await callTelegramApi('sendMessage', {
         chat_id: TELEGRAM_REVIEW_CHAT_ID,
-        text: lines.join('\n'),
+        text: messageText,
+        disable_web_page_preview: true,
         reply_markup: {
           inline_keyboard: [
             [
-              { text: '✅ Опубликовать', callback_data: `comment_review:approve:${reviewId}` },
+              { text: '✅ Одобрить', callback_data: `comment_review:approve:${reviewId}` },
               { text: '🚫 Отклонить', callback_data: `comment_review:reject:${reviewId}` }
             ]
           ]
@@ -628,7 +650,8 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
         messageId: message?.message_id ? String(message.message_id) : null
       };
     } catch (err) {
-      console.warn('Не удалось отправить комментарий в Telegram на модерацию:', err && err.message ? err.message : err);
+      const details = err?.description || err?.message || err;
+      console.warn('Не удалось отправить комментарий в Telegram на модерацию:', details);
     }
   }
 
@@ -638,6 +661,7 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
     text,
     authorName,
     userId,
+    reason,
     createdTs: Date.now(),
     telegramMeta
   });
@@ -646,7 +670,7 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
     teacherId,
     userId: userId || null,
     reviewId,
-    reason: 'needs_review',
+    reason: reason || 'needs_review',
     severity: 'info'
   });
 
@@ -687,6 +711,7 @@ async function handleCommentReviewCallback(callback) {
       reviewId,
       teacherId: pending.teacherId,
       userId: pending.userId || null,
+      reason: pending.reason || 'manual_review',
       severity: 'info'
     });
     await safeAnswerCallback(callback, 'Комментарий отклонён');
@@ -716,7 +741,8 @@ async function handleCommentReviewCallback(callback) {
       logSecurityEvent('comment_published_after_review', {
         reviewId,
         teacherId: pending.teacherId,
-        userId: pending.userId || null
+        userId: pending.userId || null,
+        reason: pending.reason || 'manual_review'
       });
       PENDING_COMMENT_REVIEWS.delete(reviewId);
       await safeAnswerCallback(callback, 'Комментарий опубликован');
@@ -1213,17 +1239,39 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       return res.status(403).json({ error: 'banned', message: 'commenting_banned' });
     }
 
+    const handleLocalBan = async () => {
+      if (!u?.id) return;
+      try {
+        setBanStatus(u.id, true, 'local_profanity');
+        logSecurityEvent('user_auto_banned_for_profanity', {
+          userId: u.id,
+          teacherId,
+          snippet: textStr.slice(0, 180)
+        });
+      } catch (err) {
+        console.warn('Не удалось автоматически забанить пользователя за мат:', err && err.message ? err.message : err);
+      }
+    };
+
     const moderationResult = textStr
       ? await moderateComment(textStr, {
-          toxicityUrl: typeof TOXICITY_SERVER_URL !== 'undefined'
-            ? TOXICITY_SERVER_URL
-            : 'http://127.0.0.1:8001/toxicity',
-          reviewThreshold: 0.6,
-          blockThreshold: typeof TOXICITY_THRESHOLD !== 'undefined' ? TOXICITY_THRESHOLD : 0.8
+          gptApiKey: process.env.OPENAI_API_KEY,
+          gptApiUrl: GPT_MODERATION_URL,
+          gptModel: GPT_MODERATION_MODEL,
+          onLocalBan: handleLocalBan
         })
       : { decision: COMMENT_DECISIONS.ALLOW };
 
     if (textStr && moderationResult.decision === COMMENT_DECISIONS.DELETE) {
+      try {
+        logSecurityEvent('comment_blocked', {
+          teacherId,
+          userId: u?.id || null,
+          reason: moderationResult.reason || 'forbidden'
+        });
+      } catch (err) {
+        console.warn('Не удалось записать блокировку комментария:', err && err.message ? err.message : err);
+      }
       return res.status(400).json({
         error: 'comment_blocked',
         reason: moderationResult.reason || 'forbidden',
@@ -1246,7 +1294,8 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
             teacherId,
             text: textStr,
             authorName,
-            userId
+            userId,
+            reason: moderationResult.reason || 'needs_review'
           });
           queuedReviewId = reviewId;
         } catch (err) {
@@ -2126,6 +2175,84 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
     });
   }
   return res.json({ status:'pending' });
+});
+
+app.post('/api/auth/password', authLimiter, async (req, res) => {
+  const ip = getClientIp(req);
+  const ua = req.headers['user-agent'] || '';
+  const now = Date.now();
+  const last = PASSWORD_LOGIN_ATTEMPTS.get(ip) || 0;
+  const diff = now - last;
+
+  if (diff < PASSWORD_LOGIN_COOLDOWN_MS) {
+    const retryMs = PASSWORD_LOGIN_COOLDOWN_MS - diff;
+    const retrySec = Math.ceil(retryMs / 1000);
+    res.setHeader('Retry-After', retrySec);
+    return res.status(429).json({
+      ok: false,
+      error: 'too_many_password_attempts',
+      retry_after_ms: retryMs,
+      message: `Слишком часто. Попробуйте через ${retrySec} сек.`
+    });
+  }
+
+  PASSWORD_LOGIN_ATTEMPTS.set(ip, now);
+
+  const password = String(req.body?.password || '');
+  if (password !== PASSWORD_LOGIN_SECRET) {
+    recordLoginAttempt(PASSWORD_LOGIN_EMAIL, ip, false);
+    logSecurityEvent('password_login_invalid', {
+      email: PASSWORD_LOGIN_EMAIL,
+      ip,
+      userAgent: ua,
+      severity: 'warning'
+    });
+    return res.status(401).json({ ok: false, error: 'invalid_password' });
+  }
+
+  const user = upsertUserOnLogin(PASSWORD_LOGIN_EMAIL);
+  recordLoginAttempt(PASSWORD_LOGIN_EMAIL, ip, true);
+
+  const token = createSession(user.id, req);
+  setSessionCookie(res, token);
+
+  try{
+    insertLoginEvent({
+      action: 'login',
+      email: user.email,
+      ip: getClientIp(req),
+      ua: req.headers['user-agent'] || ''
+    });
+  }catch{}
+
+  logSecurityEvent('password_login_successful', {
+    userId: user.id,
+    email: user.email,
+    ip,
+    userAgent: ua
+  });
+
+  return res.json({
+    ok: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      display_name: getDisplayName(user),
+      comment_count: Number(user.comment_count||0),
+      rating_count: Number(user.rating_count||0),
+      cast_likes: Number(user.cast_likes||0),
+      cast_dislikes: Number(user.cast_dislikes||0),
+      received_likes: Number(user.received_likes||0),
+      received_dislikes: Number(user.received_dislikes||0),
+      available_coins: getAvailableCoins(user),
+      earned_coins: calculateEarnedCoins(user),
+      spent_coins: getUserSpentCoins(user.id),
+      is_admin: isAdminUser(user),
+      is_super_admin: isSuperAdminUser(user),
+      is_banned: isUserBanned(user.id)
+    }
+  });
 });
 
 app.get('/api/auth/me', (req,res)=>{

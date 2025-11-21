@@ -12,6 +12,9 @@ const COMMENT_DECISIONS = {
   REVIEW: 2
 };
 
+const DEFAULT_GPT_ENDPOINT = 'https://api.openai.com/v1/chat/completions';
+const DEFAULT_GPT_MODEL = 'gpt-5.1-nano';
+
 function normalizeForBadWords(text) {
   let t = String(text || '').toLowerCase();
   t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
@@ -26,62 +29,89 @@ function hasBadWords(text) {
   return BAD_STEMS.some(st => norm.includes(st));
 }
 
-function extractToxicityScore(payload) {
-  if (payload && Array.isArray(payload.probs) && payload.probs.length >= 2) {
-    return Number(payload.probs[1]) || 0;
-  }
-  if (payload && Array.isArray(payload.logits) && payload.logits.length >= 2) {
-    try {
-      const l0 = Number(payload.logits[0]) || 0;
-      const l1 = Number(payload.logits[1]) || 0;
-      const max = Math.max(l0, l1);
-      const e0 = Math.exp(l0 - max);
-      const e1 = Math.exp(l1 - max);
-      return e1 / (e0 + e1);
-    } catch {
-      return 0;
+function buildModerationMessages(text) {
+  const compact = text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
+  return [
+    {
+      role: 'system',
+      content: [
+        'Ты — строгий модератор комментариев.',
+        'Нужно выявлять оскорбления, маты и очень грубую лексику на любом языке.',
+        'Верни ровно одну цифру:',
+        '0 — если есть маты/грубость/враждебность и комментарий нужно удалить.',
+        '1 — если текст безопасен и можно опубликовать.',
+        '2 — если сомневаешься; используй 2 только при реальной неопределенности.',
+        'Никаких пояснений, только цифра.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: `Оцени модерацию комментария и верни только 0/1/2.\nКомментарий: """${compact}"""`
     }
-  }
-  if (Array.isArray(payload) && payload.length > 0 && payload[0].label) {
-    let score = 0;
-    for (const it of payload) {
-      const lab = String(it.label || '').toLowerCase();
-      const sc = Number(it.score || 0);
-      if (lab.includes('tox') || lab === 'label_1' || lab === 'label1') score = Math.max(score, sc);
-    }
-    if (!score && payload.length === 1) {
-      const lab = String(payload[0].label || '').toLowerCase();
-      if (lab.includes('tox')) score = Number(payload[0].score || 0);
-    }
-    return score;
-  }
-  if (payload && (payload.toxic === true || payload.is_toxic === true || String(payload.label || '').toLowerCase().includes('tox'))) {
-    return 1;
-  }
-  return 0;
+  ];
 }
 
-async function fetchToxicityScore(text, toxicityUrl) {
-  if (!toxicityUrl || typeof fetch !== 'function') return 0;
+async function requestGptDecision(text, {
+  apiKey,
+  apiUrl = DEFAULT_GPT_ENDPOINT,
+  model = DEFAULT_GPT_MODEL,
+  timeoutMs = 12000
+} = {}) {
+  if (!apiKey || !apiUrl || typeof fetch !== 'function') {
+    return { decision: COMMENT_DECISIONS.REVIEW, reason: 'llm_not_configured' };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const r = await fetch(toxicityUrl, {
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+    const res = await fetch(apiUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: buildModerationMessages(text),
+        temperature: 0,
+        max_tokens: 4
+      }),
+      signal: controller.signal
     });
-    if (!r.ok) return 0;
-    const payload = await r.json();
-    return extractToxicityScore(payload);
-  } catch {
-    return 0;
+
+    if (!res.ok) {
+      return { decision: COMMENT_DECISIONS.REVIEW, reason: 'llm_http_error', status: res.status };
+    }
+
+    const payload = await res.json();
+    const raw = (payload?.choices?.[0]?.message?.content || '').trim();
+    const parsed = Number(raw);
+    const normalizedDecision = [0, 1, 2].includes(parsed)
+      ? parsed
+      : (() => {
+          const match = raw.match(/[0-2]/);
+          return match ? Number(match[0]) : COMMENT_DECISIONS.REVIEW;
+        })();
+
+    return {
+      decision: normalizedDecision,
+      reason: normalizedDecision === COMMENT_DECISIONS.REVIEW ? 'llm_unsure' : 'llm_answer',
+      raw
+    };
+  } catch (err) {
+    const reason = err?.name === 'AbortError' ? 'llm_timeout' : 'llm_error';
+    return { decision: COMMENT_DECISIONS.REVIEW, reason };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 async function moderateComment(text, {
-  toxicityUrl,
-  toxicityChecker,
-  reviewThreshold = 0.6,
-  blockThreshold = 0.8
+  gptApiKey,
+  gptApiUrl = DEFAULT_GPT_ENDPOINT,
+  gptModel = DEFAULT_GPT_MODEL,
+  onLocalBan
 } = {}) {
   const cleaned = String(text || '').trim();
   if (!cleaned) {
@@ -89,30 +119,27 @@ async function moderateComment(text, {
   }
 
   if (hasBadWords(cleaned)) {
+    if (typeof onLocalBan === 'function') {
+      try { await onLocalBan(cleaned); } catch {}
+    }
     return { decision: COMMENT_DECISIONS.DELETE, reason: 'profanity', score: 1 };
   }
 
-  let score = 0;
-  if (typeof toxicityChecker === 'function') {
-    try {
-      const res = await toxicityChecker(cleaned);
-      if (typeof res === 'number') score = res;
-      else if (res === true) score = 1;
-    } catch {
-      score = 0;
-    }
-  } else if (toxicityUrl) {
-    score = await fetchToxicityScore(cleaned, toxicityUrl);
+  const llmResult = await requestGptDecision(cleaned, {
+    apiKey: gptApiKey,
+    apiUrl: gptApiUrl,
+    model: gptModel
+  });
+
+  if (llmResult.decision === COMMENT_DECISIONS.DELETE) {
+    return { decision: COMMENT_DECISIONS.DELETE, reason: 'llm_block', score: 1, raw: llmResult.raw || null };
   }
 
-  if (score >= blockThreshold) {
-    return { decision: COMMENT_DECISIONS.DELETE, reason: 'toxicity', score };
-  }
-  if (score >= reviewThreshold) {
-    return { decision: COMMENT_DECISIONS.REVIEW, reason: 'needs_review', score };
+  if (llmResult.decision === COMMENT_DECISIONS.ALLOW) {
+    return { decision: COMMENT_DECISIONS.ALLOW, reason: 'llm_allow', score: 0, raw: llmResult.raw || null };
   }
 
-  return { decision: COMMENT_DECISIONS.ALLOW, reason: 'clean', score };
+  return { decision: COMMENT_DECISIONS.REVIEW, reason: llmResult.reason || 'llm_unsure', score: 0.5, raw: llmResult.raw || null };
 }
 
 module.exports = {
