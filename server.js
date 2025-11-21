@@ -68,14 +68,14 @@ const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 
 const DEFAULT_SHOP_ITEMS = [
   { id: 'nick-0', name: 'Новичок', price: 1, category: 'nickname' },
-  { id: 'nick-1', name: 'Умник', price: 50, category: 'nickname' },
-  { id: 'nick-2', name: 'Отличник', price: 75, category: 'nickname' },
-  { id: 'nick-3', name: 'Эрудит', price: 100, category: 'nickname' },
+  { id: 'nick-1', name: 'Умник', price: 20, category: 'nickname' },
+  { id: 'nick-2', name: 'Отличник', price: 50, category: 'nickname' },
+  { id: 'nick-3', name: 'Эрудит', price: 75, category: 'nickname' },
   { id: 'nick-4', name: 'Профи', price: 150, category: 'nickname' },
   { id: 'nick-5', name: 'Гуру', price: 200, category: 'nickname' },
   { id: 'nick-6', name: 'Легенда', price: 300, category: 'nickname' },
   { id: 'nick-7', name: 'Мастер', price: 250, category: 'nickname' },
-  { id: 'nick-8', name: 'Эксперт', price: 180, category: 'nickname' }
+  { id: 'nick-8', name: 'kinnijin', price: 180, category: 'nickname' }
 ];
 
 const TEACHER_REQUEST_STATUSES = {
