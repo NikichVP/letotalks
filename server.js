@@ -40,9 +40,11 @@ const TELEGRAM_REVIEW_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 const GPT_MODERATION_API_KEY = process.env.GPT_MODERATION_API_KEY || process.env.OPENAI_API_KEY || '';
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || '').replace(/\/$/, '');
-const DEFAULT_GPT_MODERATION_URL = OPENAI_BASE_URL
-  ? (OPENAI_BASE_URL.endsWith('/chat/completions') ? OPENAI_BASE_URL : `${OPENAI_BASE_URL}/chat/completions`)
-  : 'https://api.openai.com/v1/chat/completions';
+const DEFAULT_GPT_MODERATION_URL = (() => {
+  if (!OPENAI_BASE_URL) return 'https://api.openai.com/v1/responses';
+  if (/\/(chat\/completions|responses)$/i.test(OPENAI_BASE_URL)) return OPENAI_BASE_URL;
+  return `${OPENAI_BASE_URL}/responses`;
+})();
 const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERATION_URL;
 const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
 

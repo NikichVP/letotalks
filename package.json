@@ -87,6 +87,7 @@
     "statuses": "^2.0.2",
     "toidentifier": "^1.0.1",
     "type-is": "^2.0.1",
+    "undici": "^6.22.0",
     "unpipe": "^1.0.0",
     "vary": "^1.1.2",
     "wrappy": "^1.0.2"
