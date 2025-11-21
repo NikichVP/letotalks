@@ -2,7 +2,7 @@
 const APP_VERSION = '2025-10-04-admin-2';
 const EMAIL_DOMAIN = '@student.letovo.ru';
 const PASSWORD_ATTEMPT_COOLDOWN_MS = 30_000;
-const AUTH_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const AUTH_REFRESH_INTERVAL_MS = 60 * 1000; // чаще обновляем состояние (раз в минуту)
 
 const CHARACTERISTICS = [
   { key:'clarity',   name:'Понятно объясняет' },
@@ -641,7 +641,13 @@ const API = {
     teacherCacheState.promise = null;
     clearTeacherCacheInStorage();
   },
-  async teacher(id){ const r=await fetch(`/api/teacher/${id}`); return await r.json(); },
+  async teacher(id){
+    const r = await fetch(`/api/teacher/${id}`, {
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' }
+    });
+    return await r.json();
+  },
   async publish({teacherId, text, ratings, author}) {
     const r = await fetch('/api/comment-with-ratings', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -651,6 +657,9 @@ const API = {
       let payload = null;
       try { payload = await r.json(); } catch {}
       const err = new Error(payload?.error || 'publish_failed');
+      if (payload?.error) err.code = payload.error;
+      if (payload?.reason) err.reason = payload.reason;
+      if (payload?.score != null) err.score = payload.score;
       if (payload?.retry_after_ms != null) err.retry_after_ms = payload.retry_after_ms;
       if (payload?.message) err.message = payload.message; // e.g. commenting_banned
       throw err;
@@ -1333,14 +1342,35 @@ async viewHome(){
   setPending(tid,key,v){ if(!this.pendingRatings[tid]) this.pendingRatings[tid]={}; this.pendingRatings[tid][key]=v; },
   getPending(tid){ return this.pendingRatings[tid]||{}; },
   resetPending(tid){ this.pendingRatings[tid]={}; },
+  _lastCommentNotice: null,
+  setCommentNotice(notice){
+    if (notice && notice.teacherId) {
+      this._lastCommentNotice = {
+        teacherId: notice.teacherId,
+        text: String(notice.text || ''),
+        tone: notice.tone || 'muted'
+      };
+    } else {
+      this._lastCommentNotice = null;
+    }
+  },
+  consumeCommentNotice(teacherId){
+    if (this._lastCommentNotice && this._lastCommentNotice.teacherId === teacherId) {
+      const note = this._lastCommentNotice;
+      this._lastCommentNotice = null;
+      return note;
+    }
+    return null;
+  },
 
-  async teacherProfile(_, tid){
-    const data = await API.teacher(tid);
+  async teacherProfile(_, tid, prefetched){
+    const data = prefetched || await API.teacher(tid);
     if(!data || data.error){ Router.go('/'); return; }
     await this.mountNavbar();
 
     const t = data; // содержит comments с like/dislike агрегацией и myVote/own (+author_email для админов)
     const amAdmin = !!Auth._state._isAdmin;
+    const pendingNotice = this.consumeCommentNotice(t.id);
 
     const charCards = CHARACTERISTICS.map(c=>{
       const cur = characteristicAvg(t,c.key);
@@ -1419,6 +1449,7 @@ async viewHome(){
                     </div>`
                 : html`<div class="empty">Чтобы оставить комментарий и оценку, нажмите «Войти» сверху.</div>`
               }
+              <div id="commentStatus" class="muted" style="margin-top:6px; min-height:18px;">${pendingNotice?.text || ''}</div>
             </div>
 
             <div class="hr"></div>
@@ -1429,6 +1460,19 @@ async viewHome(){
       </section>`;
 
     // обработчики профиля
+    const statusBox = document.getElementById('commentStatus');
+    const setStatus = (text = '', tone = 'muted') => {
+      if (!statusBox) return;
+      statusBox.textContent = text || '';
+      statusBox.style.color = tone === 'success' ? '#0a7c2d'
+        : tone === 'warn' ? '#9a3412'
+        : '#6b7280';
+    };
+    if (pendingNotice) {
+      setStatus(pendingNotice.text, pendingNotice.tone);
+    } else {
+      setStatus('', 'muted');
+    }
     $('#backBtn')?.addEventListener('click', ()=>history.back());
     for(const c of CHARACTERISTICS) for(const v of [1,2,3,4,5]){
       const el = document.getElementById(`stars-${c.key}-${v}`);
@@ -1453,21 +1497,43 @@ async viewHome(){
         return alert('Нужно написать комментарий или выбрать хотя бы одну оценку.');
       }
       try{
-        await API.publish({ teacherId:tid, text, ratings, author:'Student' });
-        App.resetPending(tid); await App.teacherProfile(null,tid);
+        setStatus('Отправляем...', 'muted');
+        const result = await API.publish({ teacherId:tid, text, ratings, author:'Student' });
+        const teacherPayload = result?.teacher && typeof result.teacher === 'object' ? result.teacher : null;
+        const pendingReview = !!result?.pendingReview;
+        this.setCommentNotice({
+          teacherId: tid,
+          text: pendingReview
+            ? 'Комментарий отправлен на модерацию — появится после проверки.'
+            : 'Комментарий опубликован!',
+          tone: pendingReview ? 'warn' : 'success'
+        });
+        App.resetPending(tid);
+        await App.teacherProfile(null,tid, teacherPayload);
         Auth.refreshStatsAndPopover();
       }catch(err){
         if (err?.message === 'rate_limited'){
           const sec = Math.max(1, Math.ceil((err.retry_after_ms ?? 60_000) / 1000));
+          setStatus(`Слишком часто. Попробуйте через ${sec} сек.`, 'warn');
           alert(`Слишком часто. \nПопробуйте через ${sec} сек.`);
         } else if (err?.message === 'profanity_forbidden') {
+          setStatus('Комментарий содержит запрещённую лексику. Исправьте текст и попробуйте снова.', 'warn');
           alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
         } else if (err?.message === 'commenting_banned' || err?.message === 'banned') {
+          setStatus('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.', 'warn');
           alert('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.');
+        } else if (err?.message === 'comment_blocked' || err?.code === 'comment_blocked') {
+          const reasonLabel = err?.reason === 'llm_block'
+            ? 'AI-модерация отклонила текст.'
+            : 'Комментарий не прошёл проверку.';
+          setStatus(reasonLabel, 'warn');
+          alert(reasonLabel);
         } else if (err?.code === 'toxic_comment' || (typeof err?.score === 'number' && err.score >= 0.5)) {
           const scoreText = typeof err.score === 'number' ? ` (вероятность токсичности: ${Math.round(err.score * 100)}%)` : '';
+          setStatus('Комментарий был отклонён системой модерации как токсичный.' + scoreText, 'warn');
           alert('Комментарий был отклонён системой модерации как токсичный.' + scoreText);
         } else {
+          setStatus('Не удалось опубликовать комментарий. Попробуйте позже.', 'warn');
           alert('Не удалось опубликовать :(');
         }
       }
@@ -2408,6 +2474,7 @@ async viewHome(){
 
   applyShopStateToAuth(shopState) {
     if (!shopState) return;
+    const baseDisplay = Auth._state.username || (Auth._state.email ? Auth._state.email.split('@')[0] : '') || Auth._state.display_name || 'Student';
     const update = {
       available_coins: Number(shopState.balance ?? Auth._state.available_coins),
       earned_coins: Number(shopState.earnedCoins ?? Auth._state.earned_coins),
@@ -2415,6 +2482,8 @@ async viewHome(){
     };
     if (shopState.activeNickname) {
       update.display_name = shopState.activeNickname;
+    } else {
+      update.display_name = baseDisplay;
     }
     Auth.set(update);
   },

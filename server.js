@@ -1142,19 +1142,18 @@ app.get('/api/home', (req, res) => {
   res.json({ characteristics, departments });
 });
 
-app.get('/api/teacher/:id',(req,res)=>{
-  const t = getTeacherById(req.params.id);
-  if(!t) return res.status(404).json({error:'not_found'});
+function buildTeacherPayload(teacherRow, req) {
+  if (!teacherRow) return null;
 
-  const ratings = getRatingsForTeacher(t.id);
-  const commentsRaw = getCommentsForTeacher(t.id);
+  const ratings = getRatingsForTeacher(teacherRow.id);
+  const commentsRaw = getCommentsForTeacher(teacherRow.id);
 
   const u = getUserFromRequest(req);
   const myId = u?.id || null;
   const amAdmin = isAdminUser(u);
 
-  const ids = commentsRaw.map(c=>String(c.id));
-  const {counts, myVotes} = countVotesForCommentBulk(ids, myId);
+  const ids = commentsRaw.map(c => String(c.id));
+  const { counts, myVotes } = countVotesForCommentBulk(ids, myId);
 
   const userCache = new Map();
   const resolveUser = (uid) => {
@@ -1166,7 +1165,7 @@ app.get('/api/teacher/:id',(req,res)=>{
     return userCache.get(key);
   };
 
-  const comments = commentsRaw.map(c=>{
+  const comments = commentsRaw.map(c => {
     const authorUser = c.author_uid ? resolveUser(c.author_uid) : null;
     const activeNick = authorUser ? getActiveNickname(authorUser.id) : null;
     const displayAuthor = activeNick || 'Аноним';
@@ -1178,16 +1177,16 @@ app.get('/api/teacher/:id',(req,res)=>{
       author: c.author,
       authorDisplay: displayAuthor,
       text: c.text,
-      likes: (counts[String(c.id)]?.likes)||0,
-      dislikes: (counts[String(c.id)]?.dislikes)||0,
+      likes: (counts[String(c.id)]?.likes) || 0,
+      dislikes: (counts[String(c.id)]?.dislikes) || 0,
       myVote: Number(myVotes[String(c.id)] ?? 0),
-      isOwn: !!(myId && c.author_uid && String(c.author_uid)===String(myId))
+      isOwn: !!(myId && c.author_uid && String(c.author_uid) === String(myId))
     };
     if (amAdmin) {
       const au = authorUser;
       return {
         ...base,
-        author_uid: c.author_uid||'',
+        author_uid: c.author_uid || '',
         author_email: au?.email || '',
         author_display: displayAuthor
       };
@@ -1195,14 +1194,24 @@ app.get('/api/teacher/:id',(req,res)=>{
     return base;
   });
 
-  const teacher = normalizeTeacherRow(t);
+  const teacher = normalizeTeacherRow(teacherRow);
 
-  res.json({
+  return {
     ...teacher,
     ratings,
     comments,
     overall: overall(ratings)
-  });
+  };
+}
+
+app.get('/api/teacher/:id',(req,res)=>{
+  const t = getTeacherById(req.params.id);
+  if(!t) return res.status(404).json({error:'not_found'});
+
+  const payload = buildTeacherPayload(t, req);
+  if (!payload) return res.status(404).json({error:'not_found'});
+
+  res.json(payload);
 });
 
 
@@ -1337,22 +1346,11 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       }
     }
 
-    // Формируем и отдаем ответ в формате новой версии проекта
-    const retRatings = typeof getRatingsForTeacher === 'function' ? getRatingsForTeacher(teacherId) : {};
-    const comments = typeof getCommentsForTeacher === 'function' ? getCommentsForTeacher(teacherId) : [];
-
-    const teacher = normalizeTeacherRow(t);
-
     return res.json({
       ok: true,
       pendingReview: !!queuedReviewId,
       reviewId: queuedReviewId || undefined,
-      teacher: {
-        ...teacher,
-        ratings: retRatings,
-        comments,
-        overall: typeof overall === 'function' ? overall(retRatings) : null
-      }
+      teacher: buildTeacherPayload(t, req)
     });
   } catch (err) {
     console.error('Unhandled error in /api/comment-with-ratings:', err && err.stack ? err.stack : err);
