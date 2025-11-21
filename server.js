@@ -317,6 +317,29 @@ function normalizeSubjectsList(value) {
     .slice(0, 15);
 }
 
+function normalizeDepartmentKey(value) {
+  return sanitizeRequestField(value, 160).toLowerCase();
+}
+
+function getDepartmentList() {
+  const teachers = getAllTeachers();
+  const set = new Set();
+  for (const t of teachers) {
+    const dept = sanitizeRequestField(t.department, 160);
+    if (dept) set.add(dept);
+  }
+  return Array.from(set);
+}
+
+function buildDepartmentsLookup() {
+  const map = new Map();
+  for (const dept of getDepartmentList()) {
+    const key = normalizeDepartmentKey(dept);
+    if (key) map.set(key, dept);
+  }
+  return map;
+}
+
 async function callTelegramApi(method, payload) {
   if (!TELEGRAM_BOT_TOKEN) {
     const err = new Error('telegram_not_configured');
@@ -1010,9 +1033,9 @@ function extractPureEmail(s){
 /* --- PUBLIC API --- */
 
 app.get('/api/departments',(req,res)=>{
-  const teachers = getAllTeachers();
-  const set = new Set(teachers.map(t=>t.department).filter(Boolean));
-  res.json({departments:[...set].sort(new Intl.Collator('ru',{sensitivity:'base'}).compare)});
+  const collator = new Intl.Collator('ru',{sensitivity:'base'});
+  const departments = getDepartmentList().sort(collator.compare);
+  res.json({departments});
 });
 
 /**
@@ -1413,7 +1436,7 @@ app.post('/api/teacher-request', (req, res) => {
       const lastName = sanitizeRequestField(fields.lastName, 120);
       const firstName = sanitizeRequestField(fields.firstName, 120);
       const patronymic = sanitizeRequestField(fields.patronymic, 120);
-      const department = sanitizeRequestField(fields.department, 160);
+      const departmentKey = normalizeDepartmentKey(fields.department);
       const subjects = normalizeSubjectsList(fields.subjects);
       const submitterName = sanitizeRequestField(fields.submitterName, 160);
       const submitterContact = sanitizeRequestField(fields.submitterContact, 160);
@@ -1422,11 +1445,20 @@ app.post('/api/teacher-request', (req, res) => {
       if (!lastName || !firstName) {
         return res.status(400).json({ ok: false, error: 'missing_name' });
       }
-      if (!department) {
+      if (!departmentKey) {
         return res.status(400).json({ ok: false, error: 'missing_department' });
       }
       if (!subjects.length) {
         return res.status(400).json({ ok: false, error: 'missing_subjects' });
+      }
+
+      const departmentsLookup = buildDepartmentsLookup();
+      if (!departmentsLookup.size) {
+        return res.status(503).json({ ok: false, error: 'departments_unavailable' });
+      }
+      const department = departmentsLookup.get(departmentKey);
+      if (!department) {
+        return res.status(400).json({ ok: false, error: 'invalid_department' });
       }
 
       const payload = {

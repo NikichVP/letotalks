@@ -965,8 +965,13 @@ async viewHome(){
                 <input id="reqPatronymic" name="patronymic" type="text" maxlength="120" placeholder="Иванович">
               </div>
               <div class="teacher-request-field">
-                <label for="reqDepartment">Кафедра*</label>
-                <input id="reqDepartment" name="department" type="text" maxlength="160" required placeholder="Математика">
+                <label for="reqDeptBtn">Кафедра*</label>
+                <div class="select custom-select" id="reqDeptSelectWrap">
+                  <button id="reqDeptBtn" class="select-btn" type="button" disabled aria-haspopup="listbox" aria-expanded="false">Загрузка списка кафедр...</button>
+                  <div id="reqDeptMenu" class="select-menu hidden" role="listbox" aria-label="Кафедры для заявки"></div>
+                </div>
+                <input type="hidden" id="reqDepartment" name="department" value="">
+                <div class="teacher-request-hint">Выберите существующую кафедру из списка.</div>
               </div>
               <div class="teacher-request-field">
                 <label for="reqSubjects">Предметы*</label>
@@ -991,7 +996,7 @@ async viewHome(){
               <input id="reqPhoto" name="photo" type="file" accept="image/jpeg,image/png,image/webp">
             </div>
             <div class="teacher-request-actions">
-              <button type="submit" class="btn primary" id="teacherRequestSubmit">Отправить заявку</button>
+              <button type="submit" class="btn primary" id="teacherRequestSubmit" disabled>Отправить заявку</button>
               <button type="button" class="btn outline" id="teacherRequestCancel">Отмена</button>
             </div>
             <div class="teacher-request-note muted">* — обязательные поля. Отправляя заявку, вы подтверждаете корректность данных.</div>
@@ -1001,6 +1006,7 @@ async viewHome(){
       </section>
     `;
     this.bindTeacherRequestForm();
+    this.loadRequestDepartments();
   },
 
   bindTeacherRequestForm(){
@@ -1014,6 +1020,108 @@ async viewHome(){
     $('#teacherRequestCancel')?.addEventListener('click', ()=>Router.go('/'));
   },
 
+  async loadRequestDepartments(){
+    const btn = $('#reqDeptBtn');
+    const menu = $('#reqDeptMenu');
+    const wrap = $('#reqDeptSelectWrap');
+    const hidden = $('#reqDepartment');
+    const submitBtn = $('#teacherRequestSubmit');
+    if (!btn || !menu || !hidden) return;
+
+    if (!btn.dataset.defaultLabel) {
+      btn.dataset.defaultLabel = 'Выберите кафедру';
+    }
+    const defaultBtnLabel = btn.dataset.defaultLabel || 'Выберите кафедру';
+
+    if (submitBtn && !submitBtn.dataset.defaultText) {
+      submitBtn.dataset.defaultText = submitBtn.textContent || 'Отправить заявку';
+    }
+    const defaultSubmitText = submitBtn?.dataset.defaultText || 'Отправить заявку';
+    const setSubmitState = (disabled, text) => {
+      if (!submitBtn) return;
+      submitBtn.disabled = !!disabled;
+      if (text) submitBtn.textContent = text;
+    };
+
+    const setButtonState = ({ disabled = false, text = 'Выберите кафедру', expanded = false }) => {
+      btn.disabled = !!disabled;
+      btn.textContent = text;
+      btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      if (expanded) {
+        menu.classList.remove('hidden');
+      } else {
+        menu.classList.add('hidden');
+      }
+    };
+
+    const closeMenu = () => setButtonState({ disabled: btn.disabled, text: btn.textContent, expanded: false });
+
+    setSubmitState(true, 'Загрузка...');
+    setButtonState({ disabled: true, text: 'Загрузка списка кафедр...' });
+    hidden.value = '';
+    menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Загрузка...</div>';
+
+    const escapeHtml = (v)=>String(v ?? '').replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch] || ch));
+    const escapeAttr = (v)=>escapeHtml(v).replace(/\"/g,'&quot;');
+
+    try {
+      const departments = await this.getDepartments();
+      if (!Array.isArray(departments) || !departments.length) {
+        this.setTeacherRequestFeedback('Список кафедр сейчас недоступен. Попробуйте обновить страницу позже.', 'error');
+        menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Список кафедр недоступен</div>';
+        return;
+      }
+      const options = departments.map(d=>`<button type="button" class="select-item" role="option" data-value="${escapeAttr(d)}">${escapeHtml(d)}</button>`);
+      menu.innerHTML = options.join('');
+      setButtonState({ disabled: false, text: defaultBtnLabel });
+      setSubmitState(false, defaultSubmitText);
+
+      const onSelect = (value, label) => {
+        hidden.value = value;
+        btn.textContent = label || defaultBtnLabel;
+        closeMenu();
+        menu.querySelectorAll('.select-item').forEach(it => it.setAttribute('aria-selected', it.dataset.value === value ? 'true' : 'false'));
+      };
+
+      menu.onclick = (e) => {
+        const it = e.target.closest('.select-item'); if (!it) return;
+        const val = it.dataset.value || '';
+        if (!val) return;
+        onSelect(val, it.textContent.trim());
+      };
+
+      btn.onclick = () => {
+        if (btn.disabled) return;
+        const willExpand = menu.classList.contains('hidden');
+        setButtonState({ disabled: false, text: btn.textContent, expanded: willExpand });
+      };
+
+      if (!this._reqDeptDocHandlersAttached) {
+        const closeReqDeptMenu = () => {
+          const btnEl = $('#reqDeptBtn');
+          const menuEl = $('#reqDeptMenu');
+          if (btnEl) btnEl.setAttribute('aria-expanded','false');
+          if (menuEl) menuEl.classList.add('hidden');
+        };
+        document.addEventListener('click', (e)=>{
+          if (!e.target.closest('#reqDeptSelectWrap')) closeReqDeptMenu();
+        });
+        document.addEventListener('keydown', (e)=>{
+          if (e.key === 'Escape') closeReqDeptMenu();
+        });
+        this._reqDeptDocHandlersAttached = true;
+      }
+    } catch (err) {
+      console.warn('Не удалось загрузить список кафедр для заявки', err);
+      this.setTeacherRequestFeedback('Не удалось загрузить список кафедр. Попробуйте обновить страницу.', 'error');
+      menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Список кафедр недоступен</div>';
+    } finally {
+      if (btn.disabled) {
+        setSubmitState(true, defaultSubmitText);
+      }
+    }
+  },
+
   setTeacherRequestFeedback(message, type=''){
     const box = $('#teacherRequestFeedback');
     if (!box) return;
@@ -1025,7 +1133,9 @@ async viewHome(){
   teacherRequestErrorText(code, description){
     const map = {
       missing_name: 'Укажите фамилию и имя учителя.',
-      missing_department: 'Укажите кафедру учителя.',
+      missing_department: 'Выберите кафедру учителя из списка.',
+      invalid_department: 'Выберите кафедру из списка, новые не принимаются.',
+      departments_unavailable: 'Список кафедр недоступен. Попробуйте позже.',
       missing_subjects: 'Добавьте хотя бы один предмет.',
       photo_too_large: 'Фото превышает лимит в 5 МБ.',
       unsupported_photo_type: 'Допускаются только изображения в форматах JPG, PNG или WebP.',
@@ -1041,8 +1151,15 @@ async viewHome(){
   async submitTeacherRequestForm(form){
     const submitBtn = $('#teacherRequestSubmit');
     if (submitBtn?.disabled) return;
+    const departmentInput = $('#reqDepartment');
+    const departmentButton = $('#reqDeptBtn');
 
     this.setTeacherRequestFeedback('');
+
+    if (departmentButton?.disabled) {
+      this.setTeacherRequestFeedback('Дождитесь загрузки списка кафедр.', 'error');
+      return;
+    }
 
     if (!form.reportValidity()) {
       return;
@@ -1051,13 +1168,19 @@ async viewHome(){
     const lastName = $('#reqLastName')?.value?.trim() || '';
     const firstName = $('#reqFirstName')?.value?.trim() || '';
     const patronymic = $('#reqPatronymic')?.value?.trim() || '';
-    const department = $('#reqDepartment')?.value?.trim() || '';
+    const department = departmentInput?.value?.trim() || '';
     const subjectsRaw = $('#reqSubjects')?.value || '';
     const subjectsValue = subjectsRaw.trim();
     const submitterName = $('#reqSubmitterName')?.value?.trim() || '';
     const submitterContact = $('#reqSubmitterContact')?.value?.trim() || '';
     const notes = $('#reqNotes')?.value?.trim() || '';
     const subjectsClean = subjectsValue.split(/[,|\n]+/).map(s=>s.trim()).filter(Boolean).join(', ');
+
+    if (!department) {
+      this.setTeacherRequestFeedback('Выберите кафедру из списка.', 'error');
+      departmentButton?.focus();
+      return;
+    }
 
     if (!subjectsClean) {
       this.setTeacherRequestFeedback('Добавьте хотя бы один предмет.', 'error');
@@ -1104,6 +1227,16 @@ async viewHome(){
       }
       const response = await API.teacherRequest(formData);
       form.reset();
+      const deptBtn = $('#reqDeptBtn');
+      const deptMenu = $('#reqDeptMenu');
+      const deptHidden = $('#reqDepartment');
+      if (deptHidden) deptHidden.value = '';
+      if (deptBtn) {
+        deptBtn.textContent = deptBtn.dataset.defaultLabel || 'Выберите кафедру';
+        deptBtn.setAttribute('aria-expanded','false');
+        deptBtn.disabled = false;
+      }
+      if (deptMenu) deptMenu.classList.add('hidden');
       this.setTeacherRequestFeedback(`Готово! Заявка отправлена модераторам${response?.requestId ? ` (ID: ${response.requestId})` : ''}.`, 'success');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
