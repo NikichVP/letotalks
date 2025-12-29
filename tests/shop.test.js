@@ -203,7 +203,7 @@ function createAuthedUser({
 
   db.prepare(`INSERT INTO sessions (id, token_hash, user_id, created_ts, last_activity_ts, expires_ts, ip, user_agent, is_active)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
-    .run(sessionId, tokenHash, userId, now, now, expiresTs, '127.0.0.1', 'tests');
+    .run(sessionId, tokenHash, userId, now, now, expiresTs, '127.0.0.1', 'node');
 
   return {
     userId,

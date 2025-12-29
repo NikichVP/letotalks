@@ -893,7 +893,7 @@ function createDbProcessing({
 
   function getUserSessions(userId) {
     const sessions = db.prepare(`
-      SELECT id, created_ts, last_activity_ts, expires_ts, ip, user_agent
+      SELECT id, token_hash, created_ts, last_activity_ts, expires_ts, ip, user_agent
       FROM sessions
       WHERE user_id = ? AND is_active = 1 AND expires_ts > ?
       ORDER BY last_activity_ts DESC

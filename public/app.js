@@ -239,6 +239,8 @@ const Auth = {
   key: 'letotalks:auth',
   _state: makeLoggedOutState(),
   _logoutInProgress: false,
+  _ready: false,
+  _readyPromise: null,
 
   _blankState(){ return makeLoggedOutState(); },
   clearPersisted(){
@@ -291,7 +293,20 @@ const Auth = {
       }
     }catch{
       this.set(this._blankState());
+    }finally{
+      this._ready = true;
     }
+  },
+
+  async ensure(){
+    if (this._ready) return;
+    if (!this._readyPromise){
+      this._readyPromise = this.me().finally(()=>{
+        this._ready = true;
+        this._readyPromise = null;
+      });
+    }
+    return this._readyPromise;
   },
 
   login(){ Router.go('/login'); },
@@ -723,7 +738,25 @@ const Router = {
   goHome(){ this.go('/'); },
 
   async match(){
+    await Auth.ensure();
     const h = location.hash.slice(1) || '/';
+    let pathName = h;
+    try{
+      const navUrl = new URL(h.startsWith('/') ? h : `/${h}`, location.origin);
+      pathName = navUrl.pathname || h;
+    }catch{
+      pathName = h.split('?')[0] || h;
+    }
+    const isLoginRoute = pathName === '/login';
+    const isPolicyRoute = pathName === '/policy';
+    if (!Auth.isLogged() && !(isLoginRoute || isPolicyRoute)) {
+      this.go('/login');
+      return;
+    }
+    if (Auth.isLogged() && isLoginRoute) {
+      this.go('/');
+      return;
+    }
     for (const r of this.routes) {
       const m = h.match(r.pattern);
       if (m) { await r.handler(...m); return; }
@@ -2917,13 +2950,14 @@ addEventListener('DOMContentLoaded', ()=>{
 
   $('#year').textContent = new Date().getFullYear();
   Auth.render();
-  Auth.me();
-  setInterval(()=>{ Auth.me().catch(()=>{}); }, AUTH_REFRESH_INTERVAL_MS);
-  document.addEventListener('visibilitychange', ()=>{
-    if (document.visibilityState === 'visible') {
-      Auth.me().catch(()=>{});
-    }
+  Auth.ensure().finally(()=>{
+    Router.init();
+    setInterval(()=>{ Auth.me().catch(()=>{}); }, AUTH_REFRESH_INTERVAL_MS);
+    document.addEventListener('visibilitychange', ()=>{
+      if (document.visibilityState === 'visible') {
+        Auth.me().catch(()=>{});
+      }
+    });
   });
-  Router.init();
   
 });

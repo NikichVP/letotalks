@@ -805,9 +805,17 @@ if (IS_PRODUCTION) {
   app.set('trust proxy', false);
 }
 
+function normalizeIp(ip) {
+  if (!ip) return '0.0.0.0';
+  const value = String(ip).trim();
+  if (value === '::1') return '127.0.0.1';
+  if (value.startsWith('::ffff:')) return value.slice(7);
+  return value;
+}
+
 function getClientIp(req){
   const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return xf || req.socket.remoteAddress || '0.0.0.0';
+  return normalizeIp(xf || req.socket.remoteAddress || '0.0.0.0');
 }
 
 function parseCookies(req){
@@ -874,31 +882,56 @@ function createSession(userId, req){
   return token;
 }
 
-function getUserFromRequest(req){
+function getUserFromRequest(req, res = null){
+  const response = res || req.res || null;
   const cookies = parseCookies(req);
   const token = cookies[SESSION_COOKIE];
   if (!token) return null;
 
   const tokenHash = hashToken(token);
   const session = getUserFromSessionTokenHash(tokenHash);
-  if (!session) return null;
+  if (!session) {
+    if (response) clearSessionCookie(response);
+    return null;
+  }
 
-  // Проверка IP (опционально, для усиленной безопасности)
   const currentIp = getClientIp(req);
+  const currentUa = String(req.headers['user-agent'] || '');
+
+  // Жёсткая привязка сессии к устройству (User-Agent) и IP
+  if (session.user_agent && currentUa && session.user_agent !== currentUa) {
+    logSecurityEvent('session_user_agent_mismatch', {
+      userId: session.user_id,
+      sessionUserAgent: session.user_agent,
+      requestUserAgent: currentUa,
+      ip: currentIp,
+      severity: 'warning'
+    });
+    deactivateSessionByHash(tokenHash);
+    if (response) clearSessionCookie(response);
+    return null;
+  }
+
   if (session.ip && session.ip !== currentIp) {
     logSecurityEvent('session_ip_mismatch', {
       userId: session.user_id,
       sessionIp: session.ip,
       requestIp: currentIp,
+      userAgent: currentUa,
       severity: 'warning'
     });
-    // Не блокируем, но логируем (IP может меняться легитимно)
+    deactivateSessionByHash(tokenHash);
+    if (response) clearSessionCookie(response);
+    return null;
   }
 
   // Обновляем время последней активности
   updateSessionActivity(session.id, Date.now());
 
   const user = findUserById(session.user_id);
+  if (!user && response) {
+    clearSessionCookie(response);
+  }
   return user || null;
 }
 
@@ -1987,10 +2020,13 @@ app.get('/api/admin/security/login-attempts', requireAdmin, (req,res)=>{
 
 // Просмотр собственных активных сессий
 app.get('/api/user/sessions', (req,res)=>{
-  const u = getUserFromRequest(req);
+  const u = getUserFromRequest(req, res);
   if (!u) return res.status(401).json({error:'unauthorized'});
 
   const sessions = getUserSessions(u.id);
+  const cookies = parseCookies(req);
+  const currentToken = cookies[SESSION_COOKIE] || null;
+  const currentTokenHash = currentToken ? hashToken(currentToken) : null;
 
   res.json({
     ok: true,
@@ -2001,7 +2037,7 @@ app.get('/api/user/sessions', (req,res)=>{
       expiresAt: new Date(s.expires_ts).toISOString(),
       ip: s.ip,
       userAgent: s.user_agent,
-      isCurrent: false // TODO: определять текущую сессию
+      isCurrent: currentTokenHash ? s.token_hash === currentTokenHash : false
     }))
   });
 });
