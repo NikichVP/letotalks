@@ -1,5 +1,5 @@
 // server.js — Node 18+ : npm i express better-sqlite3 bcrypt helmet express-rate-limit
-// http://localhost:3000
+// http://localhost:3001
 //
 // SQLite Database: letotalks.db
 // Фото: photos/  -> /photo/<file>
@@ -21,7 +21,7 @@ const { COMMENT_DECISIONS, moderateComment } = require('./comment_moderation');
 dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 const ROOT_DIR    = __dirname;
@@ -48,7 +48,7 @@ const DEFAULT_GPT_MODERATION_URL = (() => {
 const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERATION_URL;
 const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
 
-const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || 'redacted@example.com'|| 'redacted@example.com').trim().toLowerCase();
+const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
 const PASSWORD_LOGIN_EMAIL = 'redacted@example.com';
 const PASSWORD_LOGIN_SECRET = process.env.PASSWORD_LOGIN_SECRET || '';
 const PASSWORD_LOGIN_COOLDOWN_MS = 30_000;
@@ -2608,10 +2608,10 @@ function printStartupInfo(port = PORT) {
   console.log('');
 }
 
-function startServer(port = PORT, onListen = null) {
-  const server = app.listen(port, () => {
+function startServer(_port = PORT, onListen = null) {
+  const server = app.listen(PORT, () => {
     const address = server.address();
-    const actualPort = typeof address === 'object' && address ? address.port : port;
+    const actualPort = typeof address === 'object' && address ? address.port : PORT;
     printStartupInfo(actualPort);
     if (typeof onListen === 'function') {
       onListen(actualPort);
