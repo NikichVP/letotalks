@@ -1,6 +1,8 @@
 // app.js — SPA с авторизацией по почте, лайками/дизлайками, статистикой, админкой и предмодерацией
 const APP_VERSION = '2025-10-04-admin-2';
 const EMAIL_DOMAIN = '@student.letovo.ru';
+const PASSWORD_ATTEMPT_COOLDOWN_MS = 30_000;
+const AUTH_REFRESH_INTERVAL_MS = 60 * 1000; // чаще обновляем состояние (раз в минуту)
 
 const CHARACTERISTICS = [
   { key:'clarity',   name:'Понятно объясняет' },
@@ -42,6 +44,162 @@ function coinsOf(u){
   return normalized;
 }
 
+/* ---------- Глобальное поведение кликов: "последний запрос побеждает" ---------- */
+// Идея:
+// - Любой клик по кнопке/ссылке создаёт "группу запроса" с AbortController.
+// - Все fetch-запросы, начатые во время обработки этого клика, получают общий AbortSignal этой группы.
+// - Новый клик абортирует предыдущую группу (тем самым отменяя старые запросы), т. е. последний клик выигрывает.
+// - Кнопка/ссылка временно блокируется (anti-double-click) до завершения всех запросов этой группы или по таймауту.
+// Реализация максимально ненавязчивая: без изменения существующих вызовов fetch/обработчиков.
+
+(function setupLatestClickWins(){
+  if (typeof window === 'undefined') return;
+  if (window.__latestClickWinsInstalled) return;
+  window.__latestClickWinsInstalled = true;
+
+  // Утилита для слияния AbortSignal-ов
+  function mergeSignals() {
+    const signals = Array.from(arguments).filter(Boolean);
+    if (signals.length === 0) return undefined;
+    // Если один из сигналов уже абортирован — вернём контроллер с абортом
+    const ctrl = new AbortController();
+    const abortNow = ()=>{ try{ ctrl.abort(); }catch{} };
+    let aborted = false;
+    for (const s of signals){
+      if (s.aborted){ aborted = true; break; }
+    }
+    if (aborted){ abortNow(); return ctrl.signal; }
+    const onAbort = ()=>{ abortNow(); };
+    for (const s of signals){
+      try{ s.addEventListener('abort', onAbort, { once:true }); }catch{}
+    }
+    return ctrl.signal;
+  }
+
+  const state = {
+    currentGroup: null,   // { id, controller, active, el, restoreTimer }
+    nextId: 1,
+    // флаг указывает, что сейчас выполняется обработка клика и запросы относятся к currentGroup
+    inClickPhase: false,
+  };
+
+  function restoreElement(el){
+    if (!el) return;
+    try{
+      if (el.dataset._lcwWasDisabled === '1'){
+        // Это кнопка/инпут
+        el.disabled = false;
+      }
+      if (el.dataset._lcwWasAriaDisabled === '1'){
+        el.removeAttribute('aria-disabled');
+      }
+      if (el.dataset._lcwPrevPointerEvents !== undefined){
+        el.style.pointerEvents = el.dataset._lcwPrevPointerEvents;
+      }
+    }catch{}
+    delete el?.dataset._lcwWasDisabled;
+    delete el?.dataset._lcwWasAriaDisabled;
+    delete el?.dataset._lcwPrevPointerEvents;
+  }
+
+  function disableElement(el){
+    if (!el) return;
+    // Кнопки/инпуты могли быть реально disabled — не трогаем их состояние
+    const isButton = (el.tagName === 'BUTTON') ||
+      (el.tagName === 'INPUT' && ['button','submit'].includes((el.getAttribute('type')||'').toLowerCase()));
+    if (isButton && el.disabled) return;
+
+    // Вместо выставления disabled (что ломает обработчики) временно блокируем pointer-events
+    const prev = el.style.pointerEvents;
+    if (el.dataset._lcwPrevPointerEvents === undefined) {
+      el.dataset._lcwPrevPointerEvents = prev;
+    }
+    el.style.pointerEvents = 'none';
+    if (!el.hasAttribute('aria-disabled')) {
+      el.dataset._lcwWasAriaDisabled = '1';
+      el.setAttribute('aria-disabled','true');
+    }
+  }
+
+  function createNewGroup(clickedEl){
+    // Абортируем предыдущую группу
+    if (state.currentGroup){
+      try{ state.currentGroup.controller.abort(); }catch{}
+      // Восстановим предыдущую кнопку — даже если запросы ещё не стартовали
+      clearTimeout(state.currentGroup.restoreTimer);
+      restoreElement(state.currentGroup.el);
+    }
+    const grp = {
+      id: state.nextId++,
+      controller: new AbortController(),
+      active: 0,
+      el: clickedEl || null,
+      restoreTimer: null,
+    };
+    state.currentGroup = grp;
+    return grp;
+  }
+
+  // Патчим fetch один раз
+  if (!window.__originalFetch){
+    window.__originalFetch = window.fetch.bind(window);
+    window.fetch = function(input, init){
+      const i = init || {};
+      const grp = state.inClickPhase ? state.currentGroup : null;
+      let signal = i.signal;
+      if (grp){
+        // объединяем пользовательский сигнал и сигнал группы
+        signal = mergeSignals(i.signal, grp.controller.signal);
+        grp.active++;
+      }
+      const nextInit = signal ? { ...i, signal } : i;
+      const p = window.__originalFetch(input, nextInit);
+      if (grp){
+        const finalize = ()=>{
+          grp.active = Math.max(0, grp.active - 1);
+          // Если все запросы группы завершены — восстановим элемент
+          if (grp.active === 0){
+            // Восстановление может быть вызвано синхронно — чуть отложим
+            queueMicrotask(()=>{
+              // Восстанавливаем только если это всё ещё актуальная группа
+              if (state.currentGroup && state.currentGroup.id === grp.id){
+                restoreElement(grp.el);
+                clearTimeout(grp.restoreTimer);
+              }
+            });
+          }
+        };
+        p.finally(finalize);
+      }
+      return p;
+    };
+  }
+
+  // Глобальный перехват кликов (capture), чтобы он сработал раньше других
+  document.addEventListener('click', (e)=>{
+    try{
+      // Ищем кликабельную цель
+      const clickable = e.target && (e.target.closest('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+      // Создаём новую группу в любом случае — требование: для всех кнопок и действий
+      const grp = createNewGroup(clickable || null);
+      // Anti-double-click: временно блокируем элемент
+      disableElement(clickable);
+      state.inClickPhase = true;
+      // Если в рамках этого клика не начались никакие запросы, снимаем блокировку через таймаут
+      grp.restoreTimer = setTimeout(()=>{
+        if (state.currentGroup && state.currentGroup.id === grp.id && grp.active === 0){
+          restoreElement(grp.el);
+        }
+      }, 1500);
+      // По завершении текущего стека вызовов считаем, что "фаза клика" закончилась
+      queueMicrotask(()=>{ state.inClickPhase = false; });
+    }catch(err){
+      // Безопасно игнорируем ошибки перехвата
+      state.inClickPhase = false;
+    }
+  }, true); // capture
+})();
+
 /* ---------- client-side предмодерация (минимальная, но умная) ---------- */
 const BW_STEMS = ['бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон','пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'];
 const LAT2CYR = { a:'а',b:'в',c:'с',e:'е',h:'н',k:'к',m:'м',o:'о',p:'р',t:'т',x:'х',y:'у' };
@@ -54,10 +212,39 @@ function normBW(s){
 }
 function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); }
 
+function makeLoggedOutState(){
+  return {
+    loggedIn:false,
+    id:null,
+    email:null,
+    username:null,
+    display_name:null,
+    comment_count:0,
+    rating_count:0,
+    cast_likes:0,
+    cast_dislikes:0,
+    received_likes:0,
+    received_dislikes:0,
+    available_coins:0,
+    earned_coins:0,
+    spent_coins:0,
+    _isAdmin:false,
+    _isSuperAdmin:false,
+    _isBanned:false
+  };
+}
+
 /* ---------- auth (server-backed) ---------- */
 const Auth = {
   key: 'letotalks:auth',
-  _state: { loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false },
+  _state: makeLoggedOutState(),
+  _logoutInProgress: false,
+
+  _blankState(){ return makeLoggedOutState(); },
+  clearPersisted(){
+    if (typeof localStorage === 'undefined') return;
+    try{ localStorage.removeItem(this.key); }catch{}
+  },
 
   get(){ return this._state; },
   set(o){
@@ -70,7 +257,7 @@ const Auth = {
       merged.spent_coins = Math.max(0, merged.earned_coins - merged.available_coins);
     }
     this._state = merged;
-    try{ localStorage.setItem(this.key, JSON.stringify({ email: this._state.email })); }catch{}
+    this.clearPersisted();
     this.render();
     this.renderProfilePopover(); // обновление поповера
   },
@@ -100,10 +287,10 @@ const Auth = {
           _isBanned: !!j.user.is_banned
         });
       }else{
-        this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
+        this.set(this._blankState());
       }
     }catch{
-      this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
+      this.set(this._blankState());
     }
   },
 
@@ -111,8 +298,24 @@ const Auth = {
 
   async logout(){
     try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
-    this.set({ loggedIn:false, id:null, email:null, username:null, comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0, received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0, _isAdmin:false, _isSuperAdmin:false, _isBanned:false });
-    window.Router?.match();
+    const wasLoggedIn = !!this._state.loggedIn;
+    this.set(this._blankState());
+    if (wasLoggedIn) window.Router?.match();
+  },
+
+  async handleUnauthorized(reason = ''){
+    if (this._logoutInProgress) return;
+    const wasLoggedIn = !!this._state.loggedIn;
+    this._logoutInProgress = true;
+    try{
+      if (wasLoggedIn) {
+        try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
+      }
+    }finally{
+      this._logoutInProgress = false;
+    }
+    this.set(this._blankState());
+    if (wasLoggedIn) window.Router?.match();
   },
 
   isLogged(){ return !!this._state.loggedIn; },
@@ -259,6 +462,37 @@ const Auth = {
   }
 };
 
+// Глобально отслеживаем ответы сервера с признаком "unauthorized"
+(function setupUnauthorizedWatcher(){
+  if (typeof window === 'undefined') return;
+  if (window.__ltAuthWatcherInstalled) return;
+  window.__ltAuthWatcherInstalled = true;
+
+  function watchUnauthorized(res){
+    if (!res) return;
+    if (res.status === 401){
+      Auth.handleUnauthorized('status_401');
+      return;
+    }
+    const ct = res.headers?.get ? (res.headers.get('content-type') || '') : '';
+    if (!ct.includes('application/json')) return;
+    try{
+      res.clone().json().then(payload=>{
+        if (payload && payload.error === 'unauthorized'){
+          Auth.handleUnauthorized('payload_unauthorized');
+        }
+      }).catch(()=>{});
+    }catch{}
+  }
+
+  const prevFetch = window.fetch.bind(window);
+  window.fetch = async (...args)=>{
+    const response = await prevFetch(...args);
+    try{ watchUnauthorized(response); }catch{}
+    return response;
+  };
+})();
+
 /* ---------- api ---------- */
 const TEACHERS_CACHE_KEY = 'letotalks:cache:teachers';
 const TEACHERS_CACHE_TTL = 1000 * 60 * 3; // 3 minutes — balance freshness vs load
@@ -306,6 +540,45 @@ async function fetchTeachersFromServer() {
 
 const API = {
   async departments(){ const r=await fetch('/api/departments'); return (await r.json()).departments; },
+
+  /**
+   * Лёгкий запрос для главной страницы.
+   * Возвращает только минимально необходимый набор:
+   *  - top-3 по каждой характеристике
+   *  - top-3 по каждой кафедре
+   * Это позволяет не тянуть весь список учителей при первом посещении.
+   *
+   * @returns {Promise<{characteristics: Object<string, any[]>, departments: {name:string, list:any[]}[]}>}
+   */
+  async home(){
+    const r = await fetch('/api/home', { headers: { 'Cache-Control': 'no-cache' } });
+    if (!r.ok) throw new Error('home_fetch_failed');
+    return await r.json(); // { characteristics: {key:[]}, departments: [{name,list:[]}] }
+  },
+
+  /**
+   * Пагинированная выборка учителей.
+   * Используется для страницы «Все учителя» и аналогичных лент с бесконечной подгрузкой.
+   *
+   * @param {Object} [opts]
+   * @param {number} [opts.limit=30] - размер страницы (макс. 200 на сервере)
+   * @param {number} [opts.offset=0] - смещение
+   * @param {string} [opts.q=''] - строка поиска по ФИО
+   * @param {string} [opts.department=''] - фильтр по кафедре (точное совпадение)
+   * @returns {Promise<{teachers:any[], total:number}>}
+   */
+  async teachersPage({ limit = 30, offset = 0, q = '', department = '' } = {}){
+    const p = new URLSearchParams();
+    if (limit) p.set('limit', String(limit));
+    if (offset) p.set('offset', String(offset));
+    if (q) p.set('q', String(q));
+    if (department) p.set('department', String(department));
+    const r = await fetch(`/api/teachers?${p.toString()}`, { headers: { 'Cache-Control': 'no-cache' } });
+    if (!r.ok) throw new Error('teachers_page_fetch_failed');
+    const j = await r.json().catch(()=>({ teachers: [], total: 0 }));
+    return { teachers: Array.isArray(j?.teachers) ? j.teachers : [], total: Number(j?.total||0) };
+  },
+
   async teachers(options = {}){
     const { force = false } = options;
     const now = Date.now();
@@ -368,7 +641,13 @@ const API = {
     teacherCacheState.promise = null;
     clearTeacherCacheInStorage();
   },
-  async teacher(id){ const r=await fetch(`/api/teacher/${id}`); return await r.json(); },
+  async teacher(id){
+    const r = await fetch(`/api/teacher/${id}`, {
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' }
+    });
+    return await r.json();
+  },
   async publish({teacherId, text, ratings, author}) {
     const r = await fetch('/api/comment-with-ratings', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -378,6 +657,9 @@ const API = {
       let payload = null;
       try { payload = await r.json(); } catch {}
       const err = new Error(payload?.error || 'publish_failed');
+      if (payload?.error) err.code = payload.error;
+      if (payload?.reason) err.reason = payload.reason;
+      if (payload?.score != null) err.score = payload.score;
       if (payload?.retry_after_ms != null) err.retry_after_ms = payload.retry_after_ms;
       if (payload?.message) err.message = payload.message; // e.g. commenting_banned
       throw err;
@@ -481,20 +763,51 @@ const App = {
     }
   },
 
-  async getDepartments(options = {}){
-    const teachers = await this.getTeachers(options);
-    const set = new Set();
-    for (const t of teachers) {
-      const dept = t?.department ? String(t.department).trim() : '';
-      if (dept) set.add(dept);
+  /**
+   * Список кафедр берём напрямую с сервера,
+   * чтобы не требовать предварительной загрузки всех учителей.
+   */
+  async getDepartments(){
+    try{
+      const list = await API.departments();
+      return Array.isArray(list) ? list : [];
+    }catch{
+      return [];
     }
-    return Array.from(set).sort(collator.compare);
   },
 
   async mountNavbar(){
     const btn  = $('#deptBtn');
     const menu = $('#deptMenu');
+    const searchInput = $('#searchInput');
     if (!btn || !menu) return;
+
+    const defaultDeptLabel = 'Кафедры…';
+    let currentPath = '/';
+    let currentSearch = '';
+    let currentDepartment = '';
+
+    try{
+      const hash = (location.hash || '').slice(1) || '/';
+      const navUrl = new URL(hash.startsWith('/') ? hash : `/${hash}`, location.origin);
+      currentPath = navUrl.pathname || '/';
+      if (currentPath === '/search') {
+        currentSearch = navUrl.searchParams.get('q') || '';
+      }
+      if (currentPath.startsWith('/department/')) {
+        currentDepartment = decodeURIComponent(currentPath.replace('/department/',''));
+      }
+    }catch{}
+
+    if (searchInput) {
+      searchInput.value = currentPath === '/search' ? currentSearch : '';
+    }
+
+    if (btn) {
+      btn.textContent = currentDepartment || defaultDeptLabel;
+      btn.setAttribute('aria-expanded','false');
+    }
+    menu.classList.add('hidden');
 
     const deps = await this.getDepartments();
     menu.innerHTML =
@@ -546,22 +859,30 @@ const App = {
     });
   },
 
+  /**
+   * Главная страница: используем лёгкий API-пакет через API.home(),
+   * чтобы не загружать полный список учителей при первом визите.
+   */
 async viewHome(){
   await this.mountNavbar();
-  const all = await this.getTeachers();
-  const teachers = Array.isArray(all) ? all : [];
+  // Лёгкая загрузка данных для главной страницы
+  let homeData = null;
+  try{ homeData = await API.home(); }catch{ homeData = { characteristics:{}, departments:[] }; }
 
   const charCards = CHARACTERISTICS.map(c=>{
-    const sorted = this.sortByValueThenAlpha([...teachers], t=>characteristicAvg(t,c.key)).slice(0,3);
-    const preview = sorted.map(t=>html`
+    const list = Array.isArray(homeData?.characteristics?.[c.key]) ? homeData.characteristics[c.key] : [];
+    const preview = list.map(t=>{
+      const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
+      return html`
       <div class="row" style="gap:10px;padding:8px 0">
         <div class="portrait"><img src="${t.photo||''}" alt=""></div>
         <div style="flex:1">
-          <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
           <div class="tdept">${t.department}</div>
         </div>
         <div>${fmtStars(characteristicAvg(t,c.key))}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     return html`
       <div class="card">
         <div class="card-header">
@@ -575,24 +896,27 @@ async viewHome(){
       </div>`;
   }).join('');
 
-  const deps = await this.getDepartments();
-  const deptCards = deps.map(d=>{
-    const list = this.sortByValueThenAlpha(teachers.filter(t=>t.department===d), t=>overall(t)).slice(0,3);
+  // Карточки по кафедрам берём уже подготовленными на сервере (первые 3 по каждой)
+  const deptCards = (Array.isArray(homeData?.departments)?homeData.departments:[]).map(d=>{
+    const list = Array.isArray(d.list)?d.list:[];
     if (!list.length) return '';
-    const preview = list.map(t=>html`
+    const preview = list.map(t=>{
+      const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
+      return html`
       <div class="row" style="gap:10px;padding:8px 0">
         <div class="portrait"><img src="${t.photo||''}" alt=""></div>
         <div style="flex:1">
-          <div class="tname">${[t.lastName,t.firstName].filter(Boolean).join(' ')}</div>
+          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
           <div class="tdept">${t.department}</div>
         </div>
         <div>${fmtStars(overall(t))}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     return html`
       <div class="card">
         <div class="card-header">
-          <h3>${d}</h3>
-          <a class="btn small primary" href="#/department/${encodeURIComponent(d)}">Все учителя</a>
+          <h3>${d.name}</h3>
+          <a class="btn small primary" href="#/department/${encodeURIComponent(d.name)}">Все учителя</a>
         </div>
         <div class="card-content">
           <div class="hr"></div>
@@ -641,8 +965,13 @@ async viewHome(){
                 <input id="reqPatronymic" name="patronymic" type="text" maxlength="120" placeholder="Иванович">
               </div>
               <div class="teacher-request-field">
-                <label for="reqDepartment">Кафедра*</label>
-                <input id="reqDepartment" name="department" type="text" maxlength="160" required placeholder="Математика">
+                <label for="reqDeptBtn">Кафедра*</label>
+                <div class="select custom-select" id="reqDeptSelectWrap">
+                  <button id="reqDeptBtn" class="select-btn" type="button" disabled aria-haspopup="listbox" aria-expanded="false">Загрузка списка кафедр...</button>
+                  <div id="reqDeptMenu" class="select-menu hidden" role="listbox" aria-label="Кафедры для заявки"></div>
+                </div>
+                <input type="hidden" id="reqDepartment" name="department" value="">
+                <div class="teacher-request-hint">Выберите существующую кафедру из списка.</div>
               </div>
               <div class="teacher-request-field">
                 <label for="reqSubjects">Предметы*</label>
@@ -667,7 +996,7 @@ async viewHome(){
               <input id="reqPhoto" name="photo" type="file" accept="image/jpeg,image/png,image/webp">
             </div>
             <div class="teacher-request-actions">
-              <button type="submit" class="btn primary" id="teacherRequestSubmit">Отправить заявку</button>
+              <button type="submit" class="btn primary" id="teacherRequestSubmit" disabled>Отправить заявку</button>
               <button type="button" class="btn outline" id="teacherRequestCancel">Отмена</button>
             </div>
             <div class="teacher-request-note muted">* — обязательные поля. Отправляя заявку, вы подтверждаете корректность данных.</div>
@@ -677,6 +1006,7 @@ async viewHome(){
       </section>
     `;
     this.bindTeacherRequestForm();
+    this.loadRequestDepartments();
   },
 
   bindTeacherRequestForm(){
@@ -690,6 +1020,108 @@ async viewHome(){
     $('#teacherRequestCancel')?.addEventListener('click', ()=>Router.go('/'));
   },
 
+  async loadRequestDepartments(){
+    const btn = $('#reqDeptBtn');
+    const menu = $('#reqDeptMenu');
+    const wrap = $('#reqDeptSelectWrap');
+    const hidden = $('#reqDepartment');
+    const submitBtn = $('#teacherRequestSubmit');
+    if (!btn || !menu || !hidden) return;
+
+    if (!btn.dataset.defaultLabel) {
+      btn.dataset.defaultLabel = 'Выберите кафедру';
+    }
+    const defaultBtnLabel = btn.dataset.defaultLabel || 'Выберите кафедру';
+
+    if (submitBtn && !submitBtn.dataset.defaultText) {
+      submitBtn.dataset.defaultText = submitBtn.textContent || 'Отправить заявку';
+    }
+    const defaultSubmitText = submitBtn?.dataset.defaultText || 'Отправить заявку';
+    const setSubmitState = (disabled, text) => {
+      if (!submitBtn) return;
+      submitBtn.disabled = !!disabled;
+      if (text) submitBtn.textContent = text;
+    };
+
+    const setButtonState = ({ disabled = false, text = 'Выберите кафедру', expanded = false }) => {
+      btn.disabled = !!disabled;
+      btn.textContent = text;
+      btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      if (expanded) {
+        menu.classList.remove('hidden');
+      } else {
+        menu.classList.add('hidden');
+      }
+    };
+
+    const closeMenu = () => setButtonState({ disabled: btn.disabled, text: btn.textContent, expanded: false });
+
+    setSubmitState(true, 'Загрузка...');
+    setButtonState({ disabled: true, text: 'Загрузка списка кафедр...' });
+    hidden.value = '';
+    menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Загрузка...</div>';
+
+    const escapeHtml = (v)=>String(v ?? '').replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch] || ch));
+    const escapeAttr = (v)=>escapeHtml(v).replace(/\"/g,'&quot;');
+
+    try {
+      const departments = await this.getDepartments();
+      if (!Array.isArray(departments) || !departments.length) {
+        this.setTeacherRequestFeedback('Список кафедр сейчас недоступен. Попробуйте обновить страницу позже.', 'error');
+        menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Список кафедр недоступен</div>';
+        return;
+      }
+      const options = departments.map(d=>`<button type="button" class="select-item" role="option" data-value="${escapeAttr(d)}">${escapeHtml(d)}</button>`);
+      menu.innerHTML = options.join('');
+      setButtonState({ disabled: false, text: defaultBtnLabel });
+      setSubmitState(false, defaultSubmitText);
+
+      const onSelect = (value, label) => {
+        hidden.value = value;
+        btn.textContent = label || defaultBtnLabel;
+        closeMenu();
+        menu.querySelectorAll('.select-item').forEach(it => it.setAttribute('aria-selected', it.dataset.value === value ? 'true' : 'false'));
+      };
+
+      menu.onclick = (e) => {
+        const it = e.target.closest('.select-item'); if (!it) return;
+        const val = it.dataset.value || '';
+        if (!val) return;
+        onSelect(val, it.textContent.trim());
+      };
+
+      btn.onclick = () => {
+        if (btn.disabled) return;
+        const willExpand = menu.classList.contains('hidden');
+        setButtonState({ disabled: false, text: btn.textContent, expanded: willExpand });
+      };
+
+      if (!this._reqDeptDocHandlersAttached) {
+        const closeReqDeptMenu = () => {
+          const btnEl = $('#reqDeptBtn');
+          const menuEl = $('#reqDeptMenu');
+          if (btnEl) btnEl.setAttribute('aria-expanded','false');
+          if (menuEl) menuEl.classList.add('hidden');
+        };
+        document.addEventListener('click', (e)=>{
+          if (!e.target.closest('#reqDeptSelectWrap')) closeReqDeptMenu();
+        });
+        document.addEventListener('keydown', (e)=>{
+          if (e.key === 'Escape') closeReqDeptMenu();
+        });
+        this._reqDeptDocHandlersAttached = true;
+      }
+    } catch (err) {
+      console.warn('Не удалось загрузить список кафедр для заявки', err);
+      this.setTeacherRequestFeedback('Не удалось загрузить список кафедр. Попробуйте обновить страницу.', 'error');
+      menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Список кафедр недоступен</div>';
+    } finally {
+      if (btn.disabled) {
+        setSubmitState(true, defaultSubmitText);
+      }
+    }
+  },
+
   setTeacherRequestFeedback(message, type=''){
     const box = $('#teacherRequestFeedback');
     if (!box) return;
@@ -701,7 +1133,9 @@ async viewHome(){
   teacherRequestErrorText(code, description){
     const map = {
       missing_name: 'Укажите фамилию и имя учителя.',
-      missing_department: 'Укажите кафедру учителя.',
+      missing_department: 'Выберите кафедру учителя из списка.',
+      invalid_department: 'Выберите кафедру из списка, новые не принимаются.',
+      departments_unavailable: 'Список кафедр недоступен. Попробуйте позже.',
       missing_subjects: 'Добавьте хотя бы один предмет.',
       photo_too_large: 'Фото превышает лимит в 5 МБ.',
       unsupported_photo_type: 'Допускаются только изображения в форматах JPG, PNG или WebP.',
@@ -717,8 +1151,15 @@ async viewHome(){
   async submitTeacherRequestForm(form){
     const submitBtn = $('#teacherRequestSubmit');
     if (submitBtn?.disabled) return;
+    const departmentInput = $('#reqDepartment');
+    const departmentButton = $('#reqDeptBtn');
 
     this.setTeacherRequestFeedback('');
+
+    if (departmentButton?.disabled) {
+      this.setTeacherRequestFeedback('Дождитесь загрузки списка кафедр.', 'error');
+      return;
+    }
 
     if (!form.reportValidity()) {
       return;
@@ -727,13 +1168,19 @@ async viewHome(){
     const lastName = $('#reqLastName')?.value?.trim() || '';
     const firstName = $('#reqFirstName')?.value?.trim() || '';
     const patronymic = $('#reqPatronymic')?.value?.trim() || '';
-    const department = $('#reqDepartment')?.value?.trim() || '';
+    const department = departmentInput?.value?.trim() || '';
     const subjectsRaw = $('#reqSubjects')?.value || '';
     const subjectsValue = subjectsRaw.trim();
     const submitterName = $('#reqSubmitterName')?.value?.trim() || '';
     const submitterContact = $('#reqSubmitterContact')?.value?.trim() || '';
     const notes = $('#reqNotes')?.value?.trim() || '';
     const subjectsClean = subjectsValue.split(/[,|\n]+/).map(s=>s.trim()).filter(Boolean).join(', ');
+
+    if (!department) {
+      this.setTeacherRequestFeedback('Выберите кафедру из списка.', 'error');
+      departmentButton?.focus();
+      return;
+    }
 
     if (!subjectsClean) {
       this.setTeacherRequestFeedback('Добавьте хотя бы один предмет.', 'error');
@@ -780,6 +1227,16 @@ async viewHome(){
       }
       const response = await API.teacherRequest(formData);
       form.reset();
+      const deptBtn = $('#reqDeptBtn');
+      const deptMenu = $('#reqDeptMenu');
+      const deptHidden = $('#reqDepartment');
+      if (deptHidden) deptHidden.value = '';
+      if (deptBtn) {
+        deptBtn.textContent = deptBtn.dataset.defaultLabel || 'Выберите кафедру';
+        deptBtn.setAttribute('aria-expanded','false');
+        deptBtn.disabled = false;
+      }
+      if (deptMenu) deptMenu.classList.add('hidden');
       this.setTeacherRequestFeedback(`Готово! Заявка отправлена модераторам${response?.requestId ? ` (ID: ${response.requestId})` : ''}.`, 'success');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
@@ -797,21 +1254,79 @@ async viewHome(){
     }
   },
 
+  /**
+   * Страница «Все учителя» с бесконечной подгрузкой.
+   * Сначала грузим первые 30 элементов с сервера, далее — порциями по 30
+   * при пересечении наблюдаемого «сентинела» (IntersectionObserver).
+   */
   async listAll(){
     await this.mountNavbar();
-    const all = await this.getTeachers();
-    const list = Array.isArray(all) ? all : [];
-    const sorted = this.sortByValueThenAlpha([...list], t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
           <h2>Все учителя</h2>
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
-        <div class="list">
-          ${sorted.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('') || '<div class="empty">Пока нет учителей</div>'}
+        <div id="teacherList" class="list"></div>
+        <div id="infiniteFooter" class="muted" style="text-align:center;padding:12px 0">
+          <span id="loader">Загрузка…</span>
+          <span id="end" style="display:none">Это все</span>
+          <div id="sentinel" style="height:1px"></div>
         </div>
       </section>`;
+
+    // Узлы интерфейса списка и «футер» с индикаторами
+    const container = $('#teacherList');
+    const loader = $('#loader');
+    const endMark = $('#end');
+    const sentinel = $('#sentinel');
+
+    // Параметры пагинации и состояние
+    let limit = 30;
+    let offset = 0;
+    let total = Infinity;
+    let loading = false;
+    let list = [];
+
+    // Полная перерисовка текущего накопленного списка
+    const render = () => {
+      if (!list.length && offset===0 && total===0) {
+        container.innerHTML = '<div class="empty">Пока нет учителей</div>';
+      } else {
+        container.innerHTML = list.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('');
+      }
+    };
+
+    // Загрузить следующую страницу, если не идёт активная загрузка
+    const loadMore = async () => {
+      if (loading) return;
+      if (list.length >= total) return;
+      loading = true;
+      loader.style.display = '';
+      endMark.style.display = 'none';
+      try{
+        const { teachers, total: tot } = await API.teachersPage({ limit, offset });
+        total = Number.isFinite(tot) ? tot : tot || total;
+        list = list.concat(teachers);
+        offset += teachers.length;
+        render();
+      } finally {
+        loading = false;
+        loader.style.display = list.length < total ? '' : 'none';
+        endMark.style.display = list.length >= total && total>0 ? '' : 'none';
+      }
+    };
+
+    // Наблюдаем за «сентинелом» внизу списка и подгружаем при приближении
+    const io = new IntersectionObserver((entries)=>{
+      for (const e of entries){
+        if (e.isIntersecting) loadMore();
+      }
+    }, { rootMargin: '200px 0px' });
+    io.observe(sentinel);
+
+    // initial chunk
+    loadMore();
   },
 
   async listByCharacteristic(_, key){
@@ -960,14 +1475,35 @@ async viewHome(){
   setPending(tid,key,v){ if(!this.pendingRatings[tid]) this.pendingRatings[tid]={}; this.pendingRatings[tid][key]=v; },
   getPending(tid){ return this.pendingRatings[tid]||{}; },
   resetPending(tid){ this.pendingRatings[tid]={}; },
+  _lastCommentNotice: null,
+  setCommentNotice(notice){
+    if (notice && notice.teacherId) {
+      this._lastCommentNotice = {
+        teacherId: notice.teacherId,
+        text: String(notice.text || ''),
+        tone: notice.tone || 'muted'
+      };
+    } else {
+      this._lastCommentNotice = null;
+    }
+  },
+  consumeCommentNotice(teacherId){
+    if (this._lastCommentNotice && this._lastCommentNotice.teacherId === teacherId) {
+      const note = this._lastCommentNotice;
+      this._lastCommentNotice = null;
+      return note;
+    }
+    return null;
+  },
 
-  async teacherProfile(_, tid){
-    const data = await API.teacher(tid);
+  async teacherProfile(_, tid, prefetched){
+    const data = prefetched || await API.teacher(tid);
     if(!data || data.error){ Router.go('/'); return; }
     await this.mountNavbar();
 
     const t = data; // содержит comments с like/dislike агрегацией и myVote/own (+author_email для админов)
     const amAdmin = !!Auth._state._isAdmin;
+    const pendingNotice = this.consumeCommentNotice(t.id);
 
     const charCards = CHARACTERISTICS.map(c=>{
       const cur = characteristicAvg(t,c.key);
@@ -1046,6 +1582,7 @@ async viewHome(){
                     </div>`
                 : html`<div class="empty">Чтобы оставить комментарий и оценку, нажмите «Войти» сверху.</div>`
               }
+              <div id="commentStatus" class="muted" style="margin-top:6px; min-height:18px;">${pendingNotice?.text || ''}</div>
             </div>
 
             <div class="hr"></div>
@@ -1056,6 +1593,19 @@ async viewHome(){
       </section>`;
 
     // обработчики профиля
+    const statusBox = document.getElementById('commentStatus');
+    const setStatus = (text = '', tone = 'muted') => {
+      if (!statusBox) return;
+      statusBox.textContent = text || '';
+      statusBox.style.color = tone === 'success' ? '#0a7c2d'
+        : tone === 'warn' ? '#9a3412'
+        : '#6b7280';
+    };
+    if (pendingNotice) {
+      setStatus(pendingNotice.text, pendingNotice.tone);
+    } else {
+      setStatus('', 'muted');
+    }
     $('#backBtn')?.addEventListener('click', ()=>history.back());
     for(const c of CHARACTERISTICS) for(const v of [1,2,3,4,5]){
       const el = document.getElementById(`stars-${c.key}-${v}`);
@@ -1080,21 +1630,43 @@ async viewHome(){
         return alert('Нужно написать комментарий или выбрать хотя бы одну оценку.');
       }
       try{
-        await API.publish({ teacherId:tid, text, ratings, author:'Student' });
-        App.resetPending(tid); await App.teacherProfile(null,tid);
+        setStatus('Отправляем...', 'muted');
+        const result = await API.publish({ teacherId:tid, text, ratings, author:'Student' });
+        const teacherPayload = result?.teacher && typeof result.teacher === 'object' ? result.teacher : null;
+        const pendingReview = !!result?.pendingReview;
+        this.setCommentNotice({
+          teacherId: tid,
+          text: pendingReview
+            ? 'Комментарий отправлен на модерацию — появится после проверки.'
+            : 'Комментарий опубликован!',
+          tone: pendingReview ? 'warn' : 'success'
+        });
+        App.resetPending(tid);
+        await App.teacherProfile(null,tid, teacherPayload);
         Auth.refreshStatsAndPopover();
       }catch(err){
         if (err?.message === 'rate_limited'){
           const sec = Math.max(1, Math.ceil((err.retry_after_ms ?? 60_000) / 1000));
+          setStatus(`Слишком часто. Попробуйте через ${sec} сек.`, 'warn');
           alert(`Слишком часто. \nПопробуйте через ${sec} сек.`);
         } else if (err?.message === 'profanity_forbidden') {
+          setStatus('Комментарий содержит запрещённую лексику. Исправьте текст и попробуйте снова.', 'warn');
           alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
         } else if (err?.message === 'commenting_banned' || err?.message === 'banned') {
+          setStatus('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.', 'warn');
           alert('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.');
+        } else if (err?.message === 'comment_blocked' || err?.code === 'comment_blocked') {
+          const reasonLabel = err?.reason === 'llm_block'
+            ? 'AI-модерация отклонила текст.'
+            : 'Комментарий не прошёл проверку.';
+          setStatus(reasonLabel, 'warn');
+          alert(reasonLabel);
         } else if (err?.code === 'toxic_comment' || (typeof err?.score === 'number' && err.score >= 0.5)) {
           const scoreText = typeof err.score === 'number' ? ` (вероятность токсичности: ${Math.round(err.score * 100)}%)` : '';
+          setStatus('Комментарий был отклонён системой модерации как токсичный.' + scoreText, 'warn');
           alert('Комментарий был отклонён системой модерации как токсичный.' + scoreText);
         } else {
+          setStatus('Не удалось опубликовать комментарий. Попробуйте позже.', 'warn');
           alert('Не удалось опубликовать :(');
         }
       }
@@ -1210,16 +1782,17 @@ async viewHome(){
           </div>
 
           <div id="stageActive" class="hidden">
-            <div class="row wrap" style="gap:12px; align-items:flex-start">
-              <div>
-                <div class="muted">Временный адрес</div>
-                <div id="tmpEmail" class="badge" style="user-select:all"></div>
+            <div class="row wrap" style="gap:20px; align-items:flex-start">
+              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 200px;">
+                <div class="muted" style="margin-bottom: 4px;">Временный адрес</div>
+                <div id="tmpEmail" class="badge" style="user-select:all; margin-bottom: 4px;"></div>
+                <button id="copyEmail" class="btn small outline">Скопировать адрес</button>
               </div>
-              <div>
-                <div class="muted">Ваш код</div>
-                <div id="tmpCode" class="badge" style="user-select:all"></div>
+              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 140px;">
+                <div class="muted" style="margin-bottom: 4px;">Ваш код</div>
+                <div id="tmpCode" class="badge" style="user-select:all; margin-bottom: 4px;"></div>
+                <button id="copyCode" class="btn small outline">Скопировать код</button>
               </div>
-              <button id="copyAll" class="btn small outline">Скопировать адрес и код</button>
             </div>
 
             <div class="empty" id="statusLine" style="margin-top:10px">Ждём письмо…</div>
@@ -1228,6 +1801,23 @@ async viewHome(){
             <div class="row" style="margin-top:10px">
               <button id="cancelBtn" class="btn outline">Сбросить</button>
             </div>
+          </div>
+
+          <div class="hr"></div>
+
+          <div id="passwordLoginBox">
+            <h3 style="margin:6px 0 8px;">Вход по паролю</h3>
+            <p class="muted" style="margin-top:0">Если знаете пароль, можно войти сразу в аккаунт без письма.</p>
+            <form id="passwordLoginForm" class="password-login-form">
+              <div class="teacher-request-field" style="max-width:380px">
+                <label for="passwordInput">Пароль</label>
+                <input id="passwordInput" type="password" autocomplete="current-password" placeholder="Введите пароль" required>
+              </div>
+              <div class="row" style="gap:10px; align-items:center; flex-wrap:wrap; margin-top:6px">
+                <button type="submit" id="passwordSubmit" class="btn primary">Войти по паролю</button>
+                <div id="passwordStatus" class="status-msg muted"></div>
+              </div>
+            </form>
           </div>
         </div>
       </section>
@@ -1301,12 +1891,101 @@ async viewHome(){
       sessionId = null; $email.textContent=''; $code.textContent='';
     });
 
-    $('#copyAll')?.addEventListener('click', async ()=>{
+    $('#copyEmail')?.addEventListener('click', async ()=>{
       try{
-        await navigator.clipboard.writeText(`Временный адрес: ${$email.textContent}\nКод: ${$code.textContent}`);
-        $status.textContent = 'Скопировано!';
+        await navigator.clipboard.writeText($email.textContent);
+        $status.textContent = 'Адрес скопирован!';
         setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
       }catch{}
+    });
+
+    $('#copyCode')?.addEventListener('click', async ()=>{
+      try{
+        await navigator.clipboard.writeText($code.textContent);
+        $status.textContent = 'Код скопирован!';
+        setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
+      }catch{}
+    });
+
+    const passwordForm = $('#passwordLoginForm');
+    const passwordInput = $('#passwordInput');
+    const passwordBtn = $('#passwordSubmit');
+    const passwordStatus = $('#passwordStatus');
+    let passwordCooldownUntil = 0;
+
+    function setPasswordStatus(text, variant = 'muted'){
+      if (!passwordStatus) return;
+      passwordStatus.textContent = text || '';
+      passwordStatus.classList.toggle('error', variant === 'error');
+      passwordStatus.classList.toggle('success', variant === 'success');
+      passwordStatus.classList.toggle('muted', !variant || variant === 'muted');
+    }
+
+    passwordForm?.addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const now = Date.now();
+      if (now < passwordCooldownUntil){
+        const left = Math.max(1, Math.ceil((passwordCooldownUntil - now)/1000));
+        setPasswordStatus(`Слишком часто. Попробуйте через ${left} сек.`, 'error');
+        return;
+      }
+
+      const pwd = passwordInput?.value || '';
+      if (!pwd.trim()){
+        setPasswordStatus('Введите пароль.', 'error');
+        passwordInput?.focus();
+        return;
+      }
+
+      if (passwordBtn) passwordBtn.disabled = true;
+      setPasswordStatus('Проверяем…');
+      try{
+        const resp = await fetch('/api/auth/password', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ password: pwd })
+        });
+        let data = null;
+        try{ data = await resp.json(); }catch{}
+
+        const serverRetryMs = Number(data?.retry_after_ms || 0);
+        passwordCooldownUntil = Date.now() + (serverRetryMs > 0 ? serverRetryMs : PASSWORD_ATTEMPT_COOLDOWN_MS);
+
+        if (resp.ok && data?.ok !== false){
+          const u = data.user || {};
+          Auth.set({
+            loggedIn:true,
+            id: u.id,
+            email: u.email,
+            username: u.username,
+            display_name: u.display_name || u.username || (u.email ? u.email.split('@')[0] : ''),
+            comment_count: u.comment_count,
+            rating_count: u.rating_count,
+            cast_likes: u.cast_likes || 0,
+            cast_dislikes: u.cast_dislikes || 0,
+            received_likes: u.received_likes || 0,
+            received_dislikes: u.received_dislikes || 0,
+            available_coins: Number(u.available_coins ?? coinsOf(u)),
+            earned_coins: Number(u.earned_coins ?? 0),
+            spent_coins: Number(u.spent_coins ?? 0),
+            _isAdmin: !!u.is_admin,
+            _isSuperAdmin: !!u.is_super_admin,
+            _isBanned: !!u.is_banned
+          });
+          setPasswordStatus('Успешный вход.', 'success');
+          Router.go('/');
+          return;
+        }
+
+        const retryLeft = Math.max(0, Math.ceil((passwordCooldownUntil - Date.now()) / 1000));
+        const baseMsg = data?.message || (resp.status === 401 ? 'Неверный пароль.' : 'Не удалось войти. Попробуйте позже.');
+        const suffix = retryLeft ? ` Попробуйте через ${retryLeft} сек.` : '';
+        setPasswordStatus(baseMsg + suffix, 'error');
+      }catch{
+        setPasswordStatus('Ошибка сети. Попробуйте позже.', 'error');
+      }finally{
+        if (passwordBtn) passwordBtn.disabled = false;
+      }
     });
   },
 
@@ -1909,8 +2588,41 @@ async viewHome(){
     this.renderTeacherForm({ teacher, isNew:false });
   },
 
+  normalizeShopState(raw) {
+    const src = raw && typeof raw === 'object' ? (raw.shop ?? raw) : null;
+    if (!src) return null;
+    const toNum = (v, def = 0) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : def;
+    };
+    const items = Array.isArray(src.items) ? src.items : [];
+    return {
+      items,
+      balance: toNum(src.balance ?? src.available_coins, toNum(Auth._state.available_coins, 0)),
+      earnedCoins: toNum(src.earnedCoins ?? src.earned_coins, toNum(Auth._state.earned_coins, 0)),
+      spentCoins: toNum(src.spentCoins ?? src.spent_coins, toNum(Auth._state.spent_coins, 0)),
+      activeNickname: src.activeNickname || src.active_nickname || null
+    };
+  },
+
+  applyShopStateToAuth(shopState) {
+    if (!shopState) return;
+    const baseDisplay = Auth._state.username || (Auth._state.email ? Auth._state.email.split('@')[0] : '') || Auth._state.display_name || 'Student';
+    const update = {
+      available_coins: Number(shopState.balance ?? Auth._state.available_coins),
+      earned_coins: Number(shopState.earnedCoins ?? Auth._state.earned_coins),
+      spent_coins: Number(shopState.spentCoins ?? Auth._state.spent_coins)
+    };
+    if (shopState.activeNickname) {
+      update.display_name = shopState.activeNickname;
+    } else {
+      update.display_name = baseDisplay;
+    }
+    Auth.set(update);
+  },
+
   // --- Магазин ---
-  async viewShop() {
+  async viewShop(options = {}) {
     await this.mountNavbar();
 
     if (!Auth.isLogged()) {
@@ -1921,31 +2633,31 @@ async viewHome(){
       return;
     }
 
-    let shopData = {
+    const fromOptions = this.normalizeShopState(options.prefetched);
+    let shopData = fromOptions || {
       items: [],
       balance: coinsOf(Auth._state),
       earnedCoins: Auth._state.earned_coins || 0,
-      spentCoins: Auth._state.spent_coins || 0
+      spentCoins: Auth._state.spent_coins || 0,
+      activeNickname: Auth._state.display_name || null
     };
 
-    try {
-      const response = await fetch('/api/shop/items');
-      const data = await response.json();
-      if (data.ok) {
-        shopData = {
-          items: Array.isArray(data.items) ? data.items : [],
-          balance: Number(data.balance || 0),
-          earnedCoins: Number(data.earnedCoins || 0),
-          spentCoins: Number(data.spentCoins || 0)
-        };
-        Auth.set({
-          available_coins: shopData.balance,
-          earned_coins: shopData.earnedCoins,
-          spent_coins: shopData.spentCoins
-        });
+    if (!fromOptions) {
+      try {
+        const response = await fetch('/api/shop/items');
+        const data = await response.json();
+        if (data && data.ok !== false) {
+          const normalized = this.normalizeShopState(data);
+          if (normalized) {
+            shopData = normalized;
+            this.applyShopStateToAuth(normalized);
+          }
+        }
+      } catch (error) {
+        console.error('Ошибка загрузки магазина:', error);
       }
-    } catch (error) {
-      console.error('Ошибка загрузки магазина:', error);
+    } else {
+      this.applyShopStateToAuth(shopData);
     }
 
     const purchasedItems = shopData.items.filter(item => item.purchased);
@@ -2055,34 +2767,43 @@ async viewHome(){
   },
 
   async buyItem(itemId) {
-  if (!Auth.isLogged()) return;
+    if (!Auth.isLogged()) return;
 
-  try {
-    const response = await fetch('/api/shop/buy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId })
-    });
-
-    const result = await response.json();
-
-    if (result.ok) {
-      alert(result.message);
-      Auth.set({
-        available_coins: Number(result.balance ?? Auth._state.available_coins),
-        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+    try {
+      const response = await fetch('/api/shop/buy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemId })
       });
-      await this.viewShop();
-      await Auth.me();
-    } else {
-      alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
-            result.error === 'already_purchased' ? 'Этот ник уже куплен' : 'Ошибка сервера'));
+
+      const result = await response.json();
+      const shopState = this.normalizeShopState(result);
+
+      if (result.ok) {
+        alert(result.message);
+        if (shopState) {
+          this.applyShopStateToAuth(shopState);
+        } else {
+          Auth.set({
+            available_coins: Number(result.balance ?? Auth._state.available_coins),
+            earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+            spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+          });
+        }
+        await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+        if (!shopState) await Auth.me();
+      } else {
+        if (result.error === 'already_purchased' && shopState) {
+          this.applyShopStateToAuth(shopState);
+          await this.viewShop({ prefetched: shopState });
+        }
+        alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
+              result.error === 'already_purchased' ? 'Этот ник уже куплен' : 'Ошибка сервера'));
+      }
+    } catch (error) {
+      alert('Ошибка сети при покупке');
     }
-  } catch (error) {
-    alert('Ошибка сети при покупке');
-  }
-},
+  },
 
 async activateItem(itemId) {
   if (!Auth.isLogged()) return;
@@ -2095,16 +2816,21 @@ async activateItem(itemId) {
     });
 
     const result = await response.json();
+    const shopState = this.normalizeShopState(result);
 
     if (result.ok) {
       alert(result.message);
-      Auth.set({
-        available_coins: Number(result.balance ?? Auth._state.available_coins),
-        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-      });
-      await this.viewShop();
-      await Auth.me();
+      if (shopState) {
+        this.applyShopStateToAuth(shopState);
+      } else {
+        Auth.set({
+          available_coins: Number(result.balance ?? Auth._state.available_coins),
+          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+        });
+      }
+      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+      if (!shopState) await Auth.me();
     } else {
       alert('Ошибка при активации: ' + (result.error === 'item_not_owned' ? 'Этот ник не куплен' : 'Ошибка сервера'));
     }
@@ -2124,16 +2850,21 @@ async deactivateItem(itemId) {
     });
 
     const result = await response.json();
+    const shopState = this.normalizeShopState(result);
 
     if (result.ok) {
       alert(result.message);
-      Auth.set({
-        available_coins: Number(result.balance ?? Auth._state.available_coins),
-        earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-        spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-      });
-      await this.viewShop();
-      await Auth.me();
+      if (shopState) {
+        this.applyShopStateToAuth(shopState);
+      } else {
+        Auth.set({
+          available_coins: Number(result.balance ?? Auth._state.available_coins),
+          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+        });
+      }
+      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+      if (!shopState) await Auth.me();
     } else {
       const msg = result.error === 'not_active'
         ? 'Этот ник уже отключен'
@@ -2187,6 +2918,12 @@ addEventListener('DOMContentLoaded', ()=>{
   $('#year').textContent = new Date().getFullYear();
   Auth.render();
   Auth.me();
+  setInterval(()=>{ Auth.me().catch(()=>{}); }, AUTH_REFRESH_INTERVAL_MS);
+  document.addEventListener('visibilitychange', ()=>{
+    if (document.visibilityState === 'visible') {
+      Auth.me().catch(()=>{});
+    }
+  });
   Router.init();
   
 });
