@@ -3,6 +3,7 @@ const APP_VERSION = '2025-10-04-admin-2';
 const EMAIL_DOMAIN = '@student.letovo.ru';
 const PASSWORD_ATTEMPT_COOLDOWN_MS = 30_000;
 const AUTH_REFRESH_INTERVAL_MS = 60 * 1000; // чаще обновляем состояние (раз в минуту)
+const SEARCH_QUERY_MAX_LEN = 50;
 
 const CHARACTERISTICS = [
   { key:'clarity',   name:'Понятно объясняет' },
@@ -19,6 +20,10 @@ const fmtStars = v => html`<span class="rating" title="${fmtNum(v)} / 5"><span c
 function characteristicAvg(t,k){ const r=t.ratings?.[k]; return r&&r.count?(r.sum/r.count):0; }
 function overall(t){ let tot=0,cnt=0; for(const c of CHARACTERISTICS){ const r=t.ratings?.[c.key]; if(r&&r.count){ tot+=r.sum/r.count; cnt++; } } return cnt?tot/cnt:0; }
 const collator = new Intl.Collator('ru',{sensitivity:'base'});
+function normalizeSearchQuery(v){
+  const text = String(v ?? '');
+  return text.length > SEARCH_QUERY_MAX_LEN ? text.slice(0, SEARCH_QUERY_MAX_LEN) : text;
+}
 
 function coinsOf(u){
   if (!u) return 0;
@@ -265,37 +270,58 @@ const Auth = {
   },
 
   async me(){
+    let r = null;
     try{
-      const r = await fetch('/api/auth/me');
-      const j = await r.json();
-      if (j.loggedIn){
-        this.set({
-          loggedIn:true,
-          id: j.user.id,
-          email: j.user.email,
-          username: j.user.username,
-          display_name: j.user.display_name || j.user.username || j.user.email.split('@')[0],
-          comment_count: j.user.comment_count,
-          rating_count: j.user.rating_count,
-          cast_likes: j.user.cast_likes||0,
-          cast_dislikes: j.user.cast_dislikes||0,
-          received_likes: j.user.received_likes||0,
-          received_dislikes: j.user.received_dislikes||0,
-          available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
-          earned_coins: Number(j.user.earned_coins ?? 0),
-          spent_coins: Number(j.user.spent_coins ?? 0),
-          _isAdmin: !!j.user.is_admin,
-          _isSuperAdmin: !!j.user.is_super_admin,
-          _isBanned: !!j.user.is_banned
-        });
-      }else{
-        this.set(this._blankState());
-      }
+      r = await fetch('/api/auth/me', { cache: 'no-store' });
     }catch{
-      this.set(this._blankState());
-    }finally{
       this._ready = true;
+      return;
     }
+
+    if (r.status === 401) {
+      this.set(this._blankState());
+      this._ready = true;
+      return;
+    }
+
+    if (!r.ok) {
+      this._ready = true;
+      return;
+    }
+
+    let j = null;
+    try{
+      j = await r.json();
+    }catch{
+      this._ready = true;
+      return;
+    }
+
+    if (j?.loggedIn){
+      this.set({
+        loggedIn:true,
+        id: j.user.id,
+        email: j.user.email,
+        username: j.user.username,
+        display_name: j.user.display_name || j.user.username || j.user.email.split('@')[0],
+        comment_count: j.user.comment_count,
+        rating_count: j.user.rating_count,
+        cast_likes: j.user.cast_likes||0,
+        cast_dislikes: j.user.cast_dislikes||0,
+        received_likes: j.user.received_likes||0,
+        received_dislikes: j.user.received_dislikes||0,
+        available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
+        earned_coins: Number(j.user.earned_coins ?? 0),
+        spent_coins: Number(j.user.spent_coins ?? 0),
+        _isAdmin: !!j.user.is_admin,
+        _isSuperAdmin: !!j.user.is_super_admin,
+        _isBanned: !!j.user.is_banned
+      });
+    }else if (j && j.loggedIn === false){
+      this.set(this._blankState());
+    }
+
+    this._ready = true;
   },
 
   async ensure(){
@@ -825,7 +851,7 @@ const App = {
       const navUrl = new URL(hash.startsWith('/') ? hash : `/${hash}`, location.origin);
       currentPath = navUrl.pathname || '/';
       if (currentPath === '/search') {
-        currentSearch = navUrl.searchParams.get('q') || '';
+        currentSearch = normalizeSearchQuery(navUrl.searchParams.get('q') || '');
       }
       if (currentPath.startsWith('/department/')) {
         currentDepartment = decodeURIComponent(currentPath.replace('/department/',''));
@@ -867,7 +893,14 @@ const App = {
     });
   },
 
-  search(){ const q=$('#searchInput')?.value.trim(); if(!q) return; Router.go(`/search?q=${encodeURIComponent(q)}`); },
+  search(){
+    const input = $('#searchInput');
+    const raw = normalizeSearchQuery(input?.value);
+    if (input && input.value !== raw) input.value = raw;
+    const q = raw.trim();
+    if (!q) return;
+    Router.go(`/search?q=${encodeURIComponent(q)}`);
+  },
 
   teacherTile(t, rightHtml){
     const fio = [t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
@@ -1400,7 +1433,7 @@ async viewHome(){
 
   async listBySearch(_, query){
     await this.mountNavbar();
-    const q = (decodeURIComponent(query)||'').trim().toLowerCase();
+    const q = normalizeSearchQuery(decodeURIComponent(query)||'').trim().toLowerCase();
     const all = await this.getTeachers();
     const list = Array.isArray(all) ? all : [];
     const matched = list.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
@@ -2941,6 +2974,15 @@ addEventListener('DOMContentLoaded', ()=>{
   $('#logoutBtn')?.addEventListener('click', ()=>Auth.logout());
   $('#searchBtn')?.addEventListener('click', ()=>App.search());
   $('#searchInput')?.addEventListener('keydown', e=>{ if(e.key==='Enter') App.search(); });
+  const searchInput = $('#searchInput');
+  if (searchInput) {
+    searchInput.setAttribute('maxlength', String(SEARCH_QUERY_MAX_LEN));
+    searchInput.addEventListener('input', (e)=>{
+      const target = e.target;
+      const next = normalizeSearchQuery(target?.value);
+      if (target && target.value !== next) target.value = next;
+    });
+  }
 
   // Делегирование кликов по ссылкам вида href="#/..."
   document.body.addEventListener('click', (e)=>{

@@ -722,6 +722,10 @@ function createDbProcessing({
     db.prepare('UPDATE sessions SET last_activity_ts = ? WHERE id = ?').run(ts, sessionId);
   }
 
+  function updateSessionClient(sessionId, ip, userAgent) {
+    db.prepare('UPDATE sessions SET ip = ?, user_agent = ? WHERE id = ?').run(ip || null, userAgent || null, sessionId);
+  }
+
   function countActiveSessions(userId) {
     const existingSessions = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE user_id = ? AND is_active = 1').get(userId);
     return existingSessions?.count || 0;
@@ -1059,6 +1063,7 @@ function createDbProcessing({
     getRecentLoginAttempts,
     getUserFromSessionTokenHash,
     updateSessionActivity,
+    updateSessionClient,
     countActiveSessions,
     deleteOldestSession,
     insertSession,

@@ -78,6 +78,7 @@ const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый 
 const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 10; // За час
 const SECURITY_HEADERS_ENABLED = true;
+const SESSION_BINDING_MODE = (process.env.SESSION_BINDING_MODE || 'strict').toLowerCase(); // soft | strict
 
 const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 
@@ -168,6 +169,7 @@ const {
   getRecentLoginAttempts,
   getUserFromSessionTokenHash,
   updateSessionActivity,
+  updateSessionClient,
   countActiveSessions,
   deleteOldestSession,
   insertSession,
@@ -829,8 +831,10 @@ function normalizeIp(ip) {
 }
 
 function getClientIp(req){
+  if (!req) return '0.0.0.0';
+  if (req.ip) return normalizeIp(req.ip);
   const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return normalizeIp(xf || req.socket.remoteAddress || '0.0.0.0');
+  return normalizeIp(xf || req.socket?.remoteAddress || '0.0.0.0');
 }
 
 function parseCookies(req){
@@ -913,31 +917,35 @@ function getUserFromRequest(req, res = null){
   const currentIp = getClientIp(req);
   const currentUa = String(req.headers['user-agent'] || '');
 
-  // Жёсткая привязка сессии к устройству (User-Agent) и IP
-  if (session.user_agent && currentUa && session.user_agent !== currentUa) {
-    logSecurityEvent('session_user_agent_mismatch', {
-      userId: session.user_id,
-      sessionUserAgent: session.user_agent,
-      requestUserAgent: currentUa,
-      ip: currentIp,
-      severity: 'warning'
-    });
-    deactivateSessionByHash(tokenHash);
-    if (response) clearSessionCookie(response);
-    return null;
-  }
+  const mismatches = [];
+  if (session.user_agent && currentUa && session.user_agent !== currentUa) mismatches.push('user_agent');
+  if (session.ip && currentIp && session.ip !== currentIp) mismatches.push('ip');
 
-  if (session.ip && session.ip !== currentIp) {
-    logSecurityEvent('session_ip_mismatch', {
+  if (mismatches.length) {
+    logSecurityEvent('session_client_mismatch', {
       userId: session.user_id,
+      sessionId: session.id,
+      mismatches,
       sessionIp: session.ip,
       requestIp: currentIp,
-      userAgent: currentUa,
+      sessionUserAgent: session.user_agent,
+      requestUserAgent: currentUa,
       severity: 'warning'
     });
-    deactivateSessionByHash(tokenHash);
-    if (response) clearSessionCookie(response);
-    return null;
+
+    if (SESSION_BINDING_MODE === 'strict') {
+      deactivateSessionByHash(tokenHash);
+      if (response) clearSessionCookie(response);
+      return null;
+    }
+
+    const nextIp = currentIp || session.ip || null;
+    const nextUa = currentUa || session.user_agent || null;
+    updateSessionClient(session.id, nextIp, nextUa);
+  } else if ((!session.ip && currentIp) || (!session.user_agent && currentUa)) {
+    const nextIp = currentIp || session.ip || null;
+    const nextUa = currentUa || session.user_agent || null;
+    updateSessionClient(session.id, nextIp, nextUa);
   }
 
   // Обновляем время последней активности
