@@ -576,6 +576,20 @@ function createDbProcessing({
     return { counts, myVotes };
   }
 
+  function getUserVotesForComments(commentIds, userId) {
+    if (!commentIds.length || !userId) return {};
+
+    const placeholders = commentIds.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT comment_id, vote FROM comment_votes WHERE comment_id IN (${placeholders}) AND user_id = ?`);
+    const rows = stmt.all(...commentIds, String(userId));
+
+    const map = {};
+    for (const row of rows) {
+      map[String(row.comment_id)] = Number(row.vote) || 0;
+    }
+    return map;
+  }
+
   const activeNicknameStmt = db.prepare(`
     SELECT item_name FROM user_inventory
     WHERE user_id = ? AND item_type = 'nickname' AND is_active = 1
@@ -1049,6 +1063,7 @@ function createDbProcessing({
     getUserVote,
     setUserVote,
     countVotesForCommentBulk,
+    getUserVotesForComments,
     getActiveNickname,
     findUserByEmail,
     findUserById,

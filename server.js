@@ -106,6 +106,64 @@ const ALLOWED_REQUEST_PHOTO_TYPES = new Map([
   ['image/webp', '.webp']
 ]);
 
+// --- Быстрый кэш для дорогих вычислений ---
+const HOT_CACHE_TTL_MS = 60_000;
+const cacheStore = new Map();
+
+function readCache(key) {
+  const entry = cacheStore.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    cacheStore.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function writeCache(key, value, ttl = HOT_CACHE_TTL_MS) {
+  cacheStore.set(key, { value, expiresAt: Date.now() + ttl });
+  return value;
+}
+
+function invalidateCache(prefix, { exact = false } = {}) {
+  if (exact) {
+    cacheStore.delete(prefix);
+    return;
+  }
+  for (const key of Array.from(cacheStore.keys())) {
+    if (key.startsWith(prefix)) {
+      cacheStore.delete(key);
+    }
+  }
+}
+
+const TEACHER_LIST_CACHE_KEY = 'cache:teachers:enriched';
+const HOME_PAYLOAD_CACHE_KEY = 'cache:home:payload';
+const TEACHER_PAYLOAD_PREFIX = 'cache:teacher:payload:';
+
+function invalidateTeacherAggregates() {
+  invalidateCache(TEACHER_LIST_CACHE_KEY, { exact: true });
+  invalidateCache(HOME_PAYLOAD_CACHE_KEY, { exact: true });
+}
+
+function invalidateTeacherPayloadCache(teacherId) {
+  if (!teacherId) return;
+  invalidateCache(`${TEACHER_PAYLOAD_PREFIX}${teacherId}`, { exact: true });
+}
+
+function invalidateAllTeacherPayloads() {
+  invalidateCache(TEACHER_PAYLOAD_PREFIX);
+}
+
+function invalidateAllTeacherCaches(teacherId = null) {
+  invalidateTeacherAggregates();
+  if (teacherId) {
+    invalidateTeacherPayloadCache(teacherId);
+  } else {
+    invalidateAllTeacherPayloads();
+  }
+}
+
 ensureDirsAndDb({
   dataDir: DATA_DIR,
   photoDir: PHOTO_DIR,
@@ -203,7 +261,8 @@ const {
   getActiveInventoryItem,
   deactivateUserInventoryByType,
   getInventoryForUser,
-  getStartupStats
+  getStartupStats,
+  getUserVotesForComments
 } = dbCtx;
 
 const teacherRequestUpload = multer({
@@ -355,6 +414,173 @@ function buildDepartmentsLookup() {
     if (key) map.set(key, dept);
   }
   return map;
+}
+
+function getEnrichedTeachersSnapshot() {
+  const cached = readCache(TEACHER_LIST_CACHE_KEY);
+  if (cached) return cached;
+
+  const teachers = getAllTeachers();
+  const ratingsMap = getAllRatings();
+  const collator = new Intl.Collator('ru', { sensitivity: 'base' });
+
+  const list = teachers.map(row => {
+    const teacher = normalizeTeacherRow(row);
+    if (!teacher) return null;
+    const ratings = {};
+    for (const k of CHARACTERISTICS_KEYS) {
+      ratings[k] = ratingsMap[row.id]?.[k] || { sum: 0, count: 0 };
+    }
+    return {
+      ...teacher,
+      ratings,
+      overall: overall(ratings)
+    };
+  }).filter(Boolean);
+
+  list.sort((a, b) => {
+    const dv = (b.overall || 0) - (a.overall || 0);
+    if (dv !== 0) return dv;
+    const an = `${a.lastName || ''} ${a.firstName || ''}`.trim();
+    const bn = `${b.lastName || ''} ${b.firstName || ''}`.trim();
+    return collator.compare(an, bn);
+  });
+
+  const byId = new Map(list.map(t => [t.id, t]));
+
+  return writeCache(TEACHER_LIST_CACHE_KEY, { list, byId });
+}
+
+function getHomePayloadCached() {
+  const cached = readCache(HOME_PAYLOAD_CACHE_KEY);
+  if (cached) return cached;
+
+  const { list } = getEnrichedTeachersSnapshot();
+  const collator = new Intl.Collator('ru', { sensitivity: 'base' });
+  const byValueThenName = (getVal) => (a, b) => {
+    const dv = (getVal(b) || 0) - (getVal(a) || 0);
+    if (dv !== 0) return dv;
+    const an = `${a.lastName || ''} ${a.firstName || ''}`.trim();
+    const bn = `${b.lastName || ''} ${b.firstName || ''}`.trim();
+    return collator.compare(an, bn);
+  };
+
+  const characteristics = {};
+  for (const k of CHARACTERISTICS_KEYS) {
+    characteristics[k] = [...list]
+      .sort(byValueThenName(t => {
+        const r = t.ratings?.[k];
+        const sum = Number(r?.sum || 0), cnt = Number(r?.count || 0);
+        return cnt > 0 ? (sum / cnt) : 0;
+      }))
+      .slice(0, 3);
+  }
+
+  const departmentsSet = new Set(list.map(t => t.department).filter(Boolean));
+  const departments = Array.from(departmentsSet).sort(collator.compare).map(name => {
+    const top = list
+      .filter(t => t.department === name)
+      .sort(byValueThenName(t => t.overall))
+      .slice(0, 3);
+    return { name, list: top };
+  }).filter(d => d.list.length > 0);
+
+  return writeCache(HOME_PAYLOAD_CACHE_KEY, { characteristics, departments });
+}
+
+function buildTeacherBaseCached(teacherId) {
+  if (!teacherId) return null;
+
+  const cacheKey = `${TEACHER_PAYLOAD_PREFIX}${teacherId}`;
+  const cached = readCache(cacheKey);
+  if (cached) return cached;
+
+  const teacherRow = getTeacherById(teacherId);
+  if (!teacherRow) return null;
+
+  const ratings = getRatingsForTeacher(teacherId);
+  const commentsRaw = getCommentsForTeacher(teacherId);
+  const commentIds = commentsRaw.map(c => String(c.id));
+  const { counts } = countVotesForCommentBulk(commentIds, null);
+
+  const userCache = new Map();
+  const resolveUser = (uid) => {
+    if (!uid) return null;
+    const key = String(uid);
+    if (!userCache.has(key)) {
+      userCache.set(key, findUserById(key) || null);
+    }
+    return userCache.get(key);
+  };
+
+  const comments = commentsRaw.map(c => {
+    const authorUser = c.author_uid ? resolveUser(c.author_uid) : null;
+    const activeNick = authorUser ? getActiveNickname(authorUser.id) : null;
+    const displayAuthor = activeNick || 'Аноним';
+    const base = {
+      id: c.id,
+      teacherId: c.teacher_id,
+      ts: c.ts,
+      ts_iso: c.ts_iso,
+      author: c.author,
+      authorDisplay: displayAuthor,
+      text: c.text,
+      likes: (counts[String(c.id)]?.likes) || 0,
+      dislikes: (counts[String(c.id)]?.dislikes) || 0
+    };
+    const admin = {
+      author_uid: c.author_uid || '',
+      author_email: authorUser?.email || '',
+      author_display: displayAuthor
+    };
+    return { base, admin };
+  });
+
+  const teacher = normalizeTeacherRow(teacherRow);
+
+  return writeCache(cacheKey, {
+    teacher,
+    ratings,
+    overall: overall(ratings),
+    comments,
+    commentIds
+  });
+}
+
+function buildTeacherPayload(teacherId, req) {
+  const base = buildTeacherBaseCached(teacherId);
+  if (!base || !base.teacher) return null;
+
+  const u = getUserFromRequest(req);
+  const myId = u?.id || null;
+  const amAdmin = isAdminUser(u);
+  const myVotes = myId ? getUserVotesForComments(base.commentIds, myId) : {};
+
+  const comments = base.comments.map(({ base: cBase, admin }) => {
+    const myVote = Number(myVotes[String(cBase.id)] ?? 0);
+    const isOwn = !!(myId && admin.author_uid && String(admin.author_uid) === String(myId));
+    const publicComment = {
+      ...cBase,
+      myVote,
+      isOwn
+    };
+    if (amAdmin) {
+      return {
+        ...publicComment,
+        author_uid: admin.author_uid,
+        author_email: admin.author_email,
+        author_display: admin.author_display
+      };
+    }
+    return publicComment;
+  });
+
+  return {
+    ...base.teacher,
+    ratings: base.ratings,
+    comments,
+    overall: base.overall
+  };
 }
 
 async function callTelegramApi(method, payload) {
@@ -560,6 +786,7 @@ async function processTeacherRequestApproval(request, callback) {
       subjects,
       photo: photoFile
     });
+    invalidateAllTeacherCaches(teacherId);
   } catch (err) {
     console.error('Не удалось сохранить учителя из заявки:', err);
     updateTeacherRequestError(request.id, err && err.message ? err.message : 'db_error');
@@ -789,6 +1016,7 @@ async function handleCommentReviewCallback(callback) {
       PENDING_COMMENT_REVIEWS.delete(reviewId);
       await safeAnswerCallback(callback, 'Комментарий опубликован');
       await clearButtons();
+      invalidateTeacherPayloadCache(pending.teacherId);
     } catch (err) {
       console.error('Не удалось сохранить комментарий после одобрения:', err);
       await safeAnswerCallback(callback, 'Не удалось сохранить комментарий', true);
@@ -1112,48 +1340,24 @@ app.get('/api/departments',(req,res)=>{
  *  }
  */
 app.get('/api/teachers',(req,res)=>{
-  const teachers = getAllTeachers();
-  const ratingsMap = getAllRatings();
-
-  // Нормализуем строки из БД и прикрепляем рассчитанные рейтинги/overall к каждому учителю
-  let list = teachers.map(row=>{
-    const teacher = normalizeTeacherRow(row);
-    if (!teacher) return null;
-    const ratings = {};
-    for (const k of CHARACTERISTICS_KEYS){
-      ratings[k] = ratingsMap[row.id]?.[k] || {sum:0,count:0};
-    }
-    return {
-      ...teacher,
-      ratings,
-      overall: overall(ratings)
-    };
-  }).filter(Boolean);
+  const { list } = getEnrichedTeachersSnapshot();
+  let filtered = list;
 
   // Применяем необязательные базовые фильтры (строка поиска по ФИО и фильтр по кафедре)
   const q = String(req.query.q || '').trim().toLowerCase();
   if (q) {
-    list = list.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
+    filtered = filtered.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
   }
   const dept = String(req.query.department || '').trim();
   if (dept) {
-    list = list.filter(t => String(t.department) === dept);
+    filtered = filtered.filter(t => String(t.department) === dept);
   }
 
-  // Сортировка по убыванию общего рейтинга, затем по ФИО (стабильный вид списка)
-  list.sort((a,b)=>{
-    const dv = (b.overall||0) - (a.overall||0);
-    if (dv !== 0) return dv;
-    const an = `${a.lastName||''} ${a.firstName||''}`.trim();
-    const bn = `${b.lastName||''} ${b.firstName||''}`.trim();
-    return new Intl.Collator('ru',{sensitivity:'base'}).compare(an,bn);
-  });
-
   // Пагинация: ограничиваем размер страницы и вычисляем смещение
-  const total = list.length;
+  const total = filtered.length;
   const limit = Math.max(0, Math.min(200, Number(req.query.limit||0)));
   const offset = Math.max(0, Number(req.query.offset||0));
-  const paged = limit ? list.slice(offset, offset + limit) : list;
+  const paged = limit ? filtered.slice(offset, offset + limit) : filtered;
 
   res.json({teachers: paged, total});
 });
@@ -1172,122 +1376,12 @@ app.get('/api/teachers',(req,res)=>{
  *  }
  */
 app.get('/api/home', (req, res) => {
-  const teachers = getAllTeachers();
-  const ratingsMap = getAllRatings();
-
-  // Нормализуем учителей и прикрепляем рассчитанные рейтинги по всем характеристикам
-  const norm = teachers.map(row => {
-    const t = normalizeTeacherRow(row);
-    if (!t) return null;
-    const ratings = {};
-    for (const k of CHARACTERISTICS_KEYS){
-      ratings[k] = ratingsMap[row.id]?.[k] || {sum:0,count:0};
-    }
-    return {
-      ...t,
-      ratings,
-      overall: overall(ratings)
-    };
-  }).filter(Boolean);
-
-  const collator = new Intl.Collator('ru',{sensitivity:'base'});
-  // Вспомогательный компаратор: сперва по значению, затем по алфавиту по ФИО
-  const byValueThenName = (getVal) => (a,b)=>{
-    const dv = (getVal(b)||0) - (getVal(a)||0);
-    if (dv !== 0) return dv;
-    const an = `${a.lastName||''} ${a.firstName||''}`.trim();
-    const bn = `${b.lastName||''} ${b.firstName||''}`.trim();
-    return collator.compare(an,bn);
-  };
-
-  // Собираем топ-3 по каждой характеристике
-  const characteristics = {};
-  for (const k of CHARACTERISTICS_KEYS){
-    const sorted = [...norm].sort(byValueThenName(t=>{
-      const r = t.ratings?.[k];
-      const sum = Number(r?.sum||0), cnt = Number(r?.count||0);
-      return cnt>0 ? (sum/cnt) : 0;
-    })).slice(0,3);
-    characteristics[k] = sorted;
-  }
-
-  // Собираем топ-3 по каждой кафедре, сортируя по overall
-  const departmentsSet = new Set(norm.map(t=>t.department).filter(Boolean));
-  const departments = Array.from(departmentsSet).sort(collator.compare).map(name => {
-    const list = norm.filter(t=>t.department===name).sort(byValueThenName(t=>t.overall)).slice(0,3);
-    return { name, list };
-  }).filter(d=>d.list.length>0);
-
-  res.json({ characteristics, departments });
+  const payload = getHomePayloadCached();
+  res.json(payload);
 });
 
-function buildTeacherPayload(teacherRow, req) {
-  if (!teacherRow) return null;
-
-  const ratings = getRatingsForTeacher(teacherRow.id);
-  const commentsRaw = getCommentsForTeacher(teacherRow.id);
-
-  const u = getUserFromRequest(req);
-  const myId = u?.id || null;
-  const amAdmin = isAdminUser(u);
-
-  const ids = commentsRaw.map(c => String(c.id));
-  const { counts, myVotes } = countVotesForCommentBulk(ids, myId);
-
-  const userCache = new Map();
-  const resolveUser = (uid) => {
-    if (!uid) return null;
-    const key = String(uid);
-    if (!userCache.has(key)) {
-      userCache.set(key, findUserById(key) || null);
-    }
-    return userCache.get(key);
-  };
-
-  const comments = commentsRaw.map(c => {
-    const authorUser = c.author_uid ? resolveUser(c.author_uid) : null;
-    const activeNick = authorUser ? getActiveNickname(authorUser.id) : null;
-    const displayAuthor = activeNick || 'Аноним';
-    const base = {
-      id: c.id,
-      teacherId: c.teacher_id,
-      ts: c.ts,
-      ts_iso: c.ts_iso,
-      author: c.author,
-      authorDisplay: displayAuthor,
-      text: c.text,
-      likes: (counts[String(c.id)]?.likes) || 0,
-      dislikes: (counts[String(c.id)]?.dislikes) || 0,
-      myVote: Number(myVotes[String(c.id)] ?? 0),
-      isOwn: !!(myId && c.author_uid && String(c.author_uid) === String(myId))
-    };
-    if (amAdmin) {
-      const au = authorUser;
-      return {
-        ...base,
-        author_uid: c.author_uid || '',
-        author_email: au?.email || '',
-        author_display: displayAuthor
-      };
-    }
-    return base;
-  });
-
-  const teacher = normalizeTeacherRow(teacherRow);
-
-  return {
-    ...teacher,
-    ratings,
-    comments,
-    overall: overall(ratings)
-  };
-}
-
 app.get('/api/teacher/:id',(req,res)=>{
-  const t = getTeacherById(req.params.id);
-  if(!t) return res.status(404).json({error:'not_found'});
-
-  const payload = buildTeacherPayload(t, req);
+  const payload = buildTeacherPayload(req.params.id, req);
   if (!payload) return res.status(404).json({error:'not_found'});
 
   res.json(payload);
@@ -1371,6 +1465,8 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
 
     let queuedReviewId = null;
     let commentAdded = false;
+    let invalidatePayload = false;
+    let invalidateAggregates = false;
 
     // Сохраняем комментарий (используем только новую функцию addComment)
     if (textStr) {
@@ -1396,6 +1492,7 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
         try {
           await addComment({ teacherId, author: authorName, text: textStr, author_uid: userId || '' });
           commentAdded = true;
+          invalidatePayload = true;
         } catch (err) {
           console.error('addComment failed:', err && err.message ? err.message : err);
           return res.status(500).json({ error: 'server_error', message: 'failed_to_save_comment' });
@@ -1408,6 +1505,10 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     if (hasRatings) {
       try {
         ratingUpdateInfo = updateRatings(teacherId, ratings, userId || null) || ratingUpdateInfo;
+        if ((ratingUpdateInfo.added || ratingUpdateInfo.updated) && !invalidateAggregates) {
+          invalidateAggregates = true;
+          invalidatePayload = true;
+        }
       } catch (err) {
         console.error('updateRatings failed:', err && err.message ? err.message : err);
         ratingUpdateInfo = { added: 0, updated: 0 };
@@ -1425,11 +1526,17 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       }
     }
 
+    if (invalidateAggregates) {
+      invalidateAllTeacherCaches(teacherId);
+    } else if (invalidatePayload) {
+      invalidateTeacherPayloadCache(teacherId);
+    }
+
     return res.json({
       ok: true,
       pendingReview: !!queuedReviewId,
       reviewId: queuedReviewId || undefined,
-      teacher: buildTeacherPayload(t, req)
+      teacher: buildTeacherPayload(teacherId, req)
     });
   } catch (err) {
     console.error('Unhandled error in /api/comment-with-ratings:', err && err.stack ? err.stack : err);
@@ -1470,6 +1577,7 @@ app.post('/api/comment/vote', (req,res)=>{
 
   const {counts} = countVotesForCommentBulk([String(commentId)], u.id);
   const cnt = counts[String(commentId)] || {likes:0,dislikes:0};
+  invalidateTeacherPayloadCache(c.teacher_id);
   res.json({ok:true, likes:cnt.likes, dislikes:cnt.dislikes, myVote:newVote});
 });
 
@@ -1866,6 +1974,7 @@ app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
   }
 
   deleteComment(commentId);
+  invalidateTeacherPayloadCache(comment.teacher_id);
   return res.json({ ok:true });
 });
 
@@ -1945,6 +2054,8 @@ app.get('/api/admin/teachers', requireAdmin, (req,res)=>{
 app.post('/api/admin/teacher/upsert', requireAdmin, express.json(), (req,res)=>{
   const { id, lastName, firstName, patronymic, department, subjects, photo } = req.body || {};
   upsertTeacher({ id, lastName, firstName, patronymic, department, subjects, photo });
+  // сбрасываем кэш списков/деталей, чтобы обновления были мгновенными
+  invalidateAllTeacherCaches(id);
   return res.json({ ok:true, total: getAllTeachers().length });
 });
 
@@ -1952,6 +2063,7 @@ app.post('/api/admin/teacher/delete', requireAdmin, express.json(), (req,res)=>{
   const { id } = req.body || {};
   if (!id) return res.status(400).json({error:'bad_request'});
   deleteTeacherById(String(id));
+  invalidateAllTeacherCaches(id);
   return res.json({ ok:true, total: getAllTeachers().length });
 });
 
@@ -2530,6 +2642,8 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
     balanceAfter: shopState?.balance ?? availableCoins
   });
 
+  invalidateAllTeacherPayloads();
+
   res.json({
     ok: true,
     message: `Ник "${item.name}" успешно приобретен!`,
@@ -2574,6 +2688,7 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   });
 
   const shopState = buildShopStateForUser(u);
+  invalidateAllTeacherPayloads();
 
   res.json({
     ok: true,
@@ -2609,6 +2724,7 @@ app.post('/api/shop/deactivate', express.json(), (req, res) => {
   });
 
   const shopState = buildShopStateForUser(u);
+  invalidateAllTeacherPayloads();
 
   res.json({
     ok: true,
