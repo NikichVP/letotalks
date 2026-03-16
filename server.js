@@ -15,14 +15,29 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 const { Blob } = require('buffer');
+const { fetch: undiciFetch } = require('undici');
 const { ensureDirsAndDb, createDbProcessing } = require('./db_processing');
 const { COMMENT_DECISIONS, moderateComment } = require('./comment_moderation');
+const { createDispatcher, resolveProxyUrl } = require('./outbound_proxy');
 
 dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 const PORT = 3001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const OUTBOUND_PROXY_URL = resolveProxyUrl();
+const outboundDispatcher = createDispatcher({ allowH2: false });
+
+if (OUTBOUND_PROXY_URL) {
+  console.log(`[proxy] letotalks via ${OUTBOUND_PROXY_URL}`);
+}
+
+function fetchWithProxy(url, init = {}) {
+  return undiciFetch(url, {
+    ...init,
+    dispatcher: init.dispatcher || outboundDispatcher,
+  });
+}
 
 const ROOT_DIR    = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
@@ -355,7 +370,7 @@ async function callTelegramApi(method, payload) {
   if (!isFormData) {
     options.headers = { 'Content-Type': 'application/json' };
   }
-  const resp = await fetch(url, options);
+  const resp = await fetchWithProxy(url, options);
 
   let data = null;
   try {
@@ -1030,7 +1045,7 @@ app.use('/api', apiRateLimiter);
 /* GuerrillaMail helpers */
 async function gmGetEmailAddress(){
   const url = 'https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=ru';
-  const r = await fetch(url).catch(()=>null);
+  const r = await fetchWithProxy(url).catch(()=>null);
   if (!r || !r.ok) throw new Error('gm_get_email_failed');
   const j = await r.json();
   return { email: j.email_addr, sid_token: j.sid_token };
@@ -1038,7 +1053,7 @@ async function gmGetEmailAddress(){
 
 async function gmCheckEmail(sid_token){
   const url = `https://api.guerrillamail.com/ajax.php?f=check_email&seq=1&sid_token=${encodeURIComponent(sid_token)}`;
-  const r = await fetch(url).catch(()=>null);
+  const r = await fetchWithProxy(url).catch(()=>null);
   if (!r || !r.ok) return [];
   const j = await r.json();
   return Array.isArray(j.list) ? j.list : [];
@@ -1046,7 +1061,7 @@ async function gmCheckEmail(sid_token){
 
 async function gmFetchEmail(sid_token, id){
   const url = `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${encodeURIComponent(id)}&sid_token=${encodeURIComponent(sid_token)}`;
-  const r = await fetch(url).catch(()=>null);
+  const r = await fetchWithProxy(url).catch(()=>null);
   if (!r || !r.ok) return null;
   return await r.json();
 }

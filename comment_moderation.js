@@ -1,9 +1,14 @@
-const { fetch: undiciFetch, Agent } = require('undici');
+const { fetch: undiciFetch } = require('undici');
+const { createDispatcher, resolveProxyUrl } = require('./outbound_proxy');
 
-const openaiAgent = new Agent({ allowH2: false });
+const openaiDispatcher = createDispatcher({ allowH2: false });
+const proxyUrl = resolveProxyUrl();
+if (proxyUrl) {
+  console.log(`[proxy] comment_moderation via ${proxyUrl}`);
+}
 
 const fetchFn = (url, init = {}) =>
-  undiciFetch(url, { ...init, dispatcher: openaiAgent });
+  undiciFetch(url, { ...init, dispatcher: init.dispatcher || openaiDispatcher });
 
 const BAD_STEMS = [
   'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
