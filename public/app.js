@@ -784,6 +784,8 @@ const App = {
     // Отключаем infinite-scroll наблюдатель прошлой страницы, чтобы он не висел
     // на удалённом из DOM сентинеле (утечка + лишние подгрузки).
     if (App._listObserver) { App._listObserver.disconnect(); App._listObserver = null; }
+    // Останавливаем авто-карусели прошлой страницы.
+    this.clearCarousels?.();
     const btn  = $('#deptBtn');
     const menu = $('#deptMenu');
     const searchInput = $('#searchInput');
@@ -945,20 +947,23 @@ async viewHome(){
       </div>`;
   }).join('');
 
+  // Для бесшовной бесконечной прокрутки дублируем набор карточек (копии-обёртки).
+  const loopSets = (cards)=> `<div class="marquee-set">${cards}</div><div class="marquee-set">${cards}</div><div class="marquee-set">${cards}</div>`;
+
   $('#app').innerHTML = html`
     <section class="section">
       <h2>Топ по характеристикам</h2>
       <div class="hscroll">
-        <button class="hscroll-arrow left hidden" type="button" aria-label="Влево">‹</button>
-        <div class="card-row">${charCards}</div>
+        <button class="hscroll-arrow left" type="button" aria-label="Влево">‹</button>
+        <div class="card-row">${loopSets(charCards)}</div>
         <button class="hscroll-arrow right" type="button" aria-label="Вправо">›</button>
       </div>
     </section>
     <section class="section">
       <h2>По кафедрам</h2>
       <div class="hscroll">
-        <button class="hscroll-arrow left hidden" type="button" aria-label="Влево">‹</button>
-        <div class="card-row">${deptCards}</div>
+        <button class="hscroll-arrow left" type="button" aria-label="Влево">‹</button>
+        <div class="card-row">${loopSets(deptCards)}</div>
         <button class="hscroll-arrow right" type="button" aria-label="Вправо">›</button>
       </div>
     </section>
@@ -975,30 +980,63 @@ async viewHome(){
   this.wireHScrollers();
 },
 
-  // Горизонтальные карусели (Топ / Кафедры): стрелки + показ/скрытие по позиции.
+  // Бесконечные авто-карусели (Топ / Кафедры): медленно едут влево сами, пауза при
+  // наведении/прокрутке, зациклены (без конца). Без видимого скроллбара.
+  _carouselCleanup: [],
+  clearCarousels(){
+    (this._carouselCleanup || []).forEach(fn=>{ try{ fn(); }catch{} });
+    this._carouselCleanup = [];
+  },
   wireHScrollers(){
-    // Прямое присваивание scrollLeft — надёжно во всех браузерах; плавность даёт
-    // CSS scroll-behavior:smooth на самом .card-row.
-    const scrollByStep = (el, delta)=>{
-      const max = el.scrollWidth - el.clientWidth;
-      el.scrollLeft = Math.max(0, Math.min(el.scrollLeft + delta, max));
-    };
+    this.clearCarousels();
     $$('.hscroll').forEach(wrap=>{
       const row = wrap.querySelector('.card-row');
-      const left = wrap.querySelector('.hscroll-arrow.left');
-      const right = wrap.querySelector('.hscroll-arrow.right');
-      if (!row) return;
+      const leftBtn = wrap.querySelector('.hscroll-arrow.left');
+      const rightBtn = wrap.querySelector('.hscroll-arrow.right');
+      if (!row || row.children.length < 2) return;
+
+      // Точка зацикливания = расстояние от 1-й копии до 2-й (точно, с учётом gap).
+      let loop = 0;
+      const measure = ()=>{ loop = row.children[1].offsetLeft - row.children[0].offsetLeft; };
+      measure();
+
+      let paused = false, resumeT = null;
+      const pauseFor = (ms)=>{ paused = true; clearTimeout(resumeT); resumeT = setTimeout(()=>{ paused = false; }, ms); };
+
+      // pos — дробный «источник истины» позиции (scrollLeft округляется до целого,
+      // поэтому копим позицию отдельно, иначе медленная прокрутка теряется на округлении).
+      let pos = row.scrollLeft;
+      const SPEED = 0.5; // px за тик (~16мс) => ~30px/с, медленно
+      const tick = setInterval(()=>{
+        if (!loop) { measure(); return; }
+        if (paused) {
+          // во время ручной прокрутки синхронизируем pos и нормализуем петлю
+          pos = row.scrollLeft;
+          if (pos >= loop) { pos -= loop; row.scrollLeft = pos; }
+          else if (pos < 0) { pos += loop; row.scrollLeft = pos; }
+          return;
+        }
+        pos += SPEED;                 // едем влево
+        if (pos >= loop) pos -= loop;  // бесшовная петля
+        row.scrollLeft = pos;
+      }, 16);
+
+      const onResize = ()=> measure();
+      window.addEventListener('resize', onResize);
+
+      // Пауза при наведении и при ручной прокрутке/свайпе.
+      wrap.addEventListener('mouseenter', ()=>{ paused = true; clearTimeout(resumeT); });
+      wrap.addEventListener('mouseleave', ()=> pauseFor(500));
+      row.addEventListener('wheel', ()=> pauseFor(2500), { passive:true });
+      row.addEventListener('touchstart', ()=> pauseFor(4000), { passive:true });
+      row.addEventListener('touchend', ()=> pauseFor(2500), { passive:true });
+
       const step = ()=> Math.max(240, Math.round(row.clientWidth * 0.85));
-      const update = ()=>{
-        const maxScroll = row.scrollWidth - row.clientWidth - 2;
-        left?.classList.toggle('hidden', row.scrollLeft <= 4);
-        right?.classList.toggle('hidden', row.scrollLeft >= maxScroll);
-      };
-      left?.addEventListener('click', ()=>{ scrollByStep(row, -step()); update(); });
-      right?.addEventListener('click', ()=>{ scrollByStep(row, step()); update(); });
-      row.addEventListener('scroll', update, { passive: true });
-      requestAnimationFrame(update);
-      setTimeout(update, 300);
+      leftBtn?.addEventListener('click', ()=>{ row.scrollLeft -= step(); pauseFor(3000); });
+      rightBtn?.addEventListener('click', ()=>{ row.scrollLeft += step(); pauseFor(3000); });
+
+      setTimeout(measure, 400);
+      this._carouselCleanup.push(()=>{ clearInterval(tick); window.removeEventListener('resize', onResize); });
     });
   },
 
