@@ -326,6 +326,36 @@ const teacherRequestUpload = multer({
 }).single('photo');
 
 
+// === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
+// ВАЖНО: до express.static, иначе HTML/JS-ассеты не получают заголовки (CSP и пр.).
+if (SECURITY_HEADERS_ENABLED) {
+  app.use(helmet({
+    // Включаем CSP как второй рубеж против XSS: inline-СКРИПТЫ запрещены
+    // (script-src 'self'), inline-СТИЛИ разрешены (в шаблонах есть style="...").
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:', 'https:'],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"]
+      }
+    },
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true
+    },
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+  }));
+}
+
 app.use(express.json({ limit: '1mb' }));
 // Сжимаем ответы (особенно крупные JSON-списки учителей).
 app.use(compression());
@@ -336,19 +366,6 @@ app.use('/photo', express.static(PHOTO_DIR, {
   maxAge: '7d',
   setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff')
 }));
-
-// === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
-if (SECURITY_HEADERS_ENABLED) {
-  app.use(helmet({
-    contentSecurityPolicy: false, // Отключаем CSP, чтобы стили работали
-    hsts: {
-      maxAge: 31536000,
-      includeSubDomains: true,
-      preload: true
-    },
-    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
-  }));
-}
 
 // === БЕЗОПАСНОСТЬ: Rate Limiting ===
 // Оставляем только для авторизации - защита от брутфорса
