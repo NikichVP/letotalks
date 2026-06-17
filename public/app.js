@@ -1,7 +1,6 @@
 // app.js — SPA с авторизацией по почте, лайками/дизлайками, статистикой, админкой и предмодерацией
 const APP_VERSION = '2025-10-04-admin-2';
 const EMAIL_DOMAIN = '@student.letovo.ru';
-const PASSWORD_ATTEMPT_COOLDOWN_MS = 30_000;
 const AUTH_REFRESH_INTERVAL_MS = 60 * 1000; // чаще обновляем состояние (раз в минуту)
 const SEARCH_QUERY_MAX_LEN = 50;
 
@@ -1868,23 +1867,6 @@ async viewHome(){
               <button id="cancelBtn" class="btn outline">Сбросить</button>
             </div>
           </div>
-
-          <div class="hr"></div>
-
-          <div id="passwordLoginBox">
-            <h3 style="margin:6px 0 8px;">Вход по паролю</h3>
-            <p class="muted" style="margin-top:0">Если знаете пароль, можно войти сразу в аккаунт без письма.</p>
-            <form id="passwordLoginForm" class="password-login-form">
-              <div class="teacher-request-field" style="max-width:380px">
-                <label for="passwordInput">Пароль</label>
-                <input id="passwordInput" type="password" autocomplete="current-password" placeholder="Введите пароль" required>
-              </div>
-              <div class="row" style="gap:10px; align-items:center; flex-wrap:wrap; margin-top:6px">
-                <button type="submit" id="passwordSubmit" class="btn primary">Войти по паролю</button>
-                <div id="passwordStatus" class="status-msg muted"></div>
-              </div>
-            </form>
-          </div>
         </div>
       </section>
     `;
@@ -1971,87 +1953,6 @@ async viewHome(){
         $status.textContent = 'Код скопирован!';
         setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
       }catch{}
-    });
-
-    const passwordForm = $('#passwordLoginForm');
-    const passwordInput = $('#passwordInput');
-    const passwordBtn = $('#passwordSubmit');
-    const passwordStatus = $('#passwordStatus');
-    let passwordCooldownUntil = 0;
-
-    function setPasswordStatus(text, variant = 'muted'){
-      if (!passwordStatus) return;
-      passwordStatus.textContent = text || '';
-      passwordStatus.classList.toggle('error', variant === 'error');
-      passwordStatus.classList.toggle('success', variant === 'success');
-      passwordStatus.classList.toggle('muted', !variant || variant === 'muted');
-    }
-
-    passwordForm?.addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const now = Date.now();
-      if (now < passwordCooldownUntil){
-        const left = Math.max(1, Math.ceil((passwordCooldownUntil - now)/1000));
-        setPasswordStatus(`Слишком часто. Попробуйте через ${left} сек.`, 'error');
-        return;
-      }
-
-      const pwd = passwordInput?.value || '';
-      if (!pwd.trim()){
-        setPasswordStatus('Введите пароль.', 'error');
-        passwordInput?.focus();
-        return;
-      }
-
-      if (passwordBtn) passwordBtn.disabled = true;
-      setPasswordStatus('Проверяем…');
-      try{
-        const resp = await fetch('/api/auth/password', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ password: pwd })
-        });
-        let data = null;
-        try{ data = await resp.json(); }catch{}
-
-        const serverRetryMs = Number(data?.retry_after_ms || 0);
-        passwordCooldownUntil = Date.now() + (serverRetryMs > 0 ? serverRetryMs : PASSWORD_ATTEMPT_COOLDOWN_MS);
-
-        if (resp.ok && data?.ok !== false){
-          const u = data.user || {};
-          Auth.set({
-            loggedIn:true,
-            id: u.id,
-            email: u.email,
-            username: u.username,
-            display_name: u.display_name || u.username || (u.email ? u.email.split('@')[0] : ''),
-            comment_count: u.comment_count,
-            rating_count: u.rating_count,
-            cast_likes: u.cast_likes || 0,
-            cast_dislikes: u.cast_dislikes || 0,
-            received_likes: u.received_likes || 0,
-            received_dislikes: u.received_dislikes || 0,
-            available_coins: Number(u.available_coins ?? coinsOf(u)),
-            earned_coins: Number(u.earned_coins ?? 0),
-            spent_coins: Number(u.spent_coins ?? 0),
-            _isAdmin: !!u.is_admin,
-            _isSuperAdmin: !!u.is_super_admin,
-            _isBanned: !!u.is_banned
-          });
-          setPasswordStatus('Успешный вход.', 'success');
-          Router.go('/');
-          return;
-        }
-
-        const retryLeft = Math.max(0, Math.ceil((passwordCooldownUntil - Date.now()) / 1000));
-        const baseMsg = data?.message || (resp.status === 401 ? 'Неверный пароль.' : 'Не удалось войти. Попробуйте позже.');
-        const suffix = retryLeft ? ` Попробуйте через ${retryLeft} сек.` : '';
-        setPasswordStatus(baseMsg + suffix, 'error');
-      }catch{
-        setPasswordStatus('Ошибка сети. Попробуйте позже.', 'error');
-      }finally{
-        if (passwordBtn) passwordBtn.disabled = false;
-      }
     });
   },
 

@@ -64,9 +64,6 @@ const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERAT
 const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
 
 const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
-const PASSWORD_LOGIN_EMAIL = 'redacted@example.com';
-const PASSWORD_LOGIN_SECRET = process.env.PASSWORD_LOGIN_SECRET || '';
-const PASSWORD_LOGIN_COOLDOWN_MS = 30_000;
 
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
 const SESSION_COOKIE = 'lt_session';
@@ -325,7 +322,6 @@ function generateSecureToken() {
 
 const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
 const PENDING_COMMENT_REVIEWS = new Map(); // reviewId -> pending comment awaiting admin decision
-const PASSWORD_LOGIN_ATTEMPTS = new Map(); // ip -> last attempt timestamp
 
 const CYRILLIC_TO_LATIN = {
   'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
@@ -2378,84 +2374,6 @@ app.get('/api/auth/poll', authLimiter, async (req,res)=>{
     });
   }
   return res.json({ status:'pending' });
-});
-
-app.post('/api/auth/password', authLimiter, async (req, res) => {
-  const ip = getClientIp(req);
-  const ua = req.headers['user-agent'] || '';
-  const now = Date.now();
-  const last = PASSWORD_LOGIN_ATTEMPTS.get(ip) || 0;
-  const diff = now - last;
-
-  if (diff < PASSWORD_LOGIN_COOLDOWN_MS) {
-    const retryMs = PASSWORD_LOGIN_COOLDOWN_MS - diff;
-    const retrySec = Math.ceil(retryMs / 1000);
-    res.setHeader('Retry-After', retrySec);
-    return res.status(429).json({
-      ok: false,
-      error: 'too_many_password_attempts',
-      retry_after_ms: retryMs,
-      message: `Слишком часто. Попробуйте через ${retrySec} сек.`
-    });
-  }
-
-  PASSWORD_LOGIN_ATTEMPTS.set(ip, now);
-
-  const password = String(req.body?.password || '');
-  if (password !== PASSWORD_LOGIN_SECRET) {
-    recordLoginAttempt(PASSWORD_LOGIN_EMAIL, ip, false);
-    logSecurityEvent('password_login_invalid', {
-      email: PASSWORD_LOGIN_EMAIL,
-      ip,
-      userAgent: ua,
-      severity: 'warning'
-    });
-    return res.status(401).json({ ok: false, error: 'invalid_password' });
-  }
-
-  const user = upsertUserOnLogin(PASSWORD_LOGIN_EMAIL);
-  recordLoginAttempt(PASSWORD_LOGIN_EMAIL, ip, true);
-
-  const token = createSession(user.id, req);
-  setSessionCookie(res, token);
-
-  try{
-    insertLoginEvent({
-      action: 'login',
-      email: user.email,
-      ip: getClientIp(req),
-      ua: req.headers['user-agent'] || ''
-    });
-  }catch{}
-
-  logSecurityEvent('password_login_successful', {
-    userId: user.id,
-    email: user.email,
-    ip,
-    userAgent: ua
-  });
-
-  return res.json({
-    ok: true,
-    user: {
-      id: user.id,
-      email: user.email,
-      username: user.username,
-      display_name: getDisplayName(user),
-      comment_count: Number(user.comment_count||0),
-      rating_count: Number(user.rating_count||0),
-      cast_likes: Number(user.cast_likes||0),
-      cast_dislikes: Number(user.cast_dislikes||0),
-      received_likes: Number(user.received_likes||0),
-      received_dislikes: Number(user.received_dislikes||0),
-      available_coins: getAvailableCoins(user),
-      earned_coins: calculateEarnedCoins(user),
-      spent_coins: getUserSpentCoins(user.id),
-      is_admin: isAdminUser(user),
-      is_super_admin: isSuperAdminUser(user),
-      is_banned: isUserBanned(user.id)
-    }
-  });
 });
 
 app.get('/api/auth/me', (req,res)=>{
