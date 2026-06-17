@@ -1352,12 +1352,13 @@ async viewHome(){
     await this.mountNavbar();
     const all = await this.getTeachers();
     const list = Array.isArray(all) ? all : [];
-    const name = decodeURIComponent(dept);
+    let name = '';
+    try { name = decodeURIComponent(dept); } catch { name = String(dept || ''); }
     const filtered = this.sortByValueThenAlpha(list.filter(t=>t.department===name), t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
-          <h2>Кафедра — ${name}</h2>
+          <h2>Кафедра — ${esc(name)}</h2>
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
         <div class="list">
@@ -1581,7 +1582,7 @@ async viewHome(){
                     <textarea id="commentText" placeholder="${banned ? 'Текст сейчас отправить нельзя (бан на комментарии). Можно выставить оценки выше и нажать «Опубликовать» без текста.' : 'Напишите анонимный отзыв… (можно пусто — тогда отправятся только оценки)'}" ${banned?'':''}></textarea>
                     <div class="row" style="margin-top:8px;justify-content:space-between">
                       <div class="muted">Оценки отправятся вместе с комментарием. Можно отправить только оценки без текста.</div>
-                      <button class="btn primary" id="publishBtn" data-tid="${t.id}">Опубликовать</button>
+                      <button class="btn primary" id="publishBtn" data-tid="${escAttr(t.id)}">Опубликовать</button>
                     </div>`
                 : html`<div class="empty">Чтобы оставить комментарий и оценку, нажмите «Войти» сверху.</div>`
               }
@@ -1746,12 +1747,15 @@ async viewHome(){
       const isActive = btn.classList.contains('active');
       const vote = isActive ? 'none' : (isLike ? 'like' : 'dislike');
 
+      // Блокируем обе кнопки на время запроса — защита от двойного голоса/гонки ответов.
+      const likeEl = commentEl.querySelector('.iconbtn.like');
+      const dislikeEl = commentEl.querySelector('.iconbtn.dislike');
+      if (likeEl) likeEl.disabled = true;
+      if (dislikeEl) dislikeEl.disabled = true;
+
       try{
         const res = await API.voteComment({ commentId: cid, vote });
         if (res.ok){
-          // обновим счётчики в DOM
-          const likeEl = commentEl.querySelector('.iconbtn.like');
-          const dislikeEl = commentEl.querySelector('.iconbtn.dislike');
           if (likeEl) {
             likeEl.querySelector('.cnt').textContent = res.likes || 0;
             likeEl.classList.toggle('active', res.myVote===1);
@@ -1771,6 +1775,10 @@ async viewHome(){
         }
       }catch{
         alert('Ошибка сети.');
+      }finally{
+        // Сюда попадаем только для голосуемых комментариев (свои отсеяны выше по btn.disabled).
+        if (likeEl) likeEl.disabled = false;
+        if (dislikeEl) dislikeEl.disabled = false;
       }
     });
   },
@@ -1971,7 +1979,7 @@ async viewHome(){
     if (!(await this.ensureAdmin())) return;
 
     let commenters = [];
-    try { const r = await API.adminCommenters(); if (r.ok) commenters = r.users || []; } catch {}
+    try { const r = await API.adminCommenters(); if (r.ok) commenters = r.users || []; else console.warn('adminCommenters failed', r._status, r.error); } catch(e){ console.warn('adminCommenters error', e); }
 
     $('#app').innerHTML = html`
       <section class="section">
@@ -2135,7 +2143,7 @@ async viewHome(){
     if (!(await this.ensureAdmin())) return;
 
     let users = [];
-    try { const r = await API.adminUsers(); if (r.ok) users = r.users || []; } catch {}
+    try { const r = await API.adminUsers(); if (r.ok) users = r.users || []; else console.warn('adminUsers failed', r._status, r.error); } catch(e){ console.warn('adminUsers error', e); }
 
     $('#app').innerHTML = html`
       <section class="section">
@@ -2348,7 +2356,7 @@ async viewHome(){
     if (!(await this.ensureAdmin())) return;
 
     let teachers = [];
-    try { const r = await API.adminTeachers(); if (r.ok) teachers = r.teachers || []; } catch {}
+    try { const r = await API.adminTeachers(); if (r.ok) teachers = r.teachers || []; else console.warn('adminTeachers failed', r._status, r.error); } catch(e){ console.warn('adminTeachers error', e); }
 
     $('#app').innerHTML = html`
       <section class="section">
@@ -2480,7 +2488,8 @@ async viewHome(){
 
   async viewAdminTeacherEdit(_, encodedId){
     if (!(await this.ensureAdmin())) return;
-    const teacherId = decodeURIComponent(encodedId);
+    let teacherId = '';
+    try { teacherId = decodeURIComponent(encodedId); } catch { teacherId = String(encodedId || ''); }
     let teacher = null;
     try {
       const r = await API.adminTeachers();
@@ -2494,7 +2503,7 @@ async viewHome(){
             <div class="list-controls"><a class="link" href="#/admin/teachers">← Назад к списку</a></div>
           </div>
           ${this.adminTabs('teachers')}
-          <div class="empty">Учитель с ID ${teacherId} не найден.</div>
+          <div class="empty">Учитель с ID ${esc(teacherId)} не найден.</div>
         </section>
       `;
       return;
@@ -2618,10 +2627,10 @@ async viewHome(){
 
                   ${item.purchased
                     ? (item.isActive
-                      ? html`<button class="btn small outline deactivate-btn" data-item="${item.id}">Сделать неактивным</button>`
-                      : html`<button class="btn small primary activate-btn" data-item="${item.id}">Сделать активным</button>`)
+                      ? html`<button class="btn small outline deactivate-btn" data-item="${escAttr(item.id)}">Сделать неактивным</button>`
+                      : html`<button class="btn small primary activate-btn" data-item="${escAttr(item.id)}">Сделать активным</button>`)
                     : (shopData.balance >= item.price
-                      ? html`<button class="btn small primary buy-btn" data-item="${item.id}">Купить за ${item.price}</button>`
+                      ? html`<button class="btn small primary buy-btn" data-item="${escAttr(item.id)}">Купить за ${esc(item.price)}</button>`
                       : html`<button class="btn small outline" disabled>Не хватает coins</button>`)}
                 </div>
               </div>
@@ -2649,8 +2658,8 @@ async viewHome(){
                   <div class="nick-actions">
                     <span class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</span>
                     ${item.isActive
-                      ? html`<button class="btn small outline deactivate-btn" data-item="${item.id}">Сделать неактивным</button>`
-                      : html`<button class="btn small primary activate-btn" data-item="${item.id}">Сделать активным</button>`}
+                      ? html`<button class="btn small outline deactivate-btn" data-item="${escAttr(item.id)}">Сделать неактивным</button>`
+                      : html`<button class="btn small primary activate-btn" data-item="${escAttr(item.id)}">Сделать активным</button>`}
                   </div>
                 </div>
               `).join('')}
