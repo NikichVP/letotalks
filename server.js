@@ -64,6 +64,25 @@ const DEFAULT_GPT_MODERATION_URL = (() => {
 const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERATION_URL;
 const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
 
+// Защита от утечки ключа/данных: endpoint модерации должен быть https и
+// не указывать на внутренний/приватный адрес (иначе текст и Bearer-ключ уйдут не туда).
+(() => {
+  try {
+    const u = new URL(GPT_MODERATION_URL);
+    const host = u.hostname.toLowerCase();
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    const isPrivate = /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
+    if (u.protocol !== 'https:' && !isLocal) {
+      console.warn(`⚠️  GPT_MODERATION_URL не https (${u.protocol}//${host}) — ключ и данные могут передаваться небезопасно.`);
+    }
+    if (isPrivate) {
+      console.warn(`⚠️  GPT_MODERATION_URL указывает на приватный адрес (${host}) — проверьте конфигурацию (возможный SSRF/утечка).`);
+    }
+  } catch {
+    console.warn(`⚠️  GPT_MODERATION_URL некорректен: ${GPT_MODERATION_URL}`);
+  }
+})();
+
 const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
 
 const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
@@ -2522,7 +2541,7 @@ app.post('/api/auth/logout', (req,res)=>{
 
 app.get('/api/user/stats', (req,res)=>{
   const u = getUserFromRequest(req);
-  if (!u) return res.json({ ok:false, error:'unauthorized' });
+  if (!u) return res.status(401).json({ ok:false, error:'unauthorized' });
   const earned = calculateEarnedCoins(u);
   const spent = getUserSpentCoins(u.id);
   const available = Math.max(0, earned - spent);
@@ -2755,8 +2774,14 @@ app.get('/api/shop/my-items', (req, res) => {
   });
 });
 
-/* Catch-all для SPA */
-app.get(/^\/(?!.*\.).*$/, (req, res) => {
+/* Неизвестные API-маршруты — всегда JSON 404, чтобы catch-all SPA ниже
+   случайно не отдал им index.html (HTML вместо данных). */
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'not_found' });
+});
+
+/* Catch-all для SPA (исключаем /api и файлы с расширением) */
+app.get(/^\/(?!api\/)(?!.*\.).*$/, (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
