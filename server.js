@@ -190,6 +190,15 @@ function invalidateAllTeacherPayloads() {
   invalidateCache(TEACHER_PAYLOAD_PREFIX);
 }
 
+// Точечно: сбрасываем кэш только тех учителей, под которыми пользователь
+// комментировал (там виден его ник) — вместо сноса кэша всех учителей.
+function invalidateTeacherPayloadsForUser(userId) {
+  if (!userId) return;
+  for (const teacherId of getTeacherIdsForCommentAuthor(userId)) {
+    invalidateTeacherPayloadCache(teacherId);
+  }
+}
+
 function invalidateAllTeacherCaches(teacherId = null) {
   invalidateTeacherAggregates();
   if (teacherId) {
@@ -247,6 +256,7 @@ const {
   getAllCommentsByUser,
   getUserVote,
   getVotersForComment,
+  getTeacherIdsForCommentAuthor,
   setUserVote,
   countVotesForCommentBulk,
   getActiveNickname,
@@ -2103,9 +2113,10 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
 app.get('/api/admin/comments', requireAdmin, (req,res)=>{
   const limit = Math.max(1, Math.min(500, Number(req.query.limit||100)));
   const all = getAdminComments(limit);
+  const usersById = getUsersByIds(all.map(c => c.author_uid).filter(Boolean));
 
   const out = all.map(c=>{
-    const u = c.author_uid ? findUserById(String(c.author_uid)) : null;
+    const u = c.author_uid ? usersById.get(String(c.author_uid)) : null;
     return {
       id:c.id, teacherId:c.teacher_id, ts:c.ts, ts_iso:c.ts_iso,
       text:c.text, author:c.author,
@@ -2649,9 +2660,10 @@ function buildShopStateForUser(user) {
   const purchasedItems = new Set(getUserPurchasedItems(user.id).map(row => row.item_id));
   const activeByType = new Map(getActiveInventoryForUser(user.id).map(row => [row.item_type, row.item_id]));
 
-  const balance = getAvailableCoins(user);
+  // Считаем один раз: getAvailableCoins сам зовёт earned+spent, не дублируем.
   const earnedCoins = calculateEarnedCoins(user);
   const spentCoins = getUserSpentCoins(user.id);
+  const balance = Math.max(0, earnedCoins - spentCoins);
   const activeNickname = getActiveNickname(user.id);
 
   return {
@@ -2727,7 +2739,7 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
     balanceAfter: shopState?.balance ?? availableCoins
   });
 
-  invalidateAllTeacherPayloads();
+  invalidateTeacherPayloadsForUser(u.id);
 
   res.json({
     ok: true,
@@ -2773,7 +2785,7 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   });
 
   const shopState = buildShopStateForUser(u);
-  invalidateAllTeacherPayloads();
+  invalidateTeacherPayloadsForUser(u.id);
 
   res.json({
     ok: true,
@@ -2809,7 +2821,7 @@ app.post('/api/shop/deactivate', express.json(), (req, res) => {
   });
 
   const shopState = buildShopStateForUser(u);
-  invalidateAllTeacherPayloads();
+  invalidateTeacherPayloadsForUser(u.id);
 
   res.json({
     ok: true,

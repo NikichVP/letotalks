@@ -828,6 +828,14 @@ function createDbProcessing({
     return getVotersForCommentStmt.all(commentId);
   }
 
+  // Учителя, под которыми у пользователя есть комментарии — чтобы при смене ника
+  // инвалидировать только их кэш, а не всех учителей.
+  const teacherIdsByAuthorStmt = db.prepare(`SELECT DISTINCT teacher_id FROM comments WHERE author_uid = ?`);
+  function getTeacherIdsForCommentAuthor(userId) {
+    if (!userId) return [];
+    return teacherIdsByAuthorStmt.all(String(userId)).map(r => r.teacher_id);
+  }
+
   function setUserVote(commentId, userId, newVote) {
     if (newVote === 0) {
       const stmt = db.prepare('DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?');
@@ -1464,6 +1472,7 @@ function createDbProcessing({
     getAllCommentsByUser,
     getUserVote,
     getVotersForComment,
+    getTeacherIdsForCommentAuthor,
     setUserVote,
     countVotesForCommentBulk,
     getUserVotesForComments,
