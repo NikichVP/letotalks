@@ -56,6 +56,105 @@ function ensureDirsAndDb({ dataDir, photoDir, requestPhotoDir, dbPath }) {
   }
 }
 
+// Версионные миграции схемы. Идемпотентны: трекаются через PRAGMA user_version.
+function runSchemaMigrations(db) {
+  const version = db.pragma('user_version', { simple: true });
+
+  // v1: comments.id -> AUTOINCREMENT; CHECK-констрейнты на голоса/оценки/агрегаты.
+  // Пересборка таблиц по штатной процедуре SQLite (foreign_keys OFF + транзакция).
+  if (version < 1) {
+    db.pragma('foreign_keys = OFF');
+    try {
+      db.transaction(() => {
+        // comments -> AUTOINCREMENT (id сохраняем как есть)
+        db.exec(`
+          CREATE TABLE comments_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            ts_iso TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT 'Аноним',
+            text TEXT NOT NULL DEFAULT '',
+            author_uid TEXT DEFAULT '',
+            FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+          );
+          INSERT INTO comments_new (id, teacher_id, ts, ts_iso, author, text, author_uid)
+            SELECT id, teacher_id, ts, ts_iso, author, text, author_uid FROM comments;
+          DROP TABLE comments;
+          ALTER TABLE comments_new RENAME TO comments;
+          CREATE INDEX IF NOT EXISTS idx_comments_teacher ON comments(teacher_id);
+          CREATE INDEX IF NOT EXISTS idx_comments_ts ON comments(ts DESC);
+          CREATE INDEX IF NOT EXISTS idx_comments_author_uid ON comments(author_uid);
+        `);
+
+        // comment_votes -> CHECK(vote IN (-1,1)); некорректные значения отбрасываем
+        db.exec(`
+          DELETE FROM comment_votes WHERE vote NOT IN (-1, 1);
+          CREATE TABLE comment_votes_new (
+            comment_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            vote INTEGER NOT NULL CHECK (vote IN (-1, 1)),
+            ts INTEGER NOT NULL,
+            PRIMARY KEY (comment_id, user_id),
+            FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          );
+          INSERT INTO comment_votes_new SELECT comment_id, user_id, vote, ts FROM comment_votes;
+          DROP TABLE comment_votes;
+          ALTER TABLE comment_votes_new RENAME TO comment_votes;
+          CREATE INDEX IF NOT EXISTS idx_votes_comment ON comment_votes(comment_id);
+          CREATE INDEX IF NOT EXISTS idx_votes_user ON comment_votes(user_id);
+        `);
+
+        // user_ratings -> CHECK(value BETWEEN 1 AND 5); некорректные отбрасываем
+        db.exec(`
+          DELETE FROM user_ratings WHERE value < 1 OR value > 5;
+          CREATE TABLE user_ratings_new (
+            user_id TEXT NOT NULL,
+            teacher_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value INTEGER NOT NULL CHECK (value BETWEEN 1 AND 5),
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (user_id, teacher_id, key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+          );
+          INSERT INTO user_ratings_new SELECT user_id, teacher_id, key, value, updated_ts FROM user_ratings;
+          DROP TABLE user_ratings;
+          ALTER TABLE user_ratings_new RENAME TO user_ratings;
+          CREATE INDEX IF NOT EXISTS idx_user_ratings_teacher ON user_ratings(teacher_id, key);
+        `);
+
+        // ratings -> CHECK(sum>=0, count>=0); отрицательные клампим в 0
+        db.exec(`
+          UPDATE ratings SET sum = 0 WHERE sum < 0;
+          UPDATE ratings SET count = 0 WHERE count < 0;
+          CREATE TABLE ratings_new (
+            teacher_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            sum INTEGER NOT NULL DEFAULT 0 CHECK (sum >= 0),
+            count INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+            PRIMARY KEY (teacher_id, key),
+            FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+          );
+          INSERT INTO ratings_new SELECT teacher_id, key, sum, count FROM ratings;
+          DROP TABLE ratings;
+          ALTER TABLE ratings_new RENAME TO ratings;
+        `);
+
+        db.pragma('user_version = 1');
+      })();
+
+      const fkErrors = db.pragma('foreign_key_check');
+      if (Array.isArray(fkErrors) && fkErrors.length) {
+        console.warn('⚠️  foreign_key_check после миграции v1 нашёл проблемы:', fkErrors.length);
+      }
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+  }
+}
+
 function createDbProcessing({
   dbPath,
   defaultPhoto,
@@ -102,7 +201,7 @@ function createDbProcessing({
     );
 
     CREATE TABLE IF NOT EXISTS comments (
-      id INTEGER PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
       teacher_id TEXT NOT NULL,
       ts INTEGER NOT NULL,
       ts_iso TEXT NOT NULL,
@@ -118,8 +217,8 @@ function createDbProcessing({
     CREATE TABLE IF NOT EXISTS ratings (
       teacher_id TEXT NOT NULL,
       key TEXT NOT NULL,
-      sum INTEGER NOT NULL DEFAULT 0,
-      count INTEGER NOT NULL DEFAULT 0,
+      sum INTEGER NOT NULL DEFAULT 0 CHECK (sum >= 0),
+      count INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
       PRIMARY KEY (teacher_id, key),
       FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
     );
@@ -127,7 +226,7 @@ function createDbProcessing({
     CREATE TABLE IF NOT EXISTS comment_votes (
       comment_id INTEGER NOT NULL,
       user_id TEXT NOT NULL,
-      vote INTEGER NOT NULL,
+      vote INTEGER NOT NULL CHECK (vote IN (-1, 1)),
       ts INTEGER NOT NULL,
       PRIMARY KEY (comment_id, user_id),
       FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE,
@@ -172,7 +271,7 @@ function createDbProcessing({
       user_id TEXT NOT NULL,
       teacher_id TEXT NOT NULL,
       key TEXT NOT NULL,
-      value INTEGER NOT NULL,
+      value INTEGER NOT NULL CHECK (value BETWEEN 1 AND 5),
       updated_ts INTEGER NOT NULL,
       PRIMARY KEY (user_id, teacher_id, key),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -254,6 +353,11 @@ function createDbProcessing({
       telegram_message_id TEXT
     );
   `);
+
+  // --- Версионные миграции схемы (для уже существующих БД) ---
+  // Свежие БД получают финальную схему сразу из блока выше; здесь приводим
+  // старые базы к ней: AUTOINCREMENT для comments и CHECK-констрейнты.
+  runSchemaMigrations(db);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS user_inventory (
@@ -688,18 +792,12 @@ function createDbProcessing({
     return stmt.all();
   }
 
-  function getNextCommentId() {
-    const stmt = db.prepare('SELECT MAX(id) as maxId FROM comments');
-    const row = stmt.get();
-    return (row.maxId || 0) + 1;
-  }
-
   function addComment({ teacherId, author = 'Аноним', text, author_uid = '' }) {
     const ts = Date.now();
-    const id = getNextCommentId();
-    const stmt = db.prepare('INSERT INTO comments (id, teacher_id, ts, ts_iso, author, text, author_uid) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    stmt.run(id, teacherId, ts, new Date(ts).toISOString(), author, text, author_uid);
-    return id;
+    // id назначает SQLite (AUTOINCREMENT) — без гонки SELECT MAX(id)+1.
+    const stmt = db.prepare('INSERT INTO comments (teacher_id, ts, ts_iso, author, text, author_uid) VALUES (?, ?, ?, ?, ?, ?)');
+    const info = stmt.run(teacherId, ts, new Date(ts).toISOString(), author, text, author_uid);
+    return Number(info.lastInsertRowid);
   }
 
   function deleteComment(commentId) {
