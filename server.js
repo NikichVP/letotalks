@@ -1184,6 +1184,15 @@ function getUserFromRequest(req, res = null){
   return user || null;
 }
 
+// Возвращает вошедшего и НЕ забаненного пользователя для мутаций.
+// Если не вошёл (401) или забанен (403) — отправляет ответ и возвращает null.
+function getActiveUser(req, res) {
+  const u = getUserFromRequest(req, res);
+  if (!u) { res.status(401).json({ error: 'unauthorized' }); return null; }
+  if (isUserBanned(u.id)) { res.status(403).json({ error: 'banned', message: 'account_banned' }); return null; }
+  return u;
+}
+
 function invalidateSession(token) {
   if (!token) return;
   const tokenHash = hashToken(token);
@@ -1419,9 +1428,9 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       return res.status(400).json({ error: 'bad_request', message: 'empty' });
     }
 
-    // Бан — блокируем только текстовые комментарии
-    if (textStr && u && isUserBanned(u.id)) {
-      return res.status(403).json({ error: 'banned', message: 'commenting_banned' });
+    // Бан блокирует любое действие (и комментарий, и оценку).
+    if (isUserBanned(u.id)) {
+      return res.status(403).json({ error: 'banned', message: 'account_banned' });
     }
 
     const handleLocalBan = async () => {
@@ -1546,15 +1555,15 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
 });
 
 app.post('/api/comment/vote', (req,res)=>{
-  const u = getUserFromRequest(req);
-  if (!u) return res.json({error:'unauthorized'});
+  const u = getActiveUser(req, res);
+  if (!u) return;
 
   const {commentId, vote} = req.body || {};
   const c = getCommentById(commentId);
-  if (!c) return res.json({error:'not_found'});
+  if (!c) return res.status(404).json({error:'not_found'});
 
   if (c.author_uid && String(c.author_uid)===String(u.id)){
-    return res.json({error:'forbidden'});
+    return res.status(403).json({error:'forbidden'});
   }
 
   const newVote = vote==='like' ? 1 : vote==='dislike' ? -1 : 0;
@@ -1583,6 +1592,8 @@ app.post('/api/comment/vote', (req,res)=>{
 });
 
 app.post('/api/teacher-request', (req, res) => {
+  const u = getActiveUser(req, res);
+  if (!u) return;
   teacherRequestUpload(req, res, async uploadErr => {
     if (uploadErr) {
       const code = uploadErr?.code || uploadErr?.message;
@@ -1982,7 +1993,8 @@ app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
 
 // --- Жалобы на комментарии (пользователи -> Telegram админу) ---
 app.post('/api/report-comment', express.json(), async (req, res) => {
-  const u = getUserFromRequest(req);
+  const u = getActiveUser(req, res);
+  if (!u) return;
   const { commentId, reason } = req.body || {};
   const cleanedReason = String(reason || '').trim();
   if (!commentId || !cleanedReason) return res.status(400).json({ error: 'bad_request' });
@@ -1991,7 +2003,7 @@ app.post('/api/report-comment', express.json(), async (req, res) => {
   if (!comment) return res.status(404).json({ error: 'comment_not_found' });
 
 
-  const reporter = u ? u.email : 'анон';
+  const reporter = u.email;
   const messageParts = [
     '🚩 Жалоба на комментарий',
     `ID: ${commentId}`,
@@ -2512,8 +2524,8 @@ app.get('/api/shop/items', (req, res) => {
 });
 
 app.post('/api/shop/buy', express.json(), (req, res) => {
-  const u = getUserFromRequest(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
+  const u = getActiveUser(req, res);
+  if (!u) return;
 
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
@@ -2579,8 +2591,8 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
 });
 
 app.post('/api/shop/activate', express.json(), (req, res) => {
-  const u = getUserFromRequest(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
+  const u = getActiveUser(req, res);
+  if (!u) return;
 
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
@@ -2625,8 +2637,8 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
 });
 
 app.post('/api/shop/deactivate', express.json(), (req, res) => {
-  const u = getUserFromRequest(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
+  const u = getActiveUser(req, res);
+  if (!u) return;
 
   const { itemId } = req.body || {};
   if (!itemId) return res.status(400).json({ error: 'bad_request' });
