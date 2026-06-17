@@ -1477,7 +1477,17 @@ async function sendAuthCodeEmail(email, code) {
   }
 }
 
-/* --- PUBLIC API --- */
+// === Жёсткая блокировка доступа ===
+// Незалогиненный пользователь не получает НИКАКИХ данных. Публичны только
+// эндпоинты авторизации (/api/auth/*) и Telegram webhook (со своим секретом).
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/auth/') || req.path === '/telegram/webhook') return next();
+  const u = getUserFromRequest(req, res);
+  if (!u) return res.status(401).json({ error: 'unauthorized' });
+  next();
+});
+
+/* --- PUBLIC API (доступно только вошедшим, см. гейт выше) --- */
 
 app.get('/api/departments',(req,res)=>{
   const collator = RU_COLLATOR;

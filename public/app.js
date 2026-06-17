@@ -428,6 +428,8 @@ const Auth = {
 
   function watchUnauthorized(res){
     if (!res) return;
+    // Ошибки самого процесса входа (неверный код и т.п.) не считаем «разлогином».
+    if (res.url && /\/api\/auth\//.test(res.url)) return;
     if (res.status === 401){
       Auth.handleUnauthorized('status_401');
       return;
@@ -699,12 +701,16 @@ const Router = {
       pathName = h.split('?')[0] || h;
     }
     const isLoginRoute = pathName === '/login';
-    const isPolicyRoute = pathName === '/policy';
-    if (!Auth.isLogged() && !(isLoginRoute || isPolicyRoute)) {
-      this.go('/login');
+    // Жёсткая блокировка: незалогиненный видит ТОЛЬКО экран входа (на весь экран),
+    // ни на одну другую страницу попасть нельзя. Класс lockout скрывает навбар/футер.
+    if (!Auth.isLogged()) {
+      document.body.classList.add('lockout');
+      if (!isLoginRoute) { this.go('/login'); return; }
+      await App.viewLogin();
       return;
     }
-    if (Auth.isLogged() && isLoginRoute) {
+    document.body.classList.remove('lockout');
+    if (isLoginRoute) {
       this.go('/');
       return;
     }
@@ -1783,18 +1789,15 @@ async viewHome(){
     });
   },
 
-  // --- экран логина
+  // --- экран логина (на весь экран, без навбара/футера — см. body.lockout)
   async viewLogin(){
-    await this.mountNavbar();
+    document.body.classList.add('lockout');
 
     $('#app').innerHTML = html`
-      <section class="section">
-        <div class="row space-between wrap">
-          <h2>Вход по почте</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
-        </div>
-
-        <div class="kv" id="loginBox" style="max-width:440px">
+      <section class="login-screen">
+        <div class="login-brand"><span class="login-logo">L</span> leto<span>talks</span></div>
+        <div class="kv" id="loginBox">
+          <h2 style="margin:0 0 12px">Вход по почте</h2>
           <!-- Шаг 1: ввод почты -->
           <div id="stageEmail">
             <p class="muted">Введите свою почту <strong>${EMAIL_DOMAIN}</strong> — мы отправим на неё 6-значный код для входа.</p>
