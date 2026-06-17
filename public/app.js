@@ -580,15 +580,33 @@ function clearTeacherCacheInStorage() {
   }
 }
 
+// Единая обёртка над fetch: всегда возвращает объект (не бросает), безопасно
+// парсит JSON, нормализует ok по HTTP-статусу. Сетевые ошибки -> {ok:false,...}.
+async function apiFetch(url, opts) {
+  let r;
+  try {
+    r = await fetch(url, opts);
+  } catch (err) {
+    if (err?.name === 'AbortError') return { ok: false, error: 'aborted', _status: 0, _aborted: true };
+    return { ok: false, error: 'network_error', _status: 0 };
+  }
+  let data = null;
+  try { data = await r.json(); } catch { data = null; }
+  if (data === null || typeof data !== 'object') data = {};
+  if (!('ok' in data)) data.ok = r.ok;
+  else if (!r.ok) data.ok = false;
+  data._status = r.status;
+  return data;
+}
+
 async function fetchTeachersFromServer() {
-  const r = await fetch('/api/teachers', { headers: { 'Cache-Control': 'no-cache' } });
-  if (!r.ok) throw new Error('teachers_fetch_failed');
-  const jr = await r.json().catch(()=>({ teachers: [] }));
+  const jr = await apiFetch('/api/teachers', { headers: { 'Cache-Control': 'no-cache' } });
+  if (!jr.ok) throw new Error('teachers_fetch_failed');
   return Array.isArray(jr?.teachers) ? jr.teachers : [];
 }
 
 const API = {
-  async departments(){ const r=await fetch('/api/departments'); return (await r.json()).departments; },
+  async departments(){ const d = await apiFetch('/api/departments'); return Array.isArray(d.departments) ? d.departments : []; },
 
   /**
    * Лёгкий запрос для главной страницы.
@@ -600,9 +618,9 @@ const API = {
    * @returns {Promise<{characteristics: Object<string, any[]>, departments: {name:string, list:any[]}[]}>}
    */
   async home(){
-    const r = await fetch('/api/home', { headers: { 'Cache-Control': 'no-cache' } });
-    if (!r.ok) throw new Error('home_fetch_failed');
-    return await r.json(); // { characteristics: {key:[]}, departments: [{name,list:[]}] }
+    const d = await apiFetch('/api/home', { headers: { 'Cache-Control': 'no-cache' } });
+    if (!d.ok) throw new Error('home_fetch_failed');
+    return d; // { characteristics: {key:[]}, departments: [{name,list:[]}] }
   },
 
   /**
@@ -622,9 +640,8 @@ const API = {
     if (offset) p.set('offset', String(offset));
     if (q) p.set('q', String(q));
     if (department) p.set('department', String(department));
-    const r = await fetch(`/api/teachers?${p.toString()}`, { headers: { 'Cache-Control': 'no-cache' } });
-    if (!r.ok) throw new Error('teachers_page_fetch_failed');
-    const j = await r.json().catch(()=>({ teachers: [], total: 0 }));
+    const j = await apiFetch(`/api/teachers?${p.toString()}`, { headers: { 'Cache-Control': 'no-cache' } });
+    if (!j.ok) throw new Error('teachers_page_fetch_failed');
     return { teachers: Array.isArray(j?.teachers) ? j.teachers : [], total: Number(j?.total||0) };
   },
 
@@ -691,68 +708,59 @@ const API = {
     clearTeacherCacheInStorage();
   },
   async teacher(id){
-    const r = await fetch(`/api/teacher/${id}`, {
+    return await apiFetch(`/api/teacher/${encodeURIComponent(id)}`, {
       cache: 'no-store',
       headers: { 'Cache-Control': 'no-cache' }
     });
-    return await r.json();
   },
   async publish({teacherId, text, ratings, author}) {
-    const r = await fetch('/api/comment-with-ratings', {
+    const data = await apiFetch('/api/comment-with-ratings', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ teacherId, text, ratings, author })
     });
-    if (!r.ok) {
-      let payload = null;
-      try { payload = await r.json(); } catch {}
-      const err = new Error(payload?.error || 'publish_failed');
-      if (payload?.error) err.code = payload.error;
-      if (payload?.reason) err.reason = payload.reason;
-      if (payload?.score != null) err.score = payload.score;
-      if (payload?.retry_after_ms != null) err.retry_after_ms = payload.retry_after_ms;
-      if (payload?.message) err.message = payload.message; // e.g. commenting_banned
+    if (!data.ok) {
+      const err = new Error(data.message || data.error || 'publish_failed');
+      err.code = data.error;
+      if (data.reason) err.reason = data.reason;
+      if (data.score != null) err.score = data.score;
+      if (data.retry_after_ms != null) err.retry_after_ms = data.retry_after_ms;
       throw err;
     }
-    return await r.json();
+    return data;
   },
   async voteComment({commentId, vote}){ // vote: 'like' | 'dislike' | 'none'
-    const r = await fetch('/api/comment/vote', {
+    return await apiFetch('/api/comment/vote', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ commentId, vote })
     });
-    return await r.json();
   },
-  async myStats(){ const r = await fetch('/api/user/stats'); return await r.json(); },
+  async myStats(){ return await apiFetch('/api/user/stats'); },
   async teacherRequest(formData){
-    const r = await fetch('/api/teacher-request', {
-      method: 'POST',
-      body: formData
-    });
-    let data = null;
-    try { data = await r.json(); } catch { data = null; }
-    if (!r.ok || !data || data.ok === false) {
-      const err = new Error(data?.error || 'teacher_request_failed');
+    const data = await apiFetch('/api/teacher-request', { method: 'POST', body: formData });
+    if (!data.ok) {
+      const err = new Error(data.error || 'teacher_request_failed');
       err.response = data;
-      err.status = r.status;
+      err.status = data._status;
       throw err;
     }
     return data;
   },
 
   // --- admin ---
-  async adminComments(limit=100){ const r=await fetch(`/api/admin/comments?limit=${limit}`); return await r.json(); },
-  async adminCommenters(){ const r=await fetch('/api/admin/commenters'); return await r.json(); },
-  async adminCommentsByUser(userId){ const r=await fetch('/api/admin/comments/by-user?userId='+encodeURIComponent(userId)); return await r.json(); },
-  async adminDeleteComment(id){ const r=await fetch('/api/admin/comment/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({commentId:id})}); return await r.json(); },
-  async adminFindUser(email){ const r=await fetch('/api/admin/user/find?email='+encodeURIComponent(email)); return await r.json(); },
-  async adminUsers(){ const r=await fetch('/api/admin/users'); return await r.json(); },
-  async adminBanUser({email,userId,banned,reason}){ const r=await fetch('/api/admin/user/ban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,userId,banned,reason})}); return await r.json(); },
-  async adminTeachers(){ const r=await fetch('/api/admin/teachers'); return await r.json(); },
-  async adminUpsertTeacher(payload){ const r=await fetch('/api/admin/teacher/upsert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); return await r.json(); },
-  async adminDeleteTeacher(id){ const r=await fetch('/api/admin/teacher/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); return await r.json(); },
-  async adminListAdmins(){ const r=await fetch('/api/admin/admins'); return await r.json(); },
-  async adminAddAdmin(email){ const r=await fetch('/api/admin/admins/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})}); return await r.json(); },
-  async adminRemoveAdmin(email){ const r=await fetch('/api/admin/admins/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})}); return await r.json(); },
+  _post(url, body){ return apiFetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); },
+  async adminComments(limit=100){ return apiFetch(`/api/admin/comments?limit=${encodeURIComponent(limit)}`); },
+  async adminCommenters(){ return apiFetch('/api/admin/commenters'); },
+  async adminCommentsByUser(userId){ return apiFetch('/api/admin/comments/by-user?userId='+encodeURIComponent(userId)); },
+  async adminDeleteComment(id){ return this._post('/api/admin/comment/delete', { commentId:id }); },
+  async adminFindUser(email){ return apiFetch('/api/admin/user/find?email='+encodeURIComponent(email)); },
+  async adminUsers(){ return apiFetch('/api/admin/users'); },
+  async adminBanUser({email,userId,banned,reason}){ return this._post('/api/admin/user/ban', {email,userId,banned,reason}); },
+  async adminTeachers(){ return apiFetch('/api/admin/teachers'); },
+  async adminUpsertTeacher(payload){ return this._post('/api/admin/teacher/upsert', payload); },
+  async adminDeleteTeacher(id){ return this._post('/api/admin/teacher/delete', {id}); },
+  async adminListAdmins(){ return apiFetch('/api/admin/admins'); },
+  async adminAddAdmin(email){ return this._post('/api/admin/admins/add', {email}); },
+  async adminRemoveAdmin(email){ return this._post('/api/admin/admins/remove', {email}); },
 };
 
 /* ---------- router ---------- */
@@ -1739,17 +1747,18 @@ async viewHome(){
         await App.teacherProfile(null,tid, teacherPayload);
         Auth.refreshStatsAndPopover();
       }catch(err){
-        if (err?.message === 'rate_limited'){
+        const code = err?.code || err?.message;
+        if (code === 'rate_limited'){
           const sec = Math.max(1, Math.ceil((err.retry_after_ms ?? 60_000) / 1000));
           setStatus(`Слишком часто. Попробуйте через ${sec} сек.`, 'warn');
           alert(`Слишком часто. \nПопробуйте через ${sec} сек.`);
-        } else if (err?.message === 'profanity_forbidden') {
+        } else if (code === 'profanity_forbidden') {
           setStatus('Комментарий содержит запрещённую лексику. Исправьте текст и попробуйте снова.', 'warn');
           alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
-        } else if (err?.message === 'commenting_banned' || err?.message === 'banned') {
+        } else if (code === 'commenting_banned' || code === 'banned') {
           setStatus('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.', 'warn');
           alert('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.');
-        } else if (err?.message === 'comment_blocked' || err?.code === 'comment_blocked') {
+        } else if (code === 'comment_blocked') {
           const reasonLabel = err?.reason === 'llm_block'
             ? 'AI-модерация отклонила текст.'
             : 'Комментарий не прошёл проверку.';
