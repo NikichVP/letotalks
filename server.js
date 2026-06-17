@@ -82,13 +82,29 @@ const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
   }
 })();
 
+// --- Отправка кодов входа через Resend (с noreply@letotalks.com) ---
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
+const AUTH_EMAIL_FROM = (process.env.AUTH_EMAIL_FROM || 'LetoTalks <noreply@letotalks.com>').trim();
+
 const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
 
-const ALLOWED_EMAIL_DOMAIN = '@student.letovo.ru';
+// Кто может войти/зарегистрироваться: домены школы + явные адреса (например админ).
+const ALLOWED_EMAIL_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || '@student.letovo.ru')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const ALLOWED_LOGIN_EMAILS = new Set(
+  (process.env.ALLOWED_LOGIN_EMAILS || ROOT_ADMIN_EMAIL)
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+const ALLOWED_EMAIL_DOMAIN = ALLOWED_EMAIL_DOMAINS[0] || '@student.letovo.ru'; // для обратной совместимости сообщений
+function isEmailAllowed(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!e) return false;
+  if (ALLOWED_LOGIN_EMAILS.has(e)) return true;
+  return ALLOWED_EMAIL_DOMAINS.some(d => e.endsWith(d));
+}
 const SESSION_COOKIE = 'lt_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 дней
-const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут
-const AUTH_CHECK_INTERVAL_MS = 5000;
+const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут (срок жизни кода входа)
 const MAX_SESSIONS_PER_USER = 1; // Максимум одна одновременная сессия
 const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый час
 const MAX_LOGIN_ATTEMPTS = 10; // За час
@@ -424,7 +440,7 @@ function generateSecureToken() {
   return crypto.randomBytes(32).toString('base64url');
 }
 
-const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
+const PENDING_AUTH = new Map(); // sessionId -> { email, code, created, tries, ip, ua }
 
 const CYRILLIC_TO_LATIN = {
   'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
@@ -1419,40 +1435,46 @@ const apiRateLimiter = createSlidingWindowLimiter({ windowMs: 60_000, maxRequest
 app.use('/api', apiRateLimiter);
 
 
-/* GuerrillaMail helpers */
-async function gmGetEmailAddress(){
-  const url = 'https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=ru';
-  const r = await fetchWithProxy(url).catch(()=>null);
-  if (!r || !r.ok) throw new Error('gm_get_email_failed');
-  const j = await r.json();
-  return { email: j.email_addr, sid_token: j.sid_token };
-}
-
-async function gmCheckEmail(sid_token){
-  const url = `https://api.guerrillamail.com/ajax.php?f=check_email&seq=1&sid_token=${encodeURIComponent(sid_token)}`;
-  const r = await fetchWithProxy(url).catch(()=>null);
-  if (!r || !r.ok) return [];
-  const j = await r.json();
-  return Array.isArray(j.list) ? j.list : [];
-}
-
-async function gmFetchEmail(sid_token, id){
-  const url = `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${encodeURIComponent(id)}&sid_token=${encodeURIComponent(sid_token)}`;
-  const r = await fetchWithProxy(url).catch(()=>null);
-  if (!r || !r.ok) return null;
-  return await r.json();
-}
-
-function extractCode(text){
-  if (!text) return null;
-  const m = String(text).match(/\b(\d{6})\b/);
-  return m ? m[1] : null;
-}
-
-function extractPureEmail(s){
-  if (!s) return '';
-  const m = String(s).match(/<([^>]+)>/);
-  return (m ? m[1] : String(s)).trim().toLowerCase();
+/* Отправка кода входа письмом через Resend (https://resend.com).
+   Возвращает true при успехе. Если ключ не задан — false (вызывающий код
+   в dev-режиме выводит код в консоль). */
+async function sendAuthCodeEmail(email, code) {
+  if (!RESEND_API_KEY) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const resp = await fetchWithProxy('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: AUTH_EMAIL_FROM,
+        to: [email],
+        subject: `Код входа в LetoTalks: ${code}`,
+        text: `Ваш код для входа в LetoTalks: ${code}\n\nКод действует 10 минут. Если вы не запрашивали вход — просто проигнорируйте это письмо.`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#214E8A">Вход в LetoTalks</h2>
+          <p>Ваш код для входа:</p>
+          <div style="font-size:32px;font-weight:700;letter-spacing:6px;color:#214E8A;margin:16px 0">${code}</div>
+          <p style="color:#666">Код действует 10 минут. Если вы не запрашивали вход — проигнорируйте это письмо.</p>
+        </div>`
+      }),
+      signal: controller.signal
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      console.error('Resend error', resp.status, errText);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Resend send failed:', err && err.message ? err.message : err);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /* --- PUBLIC API --- */
@@ -2379,182 +2401,98 @@ app.post('/api/user/revoke-other-sessions', (req,res)=>{
 
 /* --- AUTH --- */
 
-app.post('/api/auth/request', authLimiter, async (req,res)=>{
+// Шаг 1: пользователь вводит свою почту → шлём код письмом (Resend).
+app.post('/api/auth/request', authLimiter, express.json(), async (req,res)=>{
   const ip = getClientIp(req);
   const ua = req.headers['user-agent'] || '';
+  const email = String(req.body?.email || '').trim().toLowerCase();
 
-  try{
-    let email, sid_token;
-    try{
-      const r = await gmGetEmailAddress();
-      email = r.email; sid_token = r.sid_token;
-    }catch{
-      const random = Math.random().toString(36).slice(2,10);
-      email = `${random}@guerrillamailblock.com`;
-      sid_token = null;
-    }
-
-    // Проверка на слишком много попыток входа
-    const attempts = getRecentLoginAttempts(email, ip);
-    if (attempts.count > MAX_LOGIN_ATTEMPTS && attempts.successful < 1) {
-      logSecurityEvent('login_rate_limit_exceeded', {
-        email,
-        ip,
-        userAgent: ua,
-        attempts: attempts.count,
-        severity: 'warning'
-      });
-      return res.status(429).json({
-        error: 'too_many_attempts',
-        message: 'Слишком много попыток входа. Попробуйте позже.'
-      });
-    }
-
-    const code = String(crypto.randomInt(100000, 1000000));
-    const sessionId = 'a-' + crypto.randomBytes(16).toString('hex');
-
-    PENDING_AUTH.set(sessionId, {
-      email, sid_token, code,
-      created: Date.now(),
-      seenIds: new Set(),
-      verified: false,
-      ip,
-      ua
-    });
-
-    logSecurityEvent('auth_request_initiated', {
-      email,
-      ip,
-      userAgent: ua
-    });
-
-    return res.json({
-      ok:true,
-      session_id: sessionId,
-      email,
-      code,
-      check_every_ms: AUTH_CHECK_INTERVAL_MS,
-      expires_in_ms: AUTH_SESSION_TTL_MS,
-      required_domain: ALLOWED_EMAIL_DOMAIN
-    });
-  }catch(err){
-    logSecurityEvent('auth_request_error', {
-      error: err.message,
-      ip,
-      userAgent: ua,
-      severity: 'error'
-    });
-    return res.status(500).json({ error:'auth_request_failed' });
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: 'invalid_email', message: 'Введите корректный email.' });
   }
+  if (!isEmailAllowed(email)) {
+    logSecurityEvent('login_wrong_domain', { email, domain: email.split('@')[1], ip, userAgent: ua, severity: 'warning' });
+    return res.status(403).json({ error: 'email_not_allowed', message: `Разрешён вход только с почты ${ALLOWED_EMAIL_DOMAIN}.`, required_domain: ALLOWED_EMAIL_DOMAIN });
+  }
+
+  // Лимит попыток на email/ip
+  const attempts = getRecentLoginAttempts(email, ip);
+  if (attempts.count > MAX_LOGIN_ATTEMPTS && attempts.successful < 1) {
+    logSecurityEvent('login_rate_limit_exceeded', { email, ip, userAgent: ua, attempts: attempts.count, severity: 'warning' });
+    return res.status(429).json({ error: 'too_many_attempts', message: 'Слишком много попыток входа. Попробуйте позже.' });
+  }
+
+  const code = String(crypto.randomInt(100000, 1000000));
+  const sessionId = 'a-' + crypto.randomBytes(16).toString('hex');
+  PENDING_AUTH.set(sessionId, { email, code, created: Date.now(), tries: 0, ip, ua });
+
+  const sent = await sendAuthCodeEmail(email, code);
+  if (!sent) {
+    if (IS_PRODUCTION) {
+      PENDING_AUTH.delete(sessionId);
+      return res.status(503).json({ error: 'email_send_failed', message: 'Не удалось отправить письмо. Попробуйте позже.' });
+    }
+    // dev-режим без настроенного Resend: показываем код в консоли сервера
+    console.log(`\n📧 [DEV] Код входа для ${email}: ${code}\n`);
+  }
+
+  logSecurityEvent('auth_request_initiated', { email, ip, userAgent: ua });
+  return res.json({ ok: true, session_id: sessionId, expires_in_ms: AUTH_SESSION_TTL_MS, email_sent: sent });
 });
 
-app.get('/api/auth/poll', authLimiter, async (req,res)=>{
-  const sessionId = String(req.query.session_id||'');
+// Шаг 2: пользователь вводит код → проверяем и логиним.
+app.post('/api/auth/verify', authLimiter, express.json(), (req,res)=>{
+  const sessionId = String(req.body?.session_id || '');
+  const code = String(req.body?.code || '').trim();
   const rec = PENDING_AUTH.get(sessionId);
-  if (!rec) return res.status(404).json({ error:'no_auth_session' });
+  if (!rec) return res.status(404).json({ error: 'no_auth_session' });
 
-  if (Date.now() - rec.created > AUTH_SESSION_TTL_MS){
+  if (Date.now() - rec.created > AUTH_SESSION_TTL_MS) {
     PENDING_AUTH.delete(sessionId);
-    return res.status(410).json({ error:'expired' });
+    return res.status(410).json({ error: 'expired', message: 'Код истёк. Запросите новый.' });
   }
 
-  if (!rec.sid_token){
-    return res.json({ status:'pending' });
+  rec.tries = (rec.tries || 0) + 1;
+  if (rec.tries > 5) {
+    PENDING_AUTH.delete(sessionId);
+    return res.status(429).json({ error: 'too_many_attempts', message: 'Слишком много попыток. Запросите новый код.' });
   }
 
-  const list = await gmCheckEmail(rec.sid_token);
-  for (const m of list){
-    const id = m.mail_id || m.id;
-    if (!id || rec.seenIds.has(id)) continue;
-    rec.seenIds.add(id);
+  if (!timingSafeEqualStr(code, rec.code)) {
+    recordLoginAttempt(rec.email, rec.ip, false);
+    logSecurityEvent('login_invalid_code', { email: rec.email, ip: rec.ip, userAgent: rec.ua, severity: 'warning' });
+    return res.status(401).json({ error: 'invalid_code', message: 'Неверный код.' });
+  }
 
-    const full = await gmFetchEmail(rec.sid_token, id);
-    if (!full) continue;
+  PENDING_AUTH.delete(sessionId);
+  const user = upsertUserOnLogin(rec.email);
+  recordLoginAttempt(rec.email, rec.ip, true);
 
-    const fromRaw = full.mail_from || '';
-    const from = extractPureEmail(fromRaw);
-    const subject = full.mail_subject || '';
-    const excerpt = full.mail_excerpt || '';
-    const body = full.mail_body || '';
+  const token = createSession(user.id, req);
+  setSessionCookie(res, token);
+  try { insertLoginEvent({ action: 'login', email: user.email, ip: getClientIp(req), ua: req.headers['user-agent'] || '' }); } catch {}
+  logSecurityEvent('login_successful', { userId: user.id, email: user.email, ip: rec.ip, userAgent: rec.ua });
 
-    const codeFound = extractCode(subject) || extractCode(excerpt) || extractCode(body);
-    if (!codeFound) continue;
-
-    if (codeFound !== rec.code){
-      recordLoginAttempt(from, rec.ip, false);
-      logSecurityEvent('login_invalid_code', {
-        email: from,
-        ip: rec.ip,
-        userAgent: rec.ua,
-        severity: 'warning'
-      });
-      continue;
-    }
-
-    if (!from.endsWith(ALLOWED_EMAIL_DOMAIN)){
-      recordLoginAttempt(from, rec.ip, false);
-      logSecurityEvent('login_wrong_domain', {
-        email: from,
-        domain: from.split('@')[1],
-        ip: rec.ip,
-        userAgent: rec.ua,
-        severity: 'warning'
-      });
-      return res.json({
-        status:'wrong_domain',
-        sender_email: from,
-        required_domain: ALLOWED_EMAIL_DOMAIN
-      });
-    }
-
-    rec.verified = true;
-    const user = upsertUserOnLogin(from);
-
-    // Записываем успешную попытку входа
-    recordLoginAttempt(from, rec.ip, true);
-
-    const token = createSession(user.id, req);
-    setSessionCookie(res, token);
-
-    try{
-      insertLoginEvent({
-        action: 'login',
-        email: user.email,
-        ip: getClientIp(req),
-        ua: req.headers['user-agent'] || ''
-      });
-    }catch{}
-
-    logSecurityEvent('login_successful', {
-      userId: user.id,
+  return res.json({
+    ok: true,
+    user: {
+      id: user.id,
       email: user.email,
-      ip: rec.ip,
-      userAgent: rec.ua
-    });
-
-    PENDING_AUTH.delete(sessionId);
-    return res.json({
-      ok:true,
-      user: {
-        id: user.id,
-        email: user.email,
-        username: user.username,
-        comment_count: Number(user.comment_count||0),
-        rating_count: Number(user.rating_count||0),
-        cast_likes: Number(user.cast_likes||0),
-        cast_dislikes: Number(user.cast_dislikes||0),
-        received_likes: Number(user.received_likes||0),
-        received_dislikes: Number(user.received_dislikes||0),
-        available_coins: getAvailableCoins(user),
-        earned_coins: calculateEarnedCoins(user),
-        spent_coins: getUserSpentCoins(user.id),
-        is_admin: isAdminUser(user),
-        is_super_admin: isSuperAdminUser(user),
-        is_banned: isUserBanned(user.id)
-      }
-    });
-  }
-  return res.json({ status:'pending' });
+      username: user.username,
+      comment_count: Number(user.comment_count||0),
+      rating_count: Number(user.rating_count||0),
+      cast_likes: Number(user.cast_likes||0),
+      cast_dislikes: Number(user.cast_dislikes||0),
+      received_likes: Number(user.received_likes||0),
+      received_dislikes: Number(user.received_dislikes||0),
+      available_coins: getAvailableCoins(user),
+      earned_coins: calculateEarnedCoins(user),
+      spent_coins: getUserSpentCoins(user.id),
+      is_admin: isAdminUser(user),
+      is_super_admin: isSuperAdminUser(user),
+      is_banned: isUserBanned(user.id)
+    }
+  });
 });
 
 app.get('/api/auth/me', (req,res)=>{

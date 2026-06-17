@@ -1790,124 +1790,130 @@ async viewHome(){
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
-          <h2>Вход по школьной почте</h2>
+          <h2>Вход по почте</h2>
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
 
-        <div class="kv" id="loginBox">
-          <p>Чтобы войти, отправьте письмо <strong>со своей школьной почты (${EMAIL_DOMAIN})</strong> на сгенерированный ниже адрес с <strong>6-значным кодом</strong> в теме или тексте.</p>
-
-          <div id="stageIdle">
-            <button id="genBtn" class="btn primary">Сгенерировать адрес и код</button>
+        <div class="kv" id="loginBox" style="max-width:440px">
+          <!-- Шаг 1: ввод почты -->
+          <div id="stageEmail">
+            <p class="muted">Введите свою почту <strong>${EMAIL_DOMAIN}</strong> — мы отправим на неё 6-значный код для входа.</p>
+            <form id="emailForm">
+              <div class="teacher-request-field">
+                <label for="loginEmail">Электронная почта</label>
+                <input id="loginEmail" type="email" autocomplete="email" placeholder="ivanov.ii@student.letovo.ru" required>
+              </div>
+              <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">
+                <button type="submit" id="sendCodeBtn" class="btn primary">Получить код</button>
+                <div id="emailStatus" class="status-msg muted"></div>
+              </div>
+            </form>
           </div>
 
-          <div id="stageActive" class="hidden">
-            <div class="row wrap" style="gap:20px; align-items:flex-start">
-              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 200px;">
-                <div class="muted" style="margin-bottom: 4px;">Временный адрес</div>
-                <div id="tmpEmail" class="badge" style="user-select:all; margin-bottom: 4px;"></div>
-                <button id="copyEmail" class="btn small outline">Скопировать адрес</button>
+          <!-- Шаг 2: ввод кода -->
+          <div id="stageCode" class="hidden">
+            <p class="muted">Код отправлен на <strong id="sentToEmail"></strong>. Введите его ниже.</p>
+            <form id="codeForm">
+              <div class="teacher-request-field">
+                <label for="loginCode">Код из письма</label>
+                <input id="loginCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
               </div>
-              <div style="display: flex; flex-direction: column; gap: 8px; min-width: 140px;">
-                <div class="muted" style="margin-bottom: 4px;">Ваш код</div>
-                <div id="tmpCode" class="badge" style="user-select:all; margin-bottom: 4px;"></div>
-                <button id="copyCode" class="btn small outline">Скопировать код</button>
+              <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">
+                <button type="submit" id="verifyBtn" class="btn primary">Войти</button>
+                <button type="button" id="changeEmailBtn" class="btn small outline">Изменить почту</button>
+                <div id="codeStatus" class="status-msg muted"></div>
               </div>
-            </div>
-
-            <div class="empty" id="statusLine" style="margin-top:10px">Ждём письмо…</div>
-            <div class="muted" id="hintLine">Отправьте письмо со своей почты, оканчивающейся на ${EMAIL_DOMAIN}.</div>
-
-            <div class="row" style="margin-top:10px">
-              <button id="cancelBtn" class="btn outline">Сбросить</button>
-            </div>
+            </form>
           </div>
         </div>
       </section>
     `;
 
     let sessionId = null;
-    let pollTimer = null;
-    const $email = $('#tmpEmail');
-    const $code  = $('#tmpCode');
-    const $status= $('#statusLine');
-    const $stageIdle = $('#stageIdle');
-    const $stageActive = $('#stageActive');
+    const stageEmail = $('#stageEmail');
+    const stageCode  = $('#stageCode');
+    const emailInput = $('#loginEmail');
+    const codeInput  = $('#loginCode');
+    const emailStatus = $('#emailStatus');
+    const codeStatus  = $('#codeStatus');
+    const setStatus = (el, text, variant='muted')=>{
+      if (!el) return;
+      el.textContent = text || '';
+      el.classList.toggle('error', variant==='error');
+      el.classList.toggle('success', variant==='success');
+      el.classList.toggle('muted', !variant || variant==='muted');
+    };
 
-    function setActive(on){
-      $stageIdle.classList.toggle('hidden', !!on);
-      $stageActive.classList.toggle('hidden', !on);
-    }
-
-    $('#genBtn')?.addEventListener('click', async ()=>{
+    $('#emailForm')?.addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const email = (emailInput?.value || '').trim();
+      if (!email) { setStatus(emailStatus, 'Введите почту.', 'error'); return; }
+      const btn = $('#sendCodeBtn');
+      if (btn) btn.disabled = true;
+      setStatus(emailStatus, 'Отправляем код…');
       try{
-        const r = await fetch('/api/auth/request',{method:'POST'});
-        const j = await r.json();
-        if (!j.ok) throw new Error('request_failed');
-        sessionId = j.session_id;
-        $email.textContent = j.email;
-        $code.textContent  = j.code;
-        setActive(true);
-        $status.textContent = 'Ждём письмо…';
-
-        const interval = Math.max(1000, Number(j.check_every_ms||5000));
-        pollTimer = setInterval(async ()=>{
-          try{
-            const r2 = await fetch(`/api/auth/poll?session_id=${encodeURIComponent(sessionId)}`);
-            const p = await r2.json();
-            if (p.ok){
-              clearInterval(pollTimer); pollTimer=null;
-              Auth.set({
-                loggedIn:true,
-                id: p.user.id,
-                email: p.user.email,
-                username: p.user.username,
-                comment_count: p.user.comment_count,
-                rating_count: p.user.rating_count,
-                cast_likes: p.user.cast_likes||0,
-                cast_dislikes: p.user.cast_dislikes||0,
-                received_likes: p.user.received_likes||0,
-                received_dislikes: p.user.received_dislikes||0,
-                _isAdmin: !!p.user.is_admin,
-                _isSuperAdmin: !!p.user.is_super_admin,
-                _isBanned: !!p.user.is_banned
-              });
-              Router.go('/');
-            } else if (p.status === 'wrong_domain'){
-              $status.textContent = `Получено письмо с ${p.sender_email}, но требуется ${p.required_domain}`;
-            } else if (p.error === 'expired'){
-              clearInterval(pollTimer); pollTimer=null;
-              $status.textContent = 'Истёк срок ожидания. Сгенерируйте новый адрес и код.';
-            } else {
-              // pending
-            }
-          }catch{}
-        }, interval);
+        const r = await apiFetch('/api/auth/request', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ email })
+        });
+        if (r.ok){
+          sessionId = r.session_id;
+          $('#sentToEmail').textContent = email;
+          stageEmail.classList.add('hidden');
+          stageCode.classList.remove('hidden');
+          setStatus(codeStatus, r.email_sent ? '' : 'Письмо не настроено — код показан в консоли сервера (dev).', r.email_sent ? 'muted' : 'muted');
+          codeInput?.focus();
+        } else {
+          setStatus(emailStatus, r.message || (r.error === 'email_not_allowed' ? `Разрешён вход только с почты ${EMAIL_DOMAIN}.` : 'Не удалось отправить код.'), 'error');
+        }
       }catch{
-        alert('Не удалось сгенерировать временный адрес. Попробуйте позже.');
+        setStatus(emailStatus, 'Ошибка сети. Попробуйте позже.', 'error');
+      }finally{
+        if (btn) btn.disabled = false;
       }
     });
 
-    $('#cancelBtn')?.addEventListener('click', ()=>{
-      if (pollTimer){ clearInterval(pollTimer); pollTimer=null; }
-      setActive(false);
-      sessionId = null; $email.textContent=''; $code.textContent='';
+    $('#codeForm')?.addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const code = (codeInput?.value || '').trim();
+      if (!code) { setStatus(codeStatus, 'Введите код.', 'error'); return; }
+      const btn = $('#verifyBtn');
+      if (btn) btn.disabled = true;
+      setStatus(codeStatus, 'Проверяем…');
+      try{
+        const r = await apiFetch('/api/auth/verify', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ session_id: sessionId, code })
+        });
+        if (r.ok){
+          const u = r.user || {};
+          Auth.set({
+            loggedIn:true, id:u.id, email:u.email, username:u.username,
+            comment_count:u.comment_count, rating_count:u.rating_count,
+            cast_likes:u.cast_likes||0, cast_dislikes:u.cast_dislikes||0,
+            received_likes:u.received_likes||0, received_dislikes:u.received_dislikes||0,
+            _isAdmin:!!u.is_admin, _isSuperAdmin:!!u.is_super_admin, _isBanned:!!u.is_banned
+          });
+          Router.go('/');
+        } else if (r.error === 'expired'){
+          setStatus(codeStatus, 'Код истёк. Запросите новый.', 'error');
+        } else {
+          setStatus(codeStatus, r.message || 'Неверный код.', 'error');
+        }
+      }catch{
+        setStatus(codeStatus, 'Ошибка сети. Попробуйте позже.', 'error');
+      }finally{
+        if (btn) btn.disabled = false;
+      }
     });
 
-    $('#copyEmail')?.addEventListener('click', async ()=>{
-      try{
-        await navigator.clipboard.writeText($email.textContent);
-        $status.textContent = 'Адрес скопирован!';
-        setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
-      }catch{}
-    });
-
-    $('#copyCode')?.addEventListener('click', async ()=>{
-      try{
-        await navigator.clipboard.writeText($code.textContent);
-        $status.textContent = 'Код скопирован!';
-        setTimeout(()=>{ $status.textContent='Ждём письмо…'; }, 1200);
-      }catch{}
+    $('#changeEmailBtn')?.addEventListener('click', ()=>{
+      sessionId = null;
+      stageCode.classList.add('hidden');
+      stageEmail.classList.remove('hidden');
+      if (codeInput) codeInput.value = '';
+      setStatus(codeStatus, '');
+      emailInput?.focus();
     });
   },
 
