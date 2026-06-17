@@ -376,6 +376,25 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: true,
   trustProxy: false
 });
+// Проверка реальной сигнатуры (magic bytes) загруженного изображения: PNG/JPEG/WebP.
+function hasValidImageSignature(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(12);
+    const read = fs.readSync(fd, buf, 0, 12, 0);
+    if (read < 12) return false;
+    const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    const isJpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+    const isWebp = buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP';
+    return isPng || isJpeg || isWebp;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+
 // === БЕЗОПАСНОСТЬ: Функции для работы с хешированными токенами ===
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -1727,6 +1746,15 @@ app.post('/api/teacher-request', (req, res) => {
     }
 
     try {
+      // multer доверяет Content-Type из запроса — проверяем реальную сигнатуру файла.
+      if (req.file) {
+        const photoPath = path.join(REQUEST_PHOTO_DIR, req.file.filename);
+        if (!hasValidImageSignature(photoPath)) {
+          try { fs.unlinkSync(photoPath); } catch {}
+          return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
+        }
+      }
+
       const fields = req.body || {};
       const lastName = sanitizeRequestField(fields.lastName, 120);
       const firstName = sanitizeRequestField(fields.firstName, 120);
