@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 const { Blob } = require('buffer');
@@ -79,6 +80,9 @@ const SESSION_BINDING_MODE = (process.env.SESSION_BINDING_MODE || 'strict').toLo
 
 const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 
+// Один Collator на процесс — его создание дорогое, не пересоздаём на каждый вызов.
+const RU_COLLATOR = new Intl.Collator('ru', { sensitivity: 'base' });
+
 const DEFAULT_SHOP_ITEMS = [
   { id: 'nick-0', name: 'Новичок', price: 1, category: 'nickname' },
   { id: 'nick-1', name: 'Умник', price: 20, category: 'nickname' },
@@ -105,6 +109,7 @@ const ALLOWED_REQUEST_PHOTO_TYPES = new Map([
 
 // --- Быстрый кэш для дорогих вычислений ---
 const HOT_CACHE_TTL_MS = 60_000;
+const HOT_CACHE_MAX_ENTRIES = 1000; // верхняя граница, чтобы кэш не рос бесконечно
 const cacheStore = new Map();
 
 function readCache(key) {
@@ -118,9 +123,23 @@ function readCache(key) {
 }
 
 function writeCache(key, value, ttl = HOT_CACHE_TTL_MS) {
+  // Ограничиваем размер: при переполнении убираем самую старую запись (Map хранит порядок вставки).
+  if (cacheStore.size >= HOT_CACHE_MAX_ENTRIES && !cacheStore.has(key)) {
+    const oldestKey = cacheStore.keys().next().value;
+    if (oldestKey !== undefined) cacheStore.delete(oldestKey);
+  }
   cacheStore.set(key, { value, expiresAt: Date.now() + ttl });
   return value;
 }
+
+// Периодическая чистка протухших записей (не зависим от повторного readCache).
+const cacheSweepTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of cacheStore) {
+    if (entry.expiresAt <= now) cacheStore.delete(key);
+  }
+}, 120_000);
+if (typeof cacheSweepTimer.unref === 'function') cacheSweepTimer.unref();
 
 function invalidateCache(prefix, { exact = false } = {}) {
   if (exact) {
@@ -289,8 +308,15 @@ const teacherRequestUpload = multer({
 
 
 app.use(express.json({ limit: '1mb' }));
+// Сжимаем ответы (особенно крупные JSON-списки учителей).
+app.use(compression());
+
 app.use(express.static(PUBLIC_DIR));
-app.use('/photo', express.static(PHOTO_DIR));
+// Фото статичны и редко меняются — кэшируем у клиента; nosniff против подмены типа.
+app.use('/photo', express.static(PHOTO_DIR, {
+  maxAge: '7d',
+  setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff')
+}));
 
 // === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
 if (SECURITY_HEADERS_ENABLED) {
@@ -428,7 +454,7 @@ function getEnrichedTeachersSnapshot() {
 
   const teachers = getAllTeachers();
   const ratingsMap = getAllRatings();
-  const collator = new Intl.Collator('ru', { sensitivity: 'base' });
+  const collator = RU_COLLATOR;
 
   const list = teachers.map(row => {
     const teacher = normalizeTeacherRow(row);
@@ -462,7 +488,7 @@ function getHomePayloadCached() {
   if (cached) return cached;
 
   const { list } = getEnrichedTeachersSnapshot();
-  const collator = new Intl.Collator('ru', { sensitivity: 'base' });
+  const collator = RU_COLLATOR;
   const byValueThenName = (getVal) => (a, b) => {
     const dv = (getVal(b) || 0) - (getVal(a) || 0);
     if (dv !== 0) return dv;
@@ -1350,7 +1376,7 @@ function extractPureEmail(s){
 /* --- PUBLIC API --- */
 
 app.get('/api/departments',(req,res)=>{
-  const collator = new Intl.Collator('ru',{sensitivity:'base'});
+  const collator = RU_COLLATOR;
   const departments = getDepartmentList().sort(collator.compare);
   res.json({departments});
 });

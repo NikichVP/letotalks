@@ -917,7 +917,10 @@ function createDbProcessing({
   }
 
   function updateSessionActivity(sessionId, ts) {
-    db.prepare('UPDATE sessions SET last_activity_ts = ? WHERE id = ?').run(ts, sessionId);
+    // Троттлинг: пишем не чаще раза в минуту, иначе каждое чтение залогиненного
+    // пользователя порождает запись в БД (конкуренция за единственный writer SQLite).
+    db.prepare('UPDATE sessions SET last_activity_ts = ? WHERE id = ? AND last_activity_ts < ?')
+      .run(ts, sessionId, ts - 60_000);
   }
 
   function updateSessionClient(sessionId, ip, userAgent) {
