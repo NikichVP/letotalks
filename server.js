@@ -2682,39 +2682,33 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   const item = getShopItemById(itemId);
   if (!item) return res.status(404).json({ error: 'item_not_found' });
 
-  const availableCoins = getAvailableCoins(u);
-  if (availableCoins < item.price) {
-    return res.status(400).json({ error: 'not_enough_coins' });
+  // Проверка баланса + дубля + вставка атомарны (транзакция + UNIQUE-индекс),
+  // иначе при гонке можно купить «в долг» или дважды.
+  let outcome;
+  try {
+    outcome = db.transaction(() => {
+      const availableCoins = getAvailableCoins(u);
+      if (availableCoins < item.price) return { error: 'not_enough_coins', status: 400 };
+      if (getExistingInventoryItem(u.id, itemId, item.category)) {
+        return { error: 'already_purchased', status: 400 };
+      }
+      const hadActiveInCategory = getActiveInventoryForUser(u.id).some(row => row.item_type === item.category);
+      const newRow = insertInventoryItem({ userId: u.id, itemId, category: item.category, name: item.name, price: item.price });
+      if (!newRow) return { error: 'cannot_save_purchase', status: 500 };
+      if (!hadActiveInCategory) activateInventoryItemById(newRow.id);
+      return { ok: true, balanceBefore: availableCoins };
+    })();
+  } catch (e) {
+    if (e && /UNIQUE/i.test(e.message || '')) outcome = { error: 'already_purchased', status: 400 };
+    else { console.error('shop/buy failed:', e && e.message ? e.message : e); outcome = { error: 'cannot_save_purchase', status: 500 }; }
   }
 
-  // Проверяем, не куплен ли уже этот ник
-  const existing = getExistingInventoryItem(u.id, itemId, item.category);
-
-  if (existing) {
-    const shopState = buildShopStateForUser(u);
-    return res.status(400).json({ error: 'already_purchased', shop: shopState || null });
+  if (!outcome.ok) {
+    const shopState = outcome.error === 'already_purchased' ? buildShopStateForUser(u) : null;
+    return res.status(outcome.status).json({ error: outcome.error, shop: shopState || null });
   }
 
-  const hadActiveInCategory = getActiveInventoryForUser(u.id).some(row => row.item_type === item.category);
-
-  // Покупаем товар
-  const newInventoryRow = insertInventoryItem({
-    userId: u.id,
-    itemId,
-    category: item.category,
-    name: item.name,
-    price: item.price
-  });
-
-  if (!newInventoryRow) {
-    return res.status(500).json({ error: 'cannot_save_purchase' });
-  }
-
-  // Если это первый ник в категории — активируем сразу, чтобы он отобразился в профиле
-  if (!hadActiveInCategory) {
-    activateInventoryItemById(newInventoryRow.id);
-  }
-
+  const availableCoins = outcome.balanceBefore;
   const shopState = buildShopStateForUser(u);
 
   logSecurityEvent('shop_purchase', {

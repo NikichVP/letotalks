@@ -375,6 +375,12 @@ function createDbProcessing({
   db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_user_id ON user_inventory(user_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_item_id ON user_inventory(item_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_inventory_active ON user_inventory(user_id, is_active) WHERE is_active = 1`);
+  // Один и тот же товар нельзя купить дважды. Перед созданием UNIQUE-индекса
+  // дедуплицируем (оставляя самую раннюю покупку) — идемпотентно и безопасно.
+  db.exec(`DELETE FROM user_inventory WHERE id NOT IN (
+    SELECT MIN(id) FROM user_inventory GROUP BY user_id, item_id, item_type
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_unique ON user_inventory(user_id, item_id, item_type)`);
 
   function ensureInventorySchemaUpToDate() {
     try {
