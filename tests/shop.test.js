@@ -10,81 +10,8 @@ const { once } = require('events');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'letotalks-test-'));
 const fixtureDb = path.join(tmpDir, 'letotalks.db');
-const Database = require('better-sqlite3');
-const fixtureSetupDb = new Database(fixtureDb);
-fixtureSetupDb.exec(`
-  CREATE TABLE users (
-    id TEXT PRIMARY KEY,
-    email TEXT NOT NULL UNIQUE,
-    username TEXT,
-    created_ts INTEGER,
-    last_login_ts INTEGER,
-    login_count INTEGER NOT NULL DEFAULT 0,
-    comment_count INTEGER NOT NULL DEFAULT 0,
-    rating_count INTEGER NOT NULL DEFAULT 0,
-    cast_likes INTEGER NOT NULL DEFAULT 0,
-    cast_dislikes INTEGER NOT NULL DEFAULT 0,
-    received_likes INTEGER NOT NULL DEFAULT 0,
-    received_dislikes INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE teachers (
-    id TEXT PRIMARY KEY,
-    last_name TEXT,
-    first_name TEXT,
-    patronymic TEXT,
-    department TEXT,
-    subjects TEXT,
-    photo TEXT
-  );
-  CREATE TABLE ratings (
-    teacher_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    sum REAL NOT NULL DEFAULT 0,
-    count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (teacher_id, key)
-  );
-  CREATE TABLE user_ratings (
-    user_id TEXT NOT NULL,
-    teacher_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value INTEGER NOT NULL,
-    updated_ts INTEGER NOT NULL,
-    PRIMARY KEY (user_id, teacher_id, key)
-  );
-  CREATE TABLE comments (
-    id INTEGER PRIMARY KEY,
-    teacher_id TEXT,
-    ts INTEGER,
-    ts_iso TEXT,
-    author TEXT,
-    text TEXT,
-    author_uid TEXT
-  );
-  CREATE TABLE comment_votes (
-    comment_id INTEGER NOT NULL,
-    user_id TEXT NOT NULL,
-    vote INTEGER NOT NULL,
-    ts INTEGER NOT NULL,
-    PRIMARY KEY (comment_id, user_id)
-  );
-  CREATE TABLE admins (email TEXT PRIMARY KEY);
-  CREATE TABLE banned_users (
-    user_id TEXT PRIMARY KEY,
-    is_banned INTEGER NOT NULL DEFAULT 0,
-    reason TEXT,
-    ts INTEGER
-  );
-  CREATE TABLE login_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER,
-    ts_iso TEXT,
-    action TEXT,
-    email TEXT,
-    ip TEXT,
-    ua TEXT
-  );
-`);
-fixtureSetupDb.close();
+// Свежая пустая БД: схему создаёт сам код (createDbProcessing), тесты вставляют
+// нужные данные сами. Не зависим от (gitignored) репозиторного letotalks.db.
 
 const repoRoot = path.join(__dirname, '..');
 const repoDataDir = path.join(repoRoot, 'data');
@@ -415,6 +342,10 @@ test('buying and activating a nickname updates balances and inventory', async ()
   const user = createAuthedUser();
   const itemId = 'nick-2';
 
+  // Берём реальную цену из каталога, а не хардкодим — устойчиво к ценам БД/сида.
+  const catalog = await dispatchJson('/api/shop/items', { headers: authHeaders(user.sessionToken) });
+  const price = catalog.data.items.find((i) => i.id === itemId).price;
+
   const purchase = await dispatchJson('/api/shop/buy', {
     method: 'POST',
     headers: authHeaders(user.sessionToken),
@@ -426,8 +357,8 @@ test('buying and activating a nickname updates balances and inventory', async ()
 
   const earned = expectedEarned(user);
   assert.equal(purchase.data.earnedCoins, earned, 'earned coins remain unchanged after purchase');
-  assert.equal(purchase.data.spentCoins, 50, 'spent coins should reflect the item price');
-  assert.equal(purchase.data.balance, earned - 50, 'balance should decrease by item price');
+  assert.equal(purchase.data.spentCoins, price, 'spent coins should reflect the item price');
+  assert.equal(purchase.data.balance, earned - price, 'balance should decrease by item price');
 
   const activation = await dispatchJson('/api/shop/activate', {
     method: 'POST',
@@ -437,7 +368,7 @@ test('buying and activating a nickname updates balances and inventory', async ()
 
   assert.equal(activation.response.status, 200, 'activation should succeed');
   assert.equal(activation.data.ok, true, 'activation response should have ok=true');
-  assert.equal(activation.data.balance, earned - 50, 'balance should remain after activation');
+  assert.equal(activation.data.balance, earned - price, 'balance should remain after activation');
 
   const mine = await dispatchJson('/api/shop/my-items', {
     headers: authHeaders(user.sessionToken)
@@ -449,7 +380,7 @@ test('buying and activating a nickname updates balances and inventory', async ()
   const purchasedItem = mine.data.items.find((item) => item.item_id === itemId);
   assert.ok(purchasedItem, 'purchased nickname should be returned in my-items');
   assert.equal(purchasedItem.is_active, 1, 'activated nickname should be marked active');
-  assert.equal(mine.data.spentCoins, 50, 'spent coins should match purchase price');
+  assert.equal(mine.data.spentCoins, price, 'spent coins should match purchase price');
 });
 
 test('re-buying the same nickname is prevented with a clear error', async () => {

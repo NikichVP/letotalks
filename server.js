@@ -9,7 +9,6 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const bcrypt = require('bcrypt');
 const multer = require('multer');
 const helmet = require('helmet');
 const compression = require('compression');
@@ -92,7 +91,6 @@ const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут
 const AUTH_CHECK_INTERVAL_MS = 5000;
 const MAX_SESSIONS_PER_USER = 1; // Максимум одна одновременная сессия
 const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый час
-const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 10; // За час
 const SECURITY_HEADERS_ENABLED = true;
 const SESSION_BINDING_MODE = (process.env.SESSION_BINDING_MODE || 'strict').toLowerCase(); // soft | strict
@@ -1399,7 +1397,6 @@ function createSlidingWindowLimiter({ windowMs, maxRequests }) {
       state = { windowStart: now, count: 0 };
     }
     state.count += 1;
-    state.windowStart = state.windowStart ?? now;
     buckets.set(ip, state);
 
     if (state.count > maxRequests) {

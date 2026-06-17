@@ -14,7 +14,7 @@ if (!shouldRun) {
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'letotalks-integration-'));
   const fixtureDb = path.join(tmpDir, 'letotalks.db');
-  fs.copyFileSync(path.join(__dirname, '..', 'letotalks.db'), fixtureDb);
+  // Свежая БД: схему создаёт код, тесты вставляют данные сами (не зависим от letotalks.db).
 
   const repoRoot = path.join(__dirname, '..');
   const repoDataDir = path.join(repoRoot, 'data');
