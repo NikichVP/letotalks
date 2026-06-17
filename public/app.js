@@ -58,152 +58,67 @@ function coinsOf(u){
 // - Кнопка/ссылка временно блокируется (anti-double-click) до завершения всех запросов этой группы или по таймауту.
 // Реализация максимально ненавязчивая: без изменения существующих вызовов fetch/обработчиков.
 
-(function setupLatestClickWins(){
+// Анти-двойной-клик БЕЗ отмены чужих запросов: кнопка блокируется, пока её
+// СОБСТВЕННЫЕ запросы в полёте, и разблокируется по их завершении. Не патчим
+// поведение fetch (не абортим), поэтому клик по одной кнопке не отменяет
+// запрос, начатый другой кнопкой.
+(function setupClickBusyGuard(){
   if (typeof window === 'undefined') return;
-  if (window.__latestClickWinsInstalled) return;
-  window.__latestClickWinsInstalled = true;
+  if (window.__clickBusyGuardInstalled) return;
+  window.__clickBusyGuardInstalled = true;
 
-  // Утилита для слияния AbortSignal-ов
-  function mergeSignals() {
-    const signals = Array.from(arguments).filter(Boolean);
-    if (signals.length === 0) return undefined;
-    // Если один из сигналов уже абортирован — вернём контроллер с абортом
-    const ctrl = new AbortController();
-    const abortNow = ()=>{ try{ ctrl.abort(); }catch{} };
-    let aborted = false;
-    for (const s of signals){
-      if (s.aborted){ aborted = true; break; }
-    }
-    if (aborted){ abortNow(); return ctrl.signal; }
-    const onAbort = ()=>{ abortNow(); };
-    for (const s of signals){
-      try{ s.addEventListener('abort', onAbort, { once:true }); }catch{}
-    }
-    return ctrl.signal;
-  }
+  const busyCounts = new WeakMap(); // el -> число активных запросов, начатых этим кликом
+  let pendingEl = null;             // элемент текущей синхронной фазы клика
+  let inClickPhase = false;
 
-  const state = {
-    currentGroup: null,   // { id, controller, active, el, restoreTimer }
-    nextId: 1,
-    // флаг указывает, что сейчас выполняется обработка клика и запросы относятся к currentGroup
-    inClickPhase: false,
-  };
-
-  function restoreElement(el){
+  function disableEl(el){
     if (!el) return;
-    try{
-      if (el.dataset._lcwWasDisabled === '1'){
-        // Это кнопка/инпут
-        el.disabled = false;
-      }
-      if (el.dataset._lcwWasAriaDisabled === '1'){
-        el.removeAttribute('aria-disabled');
-      }
-      if (el.dataset._lcwPrevPointerEvents !== undefined){
-        el.style.pointerEvents = el.dataset._lcwPrevPointerEvents;
-      }
-    }catch{}
-    delete el?.dataset._lcwWasDisabled;
-    delete el?.dataset._lcwWasAriaDisabled;
-    delete el?.dataset._lcwPrevPointerEvents;
-  }
-
-  function disableElement(el){
-    if (!el) return;
-    // Кнопки/инпуты могли быть реально disabled — не трогаем их состояние
-    const isButton = (el.tagName === 'BUTTON') ||
+    const isButton = el.tagName === 'BUTTON' ||
       (el.tagName === 'INPUT' && ['button','submit'].includes((el.getAttribute('type')||'').toLowerCase()));
-    if (isButton && el.disabled) return;
-
-    // Вместо выставления disabled (что ломает обработчики) временно блокируем pointer-events
-    const prev = el.style.pointerEvents;
-    if (el.dataset._lcwPrevPointerEvents === undefined) {
-      el.dataset._lcwPrevPointerEvents = prev;
-    }
+    if (isButton && el.disabled) return; // уже реально disabled — не трогаем
+    if (el.dataset._cbgPrevPe === undefined) el.dataset._cbgPrevPe = el.style.pointerEvents || '';
     el.style.pointerEvents = 'none';
     if (!el.hasAttribute('aria-disabled')) {
-      el.dataset._lcwWasAriaDisabled = '1';
+      el.dataset._cbgAria = '1';
       el.setAttribute('aria-disabled','true');
     }
   }
-
-  function createNewGroup(clickedEl){
-    // Абортируем предыдущую группу
-    if (state.currentGroup){
-      try{ state.currentGroup.controller.abort(); }catch{}
-      // Восстановим предыдущую кнопку — даже если запросы ещё не стартовали
-      clearTimeout(state.currentGroup.restoreTimer);
-      restoreElement(state.currentGroup.el);
-    }
-    const grp = {
-      id: state.nextId++,
-      controller: new AbortController(),
-      active: 0,
-      el: clickedEl || null,
-      restoreTimer: null,
-    };
-    state.currentGroup = grp;
-    return grp;
+  function restoreEl(el){
+    if (!el) return;
+    try{
+      if (el.dataset._cbgPrevPe !== undefined){ el.style.pointerEvents = el.dataset._cbgPrevPe; }
+      if (el.dataset._cbgAria === '1'){ el.removeAttribute('aria-disabled'); }
+    }catch{}
+    delete el.dataset._cbgPrevPe;
+    delete el.dataset._cbgAria;
   }
 
-  // Патчим fetch один раз
+  // Патчим fetch один раз — только чтобы знать, когда запросы кнопки завершились.
   if (!window.__originalFetch){
     window.__originalFetch = window.fetch.bind(window);
     window.fetch = function(input, init){
-      const i = init || {};
-      const grp = state.inClickPhase ? state.currentGroup : null;
-      let signal = i.signal;
-      if (grp){
-        // объединяем пользовательский сигнал и сигнал группы
-        signal = mergeSignals(i.signal, grp.controller.signal);
-        grp.active++;
-      }
-      const nextInit = signal ? { ...i, signal } : i;
-      const p = window.__originalFetch(input, nextInit);
-      if (grp){
-        const finalize = ()=>{
-          grp.active = Math.max(0, grp.active - 1);
-          // Если все запросы группы завершены — восстановим элемент
-          if (grp.active === 0){
-            // Восстановление может быть вызвано синхронно — чуть отложим
-            queueMicrotask(()=>{
-              // Восстанавливаем только если это всё ещё актуальная группа
-              if (state.currentGroup && state.currentGroup.id === grp.id){
-                restoreElement(grp.el);
-                clearTimeout(grp.restoreTimer);
-              }
-            });
-          }
-        };
-        p.finally(finalize);
+      const el = inClickPhase ? pendingEl : null;
+      const p = window.__originalFetch(input, init); // сигнал НЕ подменяем — ничего не абортим
+      if (el){
+        busyCounts.set(el, (busyCounts.get(el) || 0) + 1);
+        disableEl(el);
+        p.finally(()=>{
+          const n = (busyCounts.get(el) || 1) - 1;
+          if (n <= 0){ busyCounts.delete(el); restoreEl(el); }
+          else { busyCounts.set(el, n); }
+        });
       }
       return p;
     };
   }
 
-  // Глобальный перехват кликов (capture), чтобы он сработал раньше других
   document.addEventListener('click', (e)=>{
     try{
-      // Ищем кликабельную цель
-      const clickable = e.target && (e.target.closest('button, a, [role="button"], input[type="button"], input[type="submit"]'));
-      // Создаём новую группу в любом случае — требование: для всех кнопок и действий
-      const grp = createNewGroup(clickable || null);
-      // Anti-double-click: временно блокируем элемент
-      disableElement(clickable);
-      state.inClickPhase = true;
-      // Если в рамках этого клика не начались никакие запросы, снимаем блокировку через таймаут
-      grp.restoreTimer = setTimeout(()=>{
-        if (state.currentGroup && state.currentGroup.id === grp.id && grp.active === 0){
-          restoreElement(grp.el);
-        }
-      }, 1500);
-      // По завершении текущего стека вызовов считаем, что "фаза клика" закончилась
-      queueMicrotask(()=>{ state.inClickPhase = false; });
-    }catch(err){
-      // Безопасно игнорируем ошибки перехвата
-      state.inClickPhase = false;
-    }
-  }, true); // capture
+      pendingEl = (e.target && e.target.closest('button, [role="button"], input[type="button"], input[type="submit"]')) || null;
+      inClickPhase = true;
+      queueMicrotask(()=>{ inClickPhase = false; pendingEl = null; });
+    }catch{ inClickPhase = false; pendingEl = null; }
+  }, true);
 })();
 
 /* ---------- client-side предмодерация (минимальная, но умная) ---------- */
