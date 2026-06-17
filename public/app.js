@@ -14,6 +14,10 @@ const CHARACTERISTICS = [
 const $  = (s,r=document)=>r.querySelector(s);
 const $$ = (s,r=document)=>Array.from(r.querySelectorAll(s));
 const html = (a,...v)=>a.reduce((x,s,i)=>x+s+(v[i]??''),'');
+// Экранирование пользовательских данных перед вставкой в innerHTML.
+// esc — для текстового контекста, escAttr — для значений атрибутов (src="...", value="...").
+const esc = (v)=>String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const escAttr = esc;
 const fmtNum = v => Math.round((v||0)*10)/10;
 const fmtStars = v => html`<span class="rating" title="${fmtNum(v)} / 5"><span class="star">★</span>${fmtNum(v)}</span>`;
 function characteristicAvg(t,k){ const r=t.ratings?.[k]; return r&&r.count?(r.sum/r.count):0; }
@@ -443,10 +447,10 @@ const Auth = {
       pop.innerHTML = `
         <div class="popover-inner">
           <div class="row space-between" style="margin-bottom:6px">
-            <div class="tname">@${nick}</div>
+            <div class="tname">@${esc(nick)}</div>
             <div class="badge">${coins} coins</div>
           </div>
-          <div class="muted" style="margin-bottom:6px">${u.email || ''}</div>
+          <div class="muted" style="margin-bottom:6px">${esc(u.email || '')}</div>
           <div class="hr"></div>
           <ul class="stats">
             <li>Заработано: <b>${earned}</b> coins</li>
@@ -870,7 +874,7 @@ const App = {
     const deps = await this.getDepartments();
     menu.innerHTML =
       `<button class="select-item" role="option" data-route="/teachers">Все учителя</button>` +
-      deps.map(d=>html`<button class="select-item" role="option" data-route="/department/${encodeURIComponent(d)}">${d}</button>`).join('');
+      deps.map(d=>html`<button class="select-item" role="option" data-route="/department/${encodeURIComponent(d)}">${esc(d)}</button>`).join('');
 
     btn.onclick = () => {
       menu.classList.toggle('hidden');
@@ -905,10 +909,10 @@ const App = {
     const fio = [t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
     return html`
       <div class="list-item">
-        <div class="portrait"><img src="${t.photo || ''}" alt=""></div>
+        <div class="portrait"><img src="${escAttr(t.photo || '')}" alt=""></div>
         <div>
-          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
-          <div class="meta">${t.department} · ${t.subjects?.join(', ')||''}</div>
+          <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
+          <div class="meta">${esc(t.department)} · ${esc(t.subjects?.join(', ')||'')}</div>
         </div>
         <div>${rightHtml||''}</div>
       </div>`;
@@ -940,10 +944,10 @@ async viewHome(){
       const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
       return html`
       <div class="row" style="gap:10px;padding:8px 0">
-        <div class="portrait"><img src="${t.photo||''}" alt=""></div>
+        <div class="portrait"><img src="${escAttr(t.photo||'')}" alt=""></div>
         <div style="flex:1">
-          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
-          <div class="tdept">${t.department}</div>
+          <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
+          <div class="tdept">${esc(t.department)}</div>
         </div>
         <div>${fmtStars(characteristicAvg(t,c.key))}</div>
       </div>`;
@@ -969,10 +973,10 @@ async viewHome(){
       const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
       return html`
       <div class="row" style="gap:10px;padding:8px 0">
-        <div class="portrait"><img src="${t.photo||''}" alt=""></div>
+        <div class="portrait"><img src="${escAttr(t.photo||'')}" alt=""></div>
         <div style="flex:1">
-          <div class="tname"><a class="link" href="#/teacher/${t.id}">${fio || 'Без имени'}</a></div>
-          <div class="tdept">${t.department}</div>
+          <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
+          <div class="tdept">${esc(t.department)}</div>
         </div>
         <div>${fmtStars(overall(t))}</div>
       </div>`;
@@ -980,7 +984,7 @@ async viewHome(){
     return html`
       <div class="card">
         <div class="card-header">
-          <h3>${d.name}</h3>
+          <h3>${esc(d.name)}</h3>
           <a class="btn small primary" href="#/department/${encodeURIComponent(d.name)}">Все учителя</a>
         </div>
         <div class="card-content">
@@ -1432,7 +1436,9 @@ async viewHome(){
 
   async listBySearch(_, query){
     await this.mountNavbar();
-    const q = normalizeSearchQuery(decodeURIComponent(query)||'').trim().toLowerCase();
+    let decoded = '';
+    try { decoded = decodeURIComponent(query) || ''; } catch { decoded = String(query || ''); }
+    const q = normalizeSearchQuery(decoded).trim().toLowerCase();
     const all = await this.getTeachers();
     const list = Array.isArray(all) ? all : [];
     const matched = list.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
@@ -1440,7 +1446,7 @@ async viewHome(){
     $('#app').innerHTML = html`
       <section class="section">
         <div class="row space-between wrap">
-          <h2>Результаты поиска: “${q}”</h2>
+          <h2>Результаты поиска: “${esc(q)}”</h2>
           <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
         </div>
         <div class="list">
@@ -1590,15 +1596,15 @@ async viewHome(){
       ? t.comments.slice().reverse().map(c=>{
         const authorName = c.authorDisplay || c.author || 'Аноним';
         return html`
-        <div class="comment" data-cid="${c.id}">
+        <div class="comment" data-cid="${escAttr(c.id)}">
           <div class="meta">
-            ${authorName} · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
+            ${esc(authorName)} · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
             ${amAdmin && (c.author_email||c.author_uid) ? html`
               <span class="badge" title="Видно только администраторам" style="margin-left:8px">
-                ${c.author_email || c.author_uid}
+                ${esc(c.author_email || c.author_uid)}
               </span>` : ''}
           </div>
-          <div class="ctext">${String(c.text||'').replace(/</g,'&lt;')}</div>
+          <div class="ctext">${esc(c.text||'')}</div>
           <div class="cactions" style="display:flex;gap:8px;align-items:center">
             <button class="iconbtn like ${c.myVote===1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👍 <span class="cnt">${c.likes||0}</span></button>
             <button class="iconbtn dislike ${c.myVote===-1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👎 <span class="cnt">${c.dislikes||0}</span></button>
@@ -1616,16 +1622,16 @@ async viewHome(){
         <div class="row space-between wrap">
           <div class="row" style="gap:14px">
             <button id="backBtn" class="btn small outline" type="button">← Назад</button>
-            <h2 style="margin:0">${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</h2>
+            <h2 style="margin:0">${esc([t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' '))}</h2>
           </div>
         </div>
 
         <div class="profile" style="margin-top:12px">
           <div class="kv">
-            <div class="portrait-lg"><img src="${t.photo||''}" alt=""></div>
+            <div class="portrait-lg"><img src="${escAttr(t.photo||'')}" alt=""></div>
             <dl>
-              <dt>Кафедра</dt><dd>${t.department}</dd>
-              <dt>Предметы</dt><dd>${t.subjects?.join(', ')||''}</dd>
+              <dt>Кафедра</dt><dd>${esc(t.department)}</dd>
+              <dt>Предметы</dt><dd>${esc(t.subjects?.join(', ')||'')}</dd>
               <dt>Общий рейтинг</dt><dd>${fmtStars(overall(t))}</dd>
             </dl>
           </div>
@@ -2058,8 +2064,8 @@ async viewHome(){
         return;
       }
       listEl.innerHTML = commenters.map(u=>html`
-        <button type="button" class="admin-list-item ${u.id===activeUserId?'active':''}" data-user="${u.id}">
-          <span class="admin-list-primary">${u.email || u.username || u.id}</span>
+        <button type="button" class="admin-list-item ${u.id===activeUserId?'active':''}" data-user="${escAttr(u.id)}">
+          <span class="admin-list-primary">${esc(u.email || u.username || u.id)}</span>
           <span class="admin-list-meta">Комментарии: ${u.comment_count}</span>
           ${u.is_banned ? '<span class="badge danger">Забанен</span>' : ''}
         </button>
@@ -2090,7 +2096,7 @@ async viewHome(){
       detailEl.innerHTML = html`
         <div class="admin-detail-head">
           <div>
-            <div class="tname">${identity}</div>
+            <div class="tname">${esc(identity)}</div>
             <div class="muted">Комментариев: ${commentCount}</div>
             ${banned ? '<div class="badge danger" style="margin-top:6px">Забанен</div>' : ''}
           </div>
@@ -2099,10 +2105,10 @@ async viewHome(){
         <div class="hr"></div>
         <div id="userCommentsWrap" class="admin-comments">
           ${comments.length ? comments.map(c=>html`
-            <div class="comment" data-comment-id="${c.id}">
-              <div class="meta">${fmtDate(c.ts)} · ${c.teacher_name || ('teacherId: '+c.teacherId)}</div>
-              <div class="ctext" style="margin:6px 0">${String(c.text||'').replace(/</g,'&lt;')}</div>
-              <button class="btn small outline" data-del-cid="${c.id}">Удалить</button>
+            <div class="comment" data-comment-id="${escAttr(c.id)}">
+              <div class="meta">${fmtDate(c.ts)} · ${esc(c.teacher_name || ('teacherId: '+c.teacherId))}</div>
+              <div class="ctext" style="margin:6px 0">${esc(c.text||'')}</div>
+              <button class="btn small outline" data-del-cid="${escAttr(c.id)}">Удалить</button>
             </div>
           `).join('') : '<div class="empty">Нет комментариев</div>'}
         </div>
@@ -2220,9 +2226,9 @@ async viewHome(){
         if (!arr.length) return '<div class="empty">Нет пользователей</div>';
         return arr.map(u=>html`
           <div class="admin-user-card">
-            <div class="admin-list-primary">${u.email || u.username || u.id}</div>
+            <div class="admin-list-primary">${esc(u.email || u.username || u.id)}</div>
             <div class="admin-list-meta">Комментарии: ${u.comment_count}</div>
-            <button class="btn small outline" data-user="${u.id}" data-action="${action}">${action==='ban'?'Забанить':'Разбанить'}</button>
+            <button class="btn small outline" data-user="${escAttr(u.id)}" data-action="${action}">${action==='ban'?'Забанить':'Разбанить'}</button>
           </div>
         `).join('');
       };
@@ -2313,10 +2319,10 @@ async viewHome(){
       }
       listBody.innerHTML = admins.map(a => html`
         <tr>
-          <td>${a.email}</td>
+          <td>${esc(a.email)}</td>
           <td>${a.isRoot ? 'Главный администратор' : 'Администратор'}</td>
           <td style="text-align:right">
-            ${a.isRoot ? '<span class="muted">Нельзя удалить</span>' : `<button class="btn small outline" data-email="${a.email}">Удалить</button>`}
+            ${a.isRoot ? '<span class="muted">Нельзя удалить</span>' : `<button class="btn small outline" data-email="${escAttr(a.email)}">Удалить</button>`}
           </td>
         </tr>
       `).join('');
@@ -2430,14 +2436,14 @@ async viewHome(){
         return;
       }
       tbody.innerHTML = teachers.map(t=>html`
-        <tr data-teacher="${t.id}">
-          <td>${t.id}</td>
-          <td>${[t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' ')}</td>
-          <td>${t.department||''}</td>
-          <td>${(t.subjects||[]).join(', ')}</td>
+        <tr data-teacher="${escAttr(t.id)}">
+          <td>${esc(t.id)}</td>
+          <td>${esc([t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' '))}</td>
+          <td>${esc(t.department||'')}</td>
+          <td>${esc((t.subjects||[]).join(', '))}</td>
           <td>
-            <button class="btn small outline" data-edit="${t.id}">Редактировать</button>
-            <button class="btn small outline" data-delete="${t.id}">Удалить</button>
+            <button class="btn small outline" data-edit="${escAttr(t.id)}">Редактировать</button>
+            <button class="btn small outline" data-delete="${escAttr(t.id)}">Удалить</button>
           </td>
         </tr>
       `).join('');
@@ -2663,7 +2669,7 @@ async viewHome(){
               <div class="card shop-item ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
                 <div class="card-content">
                   <div class="row space-between shop-item-header">
-                    <h3 style="margin: 0;">${item.name}</h3>
+                    <h3 style="margin: 0;">${esc(item.name)}</h3>
                     ${item.purchased
                       ? html`<div class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</div>`
                       : html`<div class="badge price">${item.price} coins</div>`}
@@ -2698,7 +2704,7 @@ async viewHome(){
             <div class="list shop-purchased-list">
               ${purchasedItems.map(item => html`
                 <div class="list-item purchased-nick">
-                  <div class="tname">${item.name}</div>
+                  <div class="tname">${esc(item.name)}</div>
                   <div class="nick-actions">
                     <span class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</span>
                     ${item.isActive
