@@ -666,9 +666,9 @@ function createDbProcessing({
     return rows;
   }
 
+  const getTeacherByIdStmt = db.prepare('SELECT * FROM teachers WHERE id = ?');
   function getTeacherById(id) {
-    const stmt = db.prepare('SELECT * FROM teachers WHERE id = ?');
-    return stmt.get(id);
+    return getTeacherByIdStmt.get(id);
   }
 
   function normalizeTeacherRow(row) {
@@ -729,9 +729,9 @@ function createDbProcessing({
     return candidate;
   }
 
+  const getCommentByIdStmt = db.prepare('SELECT * FROM comments WHERE id = ?');
   function getCommentById(commentId) {
-    const stmt = db.prepare('SELECT * FROM comments WHERE id = ?');
-    return stmt.get(commentId);
+    return getCommentByIdStmt.get(commentId);
   }
 
   function updateRatings(teacherId, ratings, userId = null) {
@@ -811,9 +811,9 @@ function createDbProcessing({
     return stmt.all(userId);
   }
 
+  const getUserVoteStmt = db.prepare('SELECT vote FROM comment_votes WHERE comment_id = ? AND user_id = ?');
   function getUserVote(commentId, userId) {
-    const stmt = db.prepare('SELECT vote FROM comment_votes WHERE comment_id = ? AND user_id = ?');
-    const row = stmt.get(commentId, userId);
+    const row = getUserVoteStmt.get(commentId, userId);
     return row ? row.vote : 0;
   }
 
@@ -923,9 +923,9 @@ function createDbProcessing({
     return stmt.get(email);
   }
 
+  const findUserByIdStmt = db.prepare('SELECT * FROM users WHERE id = ?');
   function findUserById(userId) {
-    const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
-    return stmt.get(userId);
+    return findUserByIdStmt.get(userId);
   }
 
   function upsertUserOnLogin(email) {
@@ -961,9 +961,9 @@ function createDbProcessing({
     stmt.run(comments, ratings, cast_like, cast_dislike, recv_like, recv_dislike, userId);
   }
 
+  const isUserBannedStmt = db.prepare('SELECT is_banned FROM banned_users WHERE user_id = ?');
   function isUserBanned(userId) {
-    const stmt = db.prepare('SELECT is_banned FROM banned_users WHERE user_id = ?');
-    const row = stmt.get(userId);
+    const row = isUserBannedStmt.get(userId);
     return row ? !!row.is_banned : false;
   }
 

@@ -1164,9 +1164,10 @@ function normalizeIp(ip) {
 
 function getClientIp(req){
   if (!req) return '0.0.0.0';
+  // Доверяем только req.ip — Express вычисляет его по настройке trust proxy.
+  // Прямое чтение X-Forwarded-For убрано: заголовок спуфабелен.
   if (req.ip) return normalizeIp(req.ip);
-  const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return normalizeIp(xf || req.socket?.remoteAddress || '0.0.0.0');
+  return normalizeIp(req.socket?.remoteAddress || '0.0.0.0');
 }
 
 function parseCookies(req){
@@ -1249,15 +1250,16 @@ function getUserFromRequest(req, res = null){
   const currentIp = getClientIp(req);
   const currentUa = String(req.headers['user-agent'] || '');
 
-  const mismatches = [];
-  if (session.user_agent && currentUa && session.user_agent !== currentUa) mismatches.push('user_agent');
-  if (session.ip && currentIp && session.ip !== currentIp) mismatches.push('ip');
+  // Привязываемся к User-Agent (стабилен в рамках устройства/браузера), но НЕ к IP:
+  // у мобильных сетей IP меняется постоянно, и разлогин по IP — это DoS на своих же.
+  const uaMismatch = !!(session.user_agent && currentUa && session.user_agent !== currentUa);
+  const ipChanged = !!(session.ip && currentIp && session.ip !== currentIp);
 
-  if (mismatches.length) {
+  if (uaMismatch) {
     logSecurityEvent('session_client_mismatch', {
       userId: session.user_id,
       sessionId: session.id,
-      mismatches,
+      mismatches: ['user_agent'],
       sessionIp: session.ip,
       requestIp: currentIp,
       sessionUserAgent: session.user_agent,
@@ -1270,14 +1272,10 @@ function getUserFromRequest(req, res = null){
       if (response) clearSessionCookie(response);
       return null;
     }
-
-    const nextIp = currentIp || session.ip || null;
-    const nextUa = currentUa || session.user_agent || null;
-    updateSessionClient(session.id, nextIp, nextUa);
-  } else if ((!session.ip && currentIp) || (!session.user_agent && currentUa)) {
-    const nextIp = currentIp || session.ip || null;
-    const nextUa = currentUa || session.user_agent || null;
-    updateSessionClient(session.id, nextIp, nextUa);
+    updateSessionClient(session.id, currentIp || session.ip || null, currentUa || session.user_agent || null);
+  } else if (ipChanged || (!session.ip && currentIp) || (!session.user_agent && currentUa)) {
+    // Смена IP или дозаполнение метаданных — просто обновляем, не завершаем сессию.
+    updateSessionClient(session.id, currentIp || session.ip || null, currentUa || session.user_agent || null);
   }
 
   // Обновляем время последней активности
@@ -1799,7 +1797,7 @@ app.post('/api/teacher-request', (req, res) => {
 
       const meta = {
         photoFilename: req.file?.filename || null,
-        ip: req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',')[0].trim() : req.ip,
+        ip: getClientIp(req),
         userAgent: req.headers['user-agent'] || ''
       };
 

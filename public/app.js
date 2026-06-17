@@ -157,17 +157,12 @@ function makeLoggedOutState(){
 
 /* ---------- auth (server-backed) ---------- */
 const Auth = {
-  key: 'letotalks:auth',
   _state: makeLoggedOutState(),
   _logoutInProgress: false,
   _ready: false,
   _readyPromise: null,
 
   _blankState(){ return makeLoggedOutState(); },
-  clearPersisted(){
-    if (typeof localStorage === 'undefined') return;
-    try{ localStorage.removeItem(this.key); }catch{}
-  },
 
   get(){ return this._state; },
   set(o){
@@ -180,7 +175,6 @@ const Auth = {
       merged.spent_coins = Math.max(0, merged.earned_coins - merged.available_coins);
     }
     this._state = merged;
-    this.clearPersisted();
     this.render();
     this.renderProfilePopover(); // обновление поповера
   },
@@ -2687,117 +2681,64 @@ async viewHome(){
     appEl.addEventListener('click', this._shopClickHandler);
   },
 
-  async buyItem(itemId) {
+  // Общая логика покупки/активации/деактивации — раньше это были три почти
+  // идентичных метода. Отличаются только endpoint, словом действия и текстами ошибок.
+  async _shopAction(endpoint, itemId, { actionNoun, errorMap = {}, handleAlreadyPurchased = false }) {
     if (!Auth.isLogged()) return;
 
-    try {
-      const response = await fetch('/api/shop/buy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ itemId })
-      });
+    const result = await apiFetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemId })
+    });
+    const shopState = this.normalizeShopState(result);
 
-      const result = await response.json();
-      const shopState = this.normalizeShopState(result);
-
-      if (result.ok) {
-        alert(result.message);
-        if (shopState) {
-          this.applyShopStateToAuth(shopState);
-        } else {
-          Auth.set({
-            available_coins: Number(result.balance ?? Auth._state.available_coins),
-            earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-            spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-          });
-        }
-        await this.viewShop(shopState ? { prefetched: shopState } : undefined);
-        if (!shopState) await Auth.me();
+    if (result.ok) {
+      if (result.message) alert(result.message);
+      if (shopState) {
+        this.applyShopStateToAuth(shopState);
       } else {
-        if (result.error === 'already_purchased' && shopState) {
-          this.applyShopStateToAuth(shopState);
-          await this.viewShop({ prefetched: shopState });
-        }
-        alert('Ошибка при покупке: ' + (result.error === 'not_enough_coins' ? 'Недостаточно coins' :
-              result.error === 'already_purchased' ? 'Этот ник уже куплен' : 'Ошибка сервера'));
+        Auth.set({
+          available_coins: Number(result.balance ?? Auth._state.available_coins),
+          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
+          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
+        });
       }
-    } catch (error) {
-      alert('Ошибка сети при покупке');
+      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+      if (!shopState) await Auth.me();
+      return;
     }
+
+    if (handleAlreadyPurchased && result.error === 'already_purchased' && shopState) {
+      this.applyShopStateToAuth(shopState);
+      await this.viewShop({ prefetched: shopState });
+    }
+    const msg = result.error === 'network_error' ? 'Ошибка сети'
+      : (errorMap[result.error] || 'Ошибка сервера');
+    alert(`Ошибка при ${actionNoun}: ${msg}`);
   },
 
-async activateItem(itemId) {
-  if (!Auth.isLogged()) return;
-
-  try {
-    const response = await fetch('/api/shop/activate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId })
+  async buyItem(itemId) {
+    return this._shopAction('/api/shop/buy', itemId, {
+      actionNoun: 'покупке',
+      handleAlreadyPurchased: true,
+      errorMap: { not_enough_coins: 'Недостаточно coins', already_purchased: 'Этот ник уже куплен' }
     });
+  },
 
-    const result = await response.json();
-    const shopState = this.normalizeShopState(result);
-
-    if (result.ok) {
-      alert(result.message);
-      if (shopState) {
-        this.applyShopStateToAuth(shopState);
-      } else {
-        Auth.set({
-          available_coins: Number(result.balance ?? Auth._state.available_coins),
-          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-        });
-      }
-      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
-      if (!shopState) await Auth.me();
-    } else {
-      alert('Ошибка при активации: ' + (result.error === 'item_not_owned' ? 'Этот ник не куплен' : 'Ошибка сервера'));
-    }
-  } catch (error) {
-    alert('Ошибка сети при активации');
-  }
-},
-
-async deactivateItem(itemId) {
-  if (!Auth.isLogged()) return;
-
-  try {
-    const response = await fetch('/api/shop/deactivate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId })
+  async activateItem(itemId) {
+    return this._shopAction('/api/shop/activate', itemId, {
+      actionNoun: 'активации',
+      errorMap: { item_not_owned: 'Этот ник не куплен' }
     });
+  },
 
-    const result = await response.json();
-    const shopState = this.normalizeShopState(result);
-
-    if (result.ok) {
-      alert(result.message);
-      if (shopState) {
-        this.applyShopStateToAuth(shopState);
-      } else {
-        Auth.set({
-          available_coins: Number(result.balance ?? Auth._state.available_coins),
-          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-        });
-      }
-      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
-      if (!shopState) await Auth.me();
-    } else {
-      const msg = result.error === 'not_active'
-        ? 'Этот ник уже отключен'
-        : result.error === 'item_not_found'
-          ? 'Ник не найден'
-          : 'Ошибка сервера';
-      alert('Ошибка при отключении: ' + msg);
-    }
-  } catch (error) {
-    alert('Ошибка сети при отключении');
-  }
-},
+  async deactivateItem(itemId) {
+    return this._shopAction('/api/shop/deactivate', itemId, {
+      actionNoun: 'отключении',
+      errorMap: { not_active: 'Этот ник уже отключен', item_not_found: 'Ник не найден' }
+    });
+  },
 
 };
 
