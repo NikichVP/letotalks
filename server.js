@@ -238,6 +238,9 @@ const {
   setTeacherRequestTelegramMeta,
   updateTeacherRequestError,
   finalizeTeacherRequest,
+  insertPendingReview,
+  getPendingReview,
+  deletePendingReview,
   getSecurityLogs,
   getActiveSessionsList,
   getLoginAttempts,
@@ -321,7 +324,6 @@ function generateSecureToken() {
 }
 
 const PENDING_AUTH = new Map(); // sessionId -> { email, sid_token, code, created, seenIds:Set, verified:false, ip, ua }
-const PENDING_COMMENT_REVIEWS = new Map(); // reviewId -> pending comment awaiting admin decision
 
 const CYRILLIC_TO_LATIN = {
   'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
@@ -922,7 +924,7 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
     }
   }
 
-  PENDING_COMMENT_REVIEWS.set(reviewId, {
+  insertPendingReview({
     id: reviewId,
     teacherId,
     text,
@@ -930,7 +932,8 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
     userId,
     reason,
     createdTs: Date.now(),
-    telegramMeta
+    telegramChatId: telegramMeta.chatId,
+    telegramMessageId: telegramMeta.messageId
   });
 
   logSecurityEvent('comment_queued_for_review', {
@@ -949,7 +952,7 @@ async function handleCommentReviewCallback(callback) {
   if (!data.startsWith('comment_review:')) return false;
 
   const [, action, reviewId] = data.split(':');
-  const pending = PENDING_COMMENT_REVIEWS.get(reviewId);
+  const pending = getPendingReview(reviewId);
   if (!pending) {
     await safeAnswerCallback(callback, 'Комментарий уже обработан или не найден', true);
     return true;
@@ -973,7 +976,7 @@ async function handleCommentReviewCallback(callback) {
   };
 
   if (action === 'reject') {
-    PENDING_COMMENT_REVIEWS.delete(reviewId);
+    deletePendingReview(reviewId);
     logSecurityEvent('comment_rejected', {
       reviewId,
       teacherId: pending.teacherId,
@@ -989,7 +992,7 @@ async function handleCommentReviewCallback(callback) {
   if (action === 'approve') {
     const teacherRow = getTeacherById(pending.teacherId);
     if (!teacherRow) {
-      PENDING_COMMENT_REVIEWS.delete(reviewId);
+      deletePendingReview(reviewId);
       await safeAnswerCallback(callback, 'Учитель не найден', true);
       await clearButtons();
       return true;
@@ -1011,7 +1014,7 @@ async function handleCommentReviewCallback(callback) {
         userId: pending.userId || null,
         reason: pending.reason || 'manual_review'
       });
-      PENDING_COMMENT_REVIEWS.delete(reviewId);
+      deletePendingReview(reviewId);
       await safeAnswerCallback(callback, 'Комментарий опубликован');
       await clearButtons();
       invalidateTeacherPayloadCache(pending.teacherId);

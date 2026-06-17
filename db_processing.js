@@ -241,6 +241,18 @@ function createDbProcessing({
     );
     CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email, ts);
     CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, ts);
+
+    CREATE TABLE IF NOT EXISTS pending_comment_reviews (
+      id TEXT PRIMARY KEY,
+      teacher_id TEXT NOT NULL,
+      text TEXT NOT NULL DEFAULT '',
+      author_name TEXT NOT NULL DEFAULT 'Аноним',
+      user_id TEXT DEFAULT '',
+      reason TEXT DEFAULT '',
+      created_ts INTEGER NOT NULL,
+      telegram_chat_id TEXT,
+      telegram_message_id TEXT
+    );
   `);
 
   db.exec(`
@@ -1037,6 +1049,47 @@ function createDbProcessing({
     return getTeacherRequestById(id);
   }
 
+  // --- Очередь комментариев на ручной модерации (персистентная) ---
+  function insertPendingReview(review) {
+    db.prepare(`
+      INSERT OR REPLACE INTO pending_comment_reviews
+        (id, teacher_id, text, author_name, user_id, reason, created_ts, telegram_chat_id, telegram_message_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      review.id,
+      review.teacherId,
+      review.text || '',
+      review.authorName || 'Аноним',
+      review.userId || '',
+      review.reason || '',
+      review.createdTs || Date.now(),
+      review.telegramChatId || null,
+      review.telegramMessageId || null
+    );
+    return review.id;
+  }
+
+  function getPendingReview(reviewId) {
+    if (!reviewId) return null;
+    const row = db.prepare('SELECT * FROM pending_comment_reviews WHERE id = ?').get(reviewId);
+    if (!row) return null;
+    return {
+      id: row.id,
+      teacherId: row.teacher_id,
+      text: row.text,
+      authorName: row.author_name,
+      userId: row.user_id,
+      reason: row.reason,
+      createdTs: row.created_ts,
+      telegramMeta: { chatId: row.telegram_chat_id, messageId: row.telegram_message_id }
+    };
+  }
+
+  function deletePendingReview(reviewId) {
+    if (!reviewId) return;
+    db.prepare('DELETE FROM pending_comment_reviews WHERE id = ?').run(reviewId);
+  }
+
   function getSecurityLogs({ limit, offset, severity }) {
     let query = 'SELECT * FROM security_log';
     const params = [];
@@ -1263,6 +1316,9 @@ function createDbProcessing({
     setTeacherRequestTelegramMeta,
     updateTeacherRequestError,
     finalizeTeacherRequest,
+    insertPendingReview,
+    getPendingReview,
+    deletePendingReview,
     getSecurityLogs,
     getActiveSessionsList,
     getLoginAttempts,
