@@ -10,10 +10,19 @@ if (proxyUrl) {
 const fetchFn = (url, init = {}) =>
   undiciFetch(url, { ...init, dispatcher: init.dispatcher || openaiDispatcher });
 
-const BAD_STEMS = [
-  'бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон',
-  'пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'
+// Однозначные корни мата — не встречаются в обычных словах, ищем как подстроку
+// на «склеенной» строке (ловит обфускацию пробелами/символами: «х у й» -> «хуй»).
+const HARD_STEMS = [
+  'хуй','хуе','хуё','хуи','пизд','бляд','еблан','ебан','ебал','ебуч','ебло','ёбан','ёбну',
+  'выеб','заеб','наеб','уеба','уебо','въеб','съеб','отъеб','поеба','распизд','охуе','охуи',
+  'нахуй','нехуй','мраз','гандон','гондон','пидор','пидар','пидрил','долбоёб','долбоеб',
+  'долбаёб','долбаеб','залуп','мудак','мудил','уёбищ','уебищ'
 ];
+
+// Неоднозначные корни: встречаются и в нормальных словах («хлеб», «требовать»,
+// «сукно», «себе»). Ищем строго по границе слова, чтобы не банить невиновных.
+// \b в JS не работает с кириллицей, поэтому границу задаём через не-букву.
+const WORD_PROFANITY_RE = /(?:^|[^а-яёa-z])(?:бля|сук[аиоуыеё]|сучк|сучар|чмо|гнид[ауы]|залуп)/i;
 
 const LAT2CYR = { 'a':'а','b':'в','c':'с','e':'е','h':'н','k':'к','m':'м','o':'о','p':'р','t':'т','x':'х','y':'у' };
 const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
@@ -96,9 +105,21 @@ function normalizeForBadWords(text) {
   return t;
 }
 
+// Та же нормализация, но с сохранением границ слов (разделители -> пробел),
+// чтобы можно было искать неоднозначные корни по границе слова.
+function normalizeKeepWords(text) {
+  let t = String(text || '').toLowerCase();
+  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch);
+  t = t.replace(/[a-z]/g, ch => LAT2CYR[ch] || ch);
+  t = t.replace(/[._\-*+=!?()\[\]{}\/\\|'":;@#$%^&`~,]+/g, ' ');
+  t = t.replace(/(.)\1{2,}/g, '$1$1');
+  return t.replace(/\s+/g, ' ').trim();
+}
+
 function hasBadWords(text) {
-  const norm = normalizeForBadWords(text);
-  return BAD_STEMS.some(st => norm.includes(st));
+  const glued = normalizeForBadWords(text);
+  if (HARD_STEMS.some(st => glued.includes(st))) return true;
+  return WORD_PROFANITY_RE.test(normalizeKeepWords(text));
 }
 
 function buildModerationMessages(text) {
@@ -238,5 +259,6 @@ module.exports = {
   COMMENT_DECISIONS,
   moderateComment,
   hasBadWords,
-  normalizeForBadWords
+  normalizeForBadWords,
+  normalizeKeepWords
 };
