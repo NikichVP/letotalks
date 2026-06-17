@@ -319,6 +319,14 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+// Сравнение секретов за константное время (защита от тайминг-атак).
+function timingSafeEqualStr(a, b) {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 function generateSecureToken() {
   return crypto.randomBytes(32).toString('base64url');
 }
@@ -591,14 +599,29 @@ async function callTelegramApi(method, payload) {
   }
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
   const isFormData = typeof FormData !== 'undefined' && payload instanceof FormData;
+  // Таймаут, чтобы зависший Telegram не держал пользовательский HTTP-запрос бесконечно.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
   const options = {
     method: 'POST',
-    body: isFormData ? payload : JSON.stringify(payload)
+    body: isFormData ? payload : JSON.stringify(payload),
+    signal: controller.signal
   };
   if (!isFormData) {
     options.headers = { 'Content-Type': 'application/json' };
   }
-  const resp = await fetchWithProxy(url, options);
+
+  let resp;
+  try {
+    resp = await fetchWithProxy(url, options);
+  } catch (err) {
+    const e = new Error(err?.name === 'AbortError' ? 'telegram_timeout' : 'telegram_failed');
+    e.code = err?.name === 'AbortError' ? 'TELEGRAM_TIMEOUT' : 'TELEGRAM_FAILED';
+    e.description = err?.message || 'telegram_request_failed';
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 
   let data = null;
   try {
@@ -1769,11 +1792,14 @@ app.post('/api/teacher-request', (req, res) => {
 });
 
 app.post('/api/telegram/webhook', express.json({ limit: '1mb' }), async (req, res) => {
-  if (TELEGRAM_WEBHOOK_SECRET) {
-    const provided = req.headers['x-telegram-bot-api-secret-token'];
-    if (String(provided || '').trim() !== TELEGRAM_WEBHOOK_SECRET) {
-      return res.status(403).json({ ok: false });
-    }
+  // Секрет обязателен: без него webhook отклоняется, иначе любой мог бы
+  // подделывать callback'и (одобрять комментарии, создавать учителей).
+  if (!TELEGRAM_WEBHOOK_SECRET) {
+    return res.status(503).json({ ok: false, error: 'webhook_secret_not_configured' });
+  }
+  const provided = String(req.headers['x-telegram-bot-api-secret-token'] || '').trim();
+  if (!timingSafeEqualStr(provided, TELEGRAM_WEBHOOK_SECRET)) {
+    return res.status(403).json({ ok: false });
   }
 
   const update = req.body || {};
