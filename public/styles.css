@@ -705,7 +705,8 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 /* --- User profile popover --- */
 .popover{
   position:absolute; z-index:20; background:#fff; border:1px solid var(--border);
-  border-radius:12px; box-shadow:0 14px 32px rgba(0,0,0,.12); padding:8px; min-width:260px;
+  border-radius:12px; box-shadow:0 14px 32px rgba(0,0,0,.12); padding:8px;
+  width:320px; max-width:calc(100vw - 16px);
 }
 .popover .popover-inner{padding:4px 6px}
 .popover .tname{font-weight:800}
@@ -993,3 +994,45 @@ body.lockout #app { padding: 0; }
   box-shadow: 0 10px 40px rgba(15,23,42,.08);
   box-sizing: border-box;
 }
+
+/* ===== Горизонтальные карусели на главной (Топ / Кафедры) ===== */
+.hscroll{ position:relative; }
+.card-row{
+  display:flex;
+  gap:14px;
+  overflow-x:auto;
+  scroll-snap-type:x proximity;
+  padding:4px 2px 10px;
+  scrollbar-width:thin;
+  -webkit-overflow-scrolling:touch;
+}
+.card-row > .card{
+  flex:0 0 clamp(280px, 30vw, 360px);
+  scroll-snap-align:start;
+  height:auto;
+}
+.card-row::-webkit-scrollbar{ height:8px; }
+.card-row::-webkit-scrollbar-thumb{ background:#cdd6e6; border-radius:999px; }
+.card-row::-webkit-scrollbar-track{ background:transparent; }
+
+.hscroll-arrow{
+  position:absolute;
+  top:46%;
+  transform:translateY(-50%);
+  z-index:5;
+  width:40px; height:40px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background:#fff;
+  color:var(--blue-700);
+  font-size:24px; line-height:1;
+  cursor:pointer;
+  box-shadow:0 4px 14px rgba(0,0,0,.14);
+  display:grid; place-items:center;
+  transition:background .15s ease, transform .15s ease;
+}
+.hscroll-arrow:hover{ background:var(--blue-100); }
+.hscroll-arrow:active{ transform:translateY(-50%) scale(.94); }
+.hscroll-arrow.left{ left:-8px; }
+.hscroll-arrow.right{ right:-8px; }
+@media (max-width:767px){ .hscroll-arrow{ display:none; } } /* на телефоне — свайп */

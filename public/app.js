@@ -386,8 +386,7 @@ const Auth = {
 
     function positionPopover(){
       const r = badge.getBoundingClientRect();
-      pop.style.minWidth = '280px';
-      const popWidth = pop.offsetWidth || 280;
+      const popWidth = pop.offsetWidth || 320;
       const viewportW = document.documentElement.clientWidth;
       // Иконка аккаунта справа -> прижимаем поповер к её правому краю и держим
       // внутри вьюпорта (иначе он вылезает за правый край экрана).
@@ -947,8 +946,22 @@ async viewHome(){
   }).join('');
 
   $('#app').innerHTML = html`
-    <section class="section"><h2>Топ по характеристикам</h2><div class="grid">${charCards}</div></section>
-    <section class="section"><h2>По кафедрам</h2><div class="grid">${deptCards}</div></section>
+    <section class="section">
+      <h2>Топ по характеристикам</h2>
+      <div class="hscroll">
+        <button class="hscroll-arrow left hidden" type="button" aria-label="Влево">‹</button>
+        <div class="card-row">${charCards}</div>
+        <button class="hscroll-arrow right" type="button" aria-label="Вправо">›</button>
+      </div>
+    </section>
+    <section class="section">
+      <h2>По кафедрам</h2>
+      <div class="hscroll">
+        <button class="hscroll-arrow left hidden" type="button" aria-label="Влево">‹</button>
+        <div class="card-row">${deptCards}</div>
+        <button class="hscroll-arrow right" type="button" aria-label="Вправо">›</button>
+      </div>
+    </section>
     <section class="section teacher-request-cta">
       <div class="cta-card">
         <div class="cta-text">
@@ -959,7 +972,35 @@ async viewHome(){
       </div>
     </section>
   `;
+  this.wireHScrollers();
 },
+
+  // Горизонтальные карусели (Топ / Кафедры): стрелки + показ/скрытие по позиции.
+  wireHScrollers(){
+    // Прямое присваивание scrollLeft — надёжно во всех браузерах; плавность даёт
+    // CSS scroll-behavior:smooth на самом .card-row.
+    const scrollByStep = (el, delta)=>{
+      const max = el.scrollWidth - el.clientWidth;
+      el.scrollLeft = Math.max(0, Math.min(el.scrollLeft + delta, max));
+    };
+    $$('.hscroll').forEach(wrap=>{
+      const row = wrap.querySelector('.card-row');
+      const left = wrap.querySelector('.hscroll-arrow.left');
+      const right = wrap.querySelector('.hscroll-arrow.right');
+      if (!row) return;
+      const step = ()=> Math.max(240, Math.round(row.clientWidth * 0.85));
+      const update = ()=>{
+        const maxScroll = row.scrollWidth - row.clientWidth - 2;
+        left?.classList.toggle('hidden', row.scrollLeft <= 4);
+        right?.classList.toggle('hidden', row.scrollLeft >= maxScroll);
+      };
+      left?.addEventListener('click', ()=>{ scrollByStep(row, -step()); update(); });
+      right?.addEventListener('click', ()=>{ scrollByStep(row, step()); update(); });
+      row.addEventListener('scroll', update, { passive: true });
+      requestAnimationFrame(update);
+      setTimeout(update, 300);
+    });
+  },
 
   async viewTeacherRequest(){
     await this.mountNavbar();
