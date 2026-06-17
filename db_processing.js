@@ -49,9 +49,9 @@ function ensureDirsAndDb({ dataDir, photoDir, requestPhotoDir, dbPath }) {
     }
 
     if (!fs.existsSync(dbPath)) {
-      console.error('❌ База данных не найдена!');
-      console.log('Запустите миграцию: npm run migrate');
-      process.exit(1);
+      // Файл создастся автоматически при первом открытии в createDbProcessing,
+      // где идемпотентно создаётся вся схема (CREATE TABLE IF NOT EXISTS).
+      console.log('ℹ️  База данных не найдена — будет создана новая по схеме.');
     }
   }
 }
@@ -71,6 +71,177 @@ function createDbProcessing({
   db.pragma('foreign_keys = ON');
 
   const { sessionTtlMs = 0, maxSessionsPerUser = 5 } = sessionConfig;
+
+  // --- Базовые (core) таблицы. Создаём идемпотентно, чтобы свежий стенд
+  // поднимался без заранее заготовленного файла БД. ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      username TEXT NOT NULL DEFAULT '',
+      created_ts INTEGER NOT NULL DEFAULT 0,
+      last_login_ts INTEGER NOT NULL DEFAULT 0,
+      login_count INTEGER NOT NULL DEFAULT 0,
+      comment_count INTEGER NOT NULL DEFAULT 0,
+      rating_count INTEGER NOT NULL DEFAULT 0,
+      cast_likes INTEGER NOT NULL DEFAULT 0,
+      cast_dislikes INTEGER NOT NULL DEFAULT 0,
+      received_likes INTEGER NOT NULL DEFAULT 0,
+      received_dislikes INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+    CREATE TABLE IF NOT EXISTS teachers (
+      id TEXT PRIMARY KEY,
+      last_name TEXT NOT NULL DEFAULT '',
+      first_name TEXT NOT NULL DEFAULT '',
+      patronymic TEXT NOT NULL DEFAULT '',
+      department TEXT NOT NULL DEFAULT '',
+      subjects TEXT NOT NULL DEFAULT '',
+      photo TEXT DEFAULT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS comments (
+      id INTEGER PRIMARY KEY,
+      teacher_id TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      ts_iso TEXT NOT NULL,
+      author TEXT NOT NULL DEFAULT 'Аноним',
+      text TEXT NOT NULL DEFAULT '',
+      author_uid TEXT DEFAULT '',
+      FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_comments_teacher ON comments(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_ts ON comments(ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_comments_author_uid ON comments(author_uid);
+
+    CREATE TABLE IF NOT EXISTS ratings (
+      teacher_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      sum INTEGER NOT NULL DEFAULT 0,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (teacher_id, key),
+      FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS comment_votes (
+      comment_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      vote INTEGER NOT NULL,
+      ts INTEGER NOT NULL,
+      PRIMARY KEY (comment_id, user_id),
+      FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_votes_comment ON comment_votes(comment_id);
+    CREATE INDEX IF NOT EXISTS idx_votes_user ON comment_votes(user_id);
+
+    CREATE TABLE IF NOT EXISTS admins (
+      email TEXT PRIMARY KEY,
+      role TEXT DEFAULT 'admin'
+    );
+
+    CREATE TABLE IF NOT EXISTS banned_users (
+      user_id TEXT PRIMARY KEY,
+      is_banned INTEGER NOT NULL DEFAULT 0,
+      reason TEXT DEFAULT '',
+      ts INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS login_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      ts_iso TEXT NOT NULL,
+      action TEXT NOT NULL,
+      email TEXT NOT NULL,
+      ip TEXT DEFAULT '',
+      ua TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_login_ts ON login_events(ts DESC);
+
+    CREATE TABLE IF NOT EXISTS shop_items (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      category TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS user_ratings (
+      user_id TEXT NOT NULL,
+      teacher_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value INTEGER NOT NULL,
+      updated_ts INTEGER NOT NULL,
+      PRIMARY KEY (user_id, teacher_id, key),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_ratings_teacher ON user_ratings(teacher_id, key);
+
+    CREATE TABLE IF NOT EXISTS teacher_requests (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      created_ts INTEGER NOT NULL,
+      created_iso TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      photo_filename TEXT,
+      submitter_ip TEXT,
+      submitter_agent TEXT,
+      telegram_chat_id TEXT,
+      telegram_message_id TEXT,
+      processed_ts INTEGER,
+      processed_iso TEXT,
+      processed_by TEXT,
+      processed_action TEXT,
+      teacher_id TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_teacher_requests_status ON teacher_requests(status);
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_id TEXT NOT NULL,
+      created_ts INTEGER NOT NULL,
+      last_activity_ts INTEGER NOT NULL,
+      expires_ts INTEGER NOT NULL,
+      ip TEXT,
+      user_agent TEXT,
+      is_active INTEGER DEFAULT 1,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_ts);
+
+    CREATE TABLE IF NOT EXISTS security_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      ts_iso TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      user_id TEXT,
+      email TEXT,
+      ip TEXT,
+      user_agent TEXT,
+      details TEXT,
+      severity TEXT DEFAULT 'info'
+    );
+    CREATE INDEX IF NOT EXISTS idx_security_log_ts ON security_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_security_log_type ON security_log(event_type);
+    CREATE INDEX IF NOT EXISTS idx_security_log_user ON security_log(user_id);
+
+    CREATE TABLE IF NOT EXISTS login_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      success INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email, ts);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, ts);
+  `);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS user_inventory (
