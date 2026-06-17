@@ -1705,13 +1705,21 @@ async viewHome(){
         const result = await API.publish({ teacherId:tid, text, ratings, author:'Student' });
         const teacherPayload = result?.teacher && typeof result.teacher === 'object' ? result.teacher : null;
         const pendingReview = !!result?.pendingReview;
-        this.setCommentNotice({
-          teacherId: tid,
-          text: pendingReview
-            ? 'Комментарий отправлен на модерацию — появится после проверки.'
-            : 'Комментарий опубликован!',
-          tone: pendingReview ? 'warn' : 'success'
-        });
+        const moderationUnavailable = !!result?.moderationUnavailable;
+        let noticeText, noticeTone;
+        if (moderationUnavailable) {
+          noticeText = result?.ratingsSaved
+            ? 'Оценки сохранены. Текст не удалось отправить на проверку — попробуйте позже.'
+            : 'Не удалось отправить текст на проверку — попробуйте позже.';
+          noticeTone = 'warn';
+        } else if (pendingReview) {
+          noticeText = 'Комментарий отправлен на модерацию — появится после проверки.';
+          noticeTone = 'warn';
+        } else {
+          noticeText = text ? 'Комментарий опубликован!' : 'Оценки сохранены!';
+          noticeTone = 'success';
+        }
+        this.setCommentNotice({ teacherId: tid, text: noticeText, tone: noticeTone });
         App.resetPending(tid);
         await App.teacherProfile(null,tid, teacherPayload);
         Auth.refreshStatsAndPopover();

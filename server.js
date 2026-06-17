@@ -1480,63 +1480,68 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     let commentAdded = false;
     let invalidatePayload = false;
     let invalidateAggregates = false;
+    let moderationUnavailable = false;
 
-    // Сохраняем комментарий (используем только новую функцию addComment)
-    if (textStr) {
-      if (moderationResult.decision === COMMENT_DECISIONS.REVIEW) {
-        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_REVIEW_CHAT_ID) {
-          return res.status(503).json({ error: 'moderation_unavailable' });
-        }
-        try {
-          const { reviewId } = await queueCommentForReview({
-            teacherRow: t,
-            teacherId,
-            text: textStr,
-            authorName,
-            userId,
-            reason: moderationResult.reason || 'needs_review'
-          });
-          queuedReviewId = reviewId;
-        } catch (err) {
-          console.error('Не удалось поставить комментарий в очередь модерации:', err && err.message ? err.message : err);
-          return res.status(500).json({ error: 'server_error', message: 'moderation_queue_failed' });
-        }
-      } else if (moderationResult.decision === COMMENT_DECISIONS.ALLOW) {
-        try {
-          await addComment({ teacherId, author: authorName, text: textStr, author_uid: userId || '' });
-          commentAdded = true;
-          invalidatePayload = true;
-        } catch (err) {
-          console.error('addComment failed:', err && err.message ? err.message : err);
-          return res.status(500).json({ error: 'server_error', message: 'failed_to_save_comment' });
-        }
-      }
-    }
-
+    // Сначала сохраняем оценки — они не зависят от модерации текста и не должны
+    // теряться, если комментарий уходит на ручную модерацию или не сохранился.
     let ratingUpdateInfo = { added: 0, updated: 0 };
-    // Обновляем рейтинг (используем только новую функцию updateRatings)
     if (hasRatings) {
       try {
-        ratingUpdateInfo = updateRatings(teacherId, ratings, userId || null) || ratingUpdateInfo;
-        if ((ratingUpdateInfo.added || ratingUpdateInfo.updated) && !invalidateAggregates) {
+        ratingUpdateInfo = updateRatings(teacherId, ratings, userId) || ratingUpdateInfo;
+        if (ratingUpdateInfo.added || ratingUpdateInfo.updated) {
           invalidateAggregates = true;
           invalidatePayload = true;
         }
       } catch (err) {
         console.error('updateRatings failed:', err && err.message ? err.message : err);
         ratingUpdateInfo = { added: 0, updated: 0 };
-        // не прерываем основной поток — вернём ответ с тем, что успели сохранить
+      }
+    }
+
+    // Затем — текстовый комментарий.
+    if (textStr) {
+      if (moderationResult.decision === COMMENT_DECISIONS.REVIEW) {
+        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_REVIEW_CHAT_ID) {
+          // Модерация недоступна: текст не публикуем, но оценки уже сохранены.
+          moderationUnavailable = true;
+        } else {
+          try {
+            const { reviewId } = await queueCommentForReview({
+              teacherRow: t,
+              teacherId,
+              text: textStr,
+              authorName,
+              userId,
+              reason: moderationResult.reason || 'needs_review'
+            });
+            queuedReviewId = reviewId;
+          } catch (err) {
+            console.error('Не удалось поставить комментарий в очередь модерации:', err && err.message ? err.message : err);
+            moderationUnavailable = true;
+          }
+        }
+      } else if (moderationResult.decision === COMMENT_DECISIONS.ALLOW) {
+        try {
+          await addComment({ teacherId, author: authorName, text: textStr, author_uid: userId });
+          commentAdded = true;
+          invalidatePayload = true;
+        } catch (err) {
+          console.error('addComment failed:', err && err.message ? err.message : err);
+          // Если и оценок нет — это полноценная ошибка; иначе сохраняем оценки.
+          if (!ratingUpdateInfo.added && !ratingUpdateInfo.updated) {
+            return res.status(500).json({ error: 'server_error', message: 'failed_to_save_comment' });
+          }
+          moderationUnavailable = true;
+        }
       }
     }
 
     // Статистика пользователя — считаем валидные оценки и комментарии
-    if (u) {
-      try {
-        const ratingDelta = ratingUpdateInfo?.added ?? (hasRatings ? validRatingKeys.length : 0);
-        incUserStats(u.id, { comments: commentAdded ? 1 : 0, ratings: ratingDelta });
-      } catch (err) {
-        console.warn('incUserStats failed:', err && err.message ? err.message : err);
-      }
+    try {
+      const ratingDelta = ratingUpdateInfo?.added ?? (hasRatings ? validRatingKeys.length : 0);
+      incUserStats(u.id, { comments: commentAdded ? 1 : 0, ratings: ratingDelta });
+    } catch (err) {
+      console.warn('incUserStats failed:', err && err.message ? err.message : err);
     }
 
     if (invalidateAggregates) {
@@ -1549,6 +1554,8 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
       ok: true,
       pendingReview: !!queuedReviewId,
       reviewId: queuedReviewId || undefined,
+      moderationUnavailable: moderationUnavailable || undefined,
+      ratingsSaved: (ratingUpdateInfo.added || ratingUpdateInfo.updated) ? true : undefined,
       teacher: buildTeacherPayload(teacherId, req)
     });
   } catch (err) {
@@ -1578,15 +1585,17 @@ app.post('/api/comment/vote', (req,res)=>{
     return res.json({ok:true, likes:cnt.likes, dislikes:cnt.dislikes, myVote:newVote});
   }
 
-  setUserVote(commentId, u.id, newVote);
-
   const cast_like     = (newVote===1?1:0)  - (prev===1?1:0);
   const cast_dislike  = (newVote===-1?1:0) - (prev===-1?1:0);
   const recv_like     = cast_like;
   const recv_dislike  = cast_dislike;
 
-  if (cast_like || cast_dislike) incUserStats(u.id, { cast_like, cast_dislike });
-  if (c.author_uid) incUserStats(String(c.author_uid), { recv_like, recv_dislike });
+  // Голос и счётчики — атомарно, чтобы comment_votes и users не рассинхронились при сбое.
+  db.transaction(() => {
+    setUserVote(commentId, u.id, newVote);
+    if (cast_like || cast_dislike) incUserStats(u.id, { cast_like, cast_dislike });
+    if (c.author_uid) incUserStats(String(c.author_uid), { recv_like, recv_dislike });
+  })();
 
   const {counts} = countVotesForCommentBulk([String(commentId)], u.id);
   const cnt = counts[String(commentId)] || {likes:0,dislikes:0};

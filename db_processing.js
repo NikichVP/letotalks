@@ -816,13 +816,14 @@ function createDbProcessing({
   }
 
   function incUserStats(userId, { comments = 0, ratings = 0, cast_like = 0, cast_dislike = 0, recv_like = 0, recv_dislike = 0 } = {}) {
+    // MAX(0, ...) — счётчики не уходят в минус при декрементах (они формируют монеты).
     const stmt = db.prepare(`UPDATE users SET
-      comment_count = comment_count + ?,
-      rating_count = rating_count + ?,
-      cast_likes = cast_likes + ?,
-      cast_dislikes = cast_dislikes + ?,
-      received_likes = received_likes + ?,
-      received_dislikes = received_dislikes + ?
+      comment_count = MAX(0, comment_count + ?),
+      rating_count = MAX(0, rating_count + ?),
+      cast_likes = MAX(0, cast_likes + ?),
+      cast_dislikes = MAX(0, cast_dislikes + ?),
+      received_likes = MAX(0, received_likes + ?),
+      received_dislikes = MAX(0, received_dislikes + ?)
       WHERE id = ?`);
     stmt.run(comments, ratings, cast_like, cast_dislike, recv_like, recv_dislike, userId);
   }
