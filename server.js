@@ -2068,7 +2068,9 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
 
   for (const u of users) {
     const uid = String(u.id||'');
-    const cnt = counts[uid] || Number(u.comment_count||0) || 0;
+    // Считаем по РЕАЛЬНЫМ комментариям, а не по денормализованному счётчику —
+    // иначе пользователь с устаревшим comment_count висит в списке без комментариев.
+    const cnt = counts[uid] || 0;
     if (!cnt) continue;
     out.push({
       id: uid,

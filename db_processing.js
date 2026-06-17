@@ -980,6 +980,19 @@ function createDbProcessing({
     stmt.run(comments, ratings, cast_like, cast_dislike, recv_like, recv_dislike, userId);
   }
 
+  // Пересчитывает денормализованные счётчики из источников (фикс возможного дрейфа).
+  function reconcileUserCounters() {
+    db.exec(`
+      UPDATE users SET
+        comment_count = (SELECT COUNT(*) FROM comments WHERE author_uid = users.id),
+        rating_count = (SELECT COUNT(*) FROM user_ratings WHERE user_id = users.id),
+        received_likes = (SELECT COUNT(*) FROM comment_votes v JOIN comments c ON v.comment_id = c.id WHERE c.author_uid = users.id AND v.vote = 1),
+        received_dislikes = (SELECT COUNT(*) FROM comment_votes v JOIN comments c ON v.comment_id = c.id WHERE c.author_uid = users.id AND v.vote = -1),
+        cast_likes = (SELECT COUNT(*) FROM comment_votes WHERE user_id = users.id AND vote = 1),
+        cast_dislikes = (SELECT COUNT(*) FROM comment_votes WHERE user_id = users.id AND vote = -1)
+    `);
+  }
+
   const isUserBannedStmt = db.prepare('SELECT is_banned FROM banned_users WHERE user_id = ?');
   function isUserBanned(userId) {
     const row = isUserBannedStmt.get(userId);
@@ -1484,6 +1497,7 @@ function createDbProcessing({
     findUserById,
     upsertUserOnLogin,
     incUserStats,
+    reconcileUserCounters,
     isUserBanned,
     setBanStatus,
     upsertTeacher,

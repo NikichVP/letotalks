@@ -272,14 +272,13 @@ const Auth = {
   isLogged(){ return !!this._state.loggedIn; },
 
   render(){
-  const loginBtn=$('#loginBtn'), userBadge=$('#userBadge'), logoutBtn=$('#logoutBtn');
+  const loginBtn=$('#loginBtn'), userBadge=$('#userBadge');
   const adminLink=$('#adminLink');
   const shopLink=$('#shopLink'); // ← эта строка должна быть
 
   if(this.isLogged()){
     loginBtn?.classList.add('hidden');
     userBadge?.classList.remove('hidden');
-    logoutBtn?.classList.remove('hidden');
 
     if (userBadge){
       const nick = this._state.display_name || (this._state.username || this._state.email || 'Student').split('@')[0] || 'Student';
@@ -301,7 +300,6 @@ const Auth = {
   }else{
     loginBtn?.classList.remove('hidden');
     userBadge?.classList.add('hidden');
-    logoutBtn?.classList.add('hidden');
     adminLink?.classList.add('hidden');
     shopLink?.classList.add('hidden');
   }
@@ -368,11 +366,20 @@ const Auth = {
             <li>Получил на своих комментариях: 👍 <b>${u.received_likes||0}</b>, 👎 <b>${u.received_dislikes||0}</b></li>
           </ul>
           <div class="hr"></div>
-          <div class="muted" style="font-size:12px">Лайки/дизлайки учитываются только на ваших комментариях.</div>
+          <div class="muted" style="font-size:12px;margin-bottom:8px">Лайки/дизлайки учитываются только на ваших комментариях.</div>
+          <button class="btn small outline" id="popoverLogout" type="button" style="width:100%">Выйти</button>
         </div>
       `;
     };
     updateContent();
+
+    // «Выйти» внутри оверлея (innerHTML пересобирается — вешаем делегированно, один раз).
+    if (!pop.__logoutBound) {
+      pop.__logoutBound = true;
+      pop.addEventListener('click', (e)=>{
+        if (e.target.closest('#popoverLogout')) { pop.classList.add('hidden'); Auth.logout(); }
+      });
+    }
 
     let hover = false;
     let hideTimer = null;
@@ -380,7 +387,15 @@ const Auth = {
     function positionPopover(){
       const r = badge.getBoundingClientRect();
       pop.style.minWidth = '280px';
-      pop.style.left = Math.round(window.scrollX + r.left) + 'px';
+      const popWidth = pop.offsetWidth || 280;
+      const viewportW = document.documentElement.clientWidth;
+      // Иконка аккаунта справа -> прижимаем поповер к её правому краю и держим
+      // внутри вьюпорта (иначе он вылезает за правый край экрана).
+      let left = window.scrollX + r.right - popWidth;
+      const minLeft = window.scrollX + 8;
+      const maxLeft = window.scrollX + viewportW - popWidth - 8;
+      left = Math.max(minLeft, Math.min(left, maxLeft));
+      pop.style.left = Math.round(left) + 'px';
       pop.style.top  = Math.round(window.scrollY + r.bottom + 8) + 'px';
     }
     function show(){
@@ -2785,7 +2800,6 @@ window.App=App; window.Router=Router; window.Auth=Auth;
 addEventListener('DOMContentLoaded', ()=>{
   Auth.migrate();
   $('#loginBtn')?.addEventListener('click', ()=>Router.go('/login'));
-  $('#logoutBtn')?.addEventListener('click', ()=>Auth.logout());
   $('#searchBtn')?.addEventListener('click', ()=>App.search());
   $('#searchInput')?.addEventListener('keydown', e=>{ if(e.key==='Enter') App.search(); });
   const searchInput = $('#searchInput');

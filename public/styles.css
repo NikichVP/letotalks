@@ -105,6 +105,10 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
   font-size: 14px;
   transition: all 0.2s ease;
   color: var(--text);
+  /* Длинное название кафедры не должно растягивать кнопку и лезть на соседей */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .select-btn:hover {
@@ -227,6 +231,20 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
   max-width:200px
 }
 
+/* Иконка аккаунта в навбаре (кнопка). Наведение -> оверлей с «Выйти». */
+.user-badge{
+  cursor:pointer;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:180px;
+  transition:background-color .15s ease, border-color .15s ease;
+}
+.user-badge:hover{
+  background:var(--blue-100);
+  border-color:var(--blue-500);
+}
+
 /* ===== TABLET/DESKTOP: 768px+ - TOPBAR IN ROW LAYOUT ===== */
 @media (min-width: 768px) {
   .topbar{
@@ -256,7 +274,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
   .custom-select{
     flex:none;
     min-width:170px;
-    max-width:none
+    max-width:230px
   }
 
   .btn{
