@@ -246,6 +246,7 @@ const {
   deleteComment,
   getAllCommentsByUser,
   getUserVote,
+  getVotersForComment,
   setUserVote,
   countVotesForCommentBulk,
   getActiveNickname,
@@ -2123,18 +2124,24 @@ app.post('/api/admin/comment/delete', requireAdmin, express.json(), (req,res)=>{
   const comment = getCommentById(commentId);
   if (!comment) return res.status(404).json({error:'not_found'});
 
-  const { counts } = countVotesForCommentBulk([String(commentId)], null);
-  const cnt = counts[String(commentId)] || { likes:0, dislikes:0 };
+  // Атомарно: откатываем счётчики автора (по реальным голосам) И cast_* всех
+  // голосовавших, затем удаляем коммент (CASCADE снесёт comment_votes).
+  db.transaction(() => {
+    const voters = getVotersForComment(commentId);
+    let likes = 0, dislikes = 0;
+    for (const v of voters) {
+      if (v.vote === 1) likes++; else if (v.vote === -1) dislikes++;
+      incUserStats(String(v.user_id), {
+        cast_like: v.vote === 1 ? -1 : 0,
+        cast_dislike: v.vote === -1 ? -1 : 0
+      });
+    }
+    if (comment.author_uid) {
+      incUserStats(String(comment.author_uid), { comments: -1, recv_like: -likes, recv_dislike: -dislikes });
+    }
+    deleteComment(commentId);
+  })();
 
-  if (comment.author_uid) {
-    incUserStats(String(comment.author_uid), {
-      comments: -1,
-      recv_like: -(cnt.likes||0),
-      recv_dislike: -(cnt.dislikes||0)
-    });
-  }
-
-  deleteComment(commentId);
   invalidateTeacherPayloadCache(comment.teacher_id);
   return res.json({ ok:true });
 });

@@ -481,7 +481,7 @@ function createDbProcessing({
   `);
   const updateAggregateRatingStmt = db.prepare(`
     UPDATE ratings
-    SET sum = sum + ?, count = count + ?
+    SET sum = MAX(0, sum + ?), count = MAX(0, count + ?)
     WHERE teacher_id = ? AND key = ?
   `);
   const selectUserRatingStmt = db.prepare(`
@@ -823,6 +823,11 @@ function createDbProcessing({
     return row ? row.vote : 0;
   }
 
+  const getVotersForCommentStmt = db.prepare('SELECT user_id, vote FROM comment_votes WHERE comment_id = ?');
+  function getVotersForComment(commentId) {
+    return getVotersForCommentStmt.all(commentId);
+  }
+
   function setUserVote(commentId, userId, newVote) {
     if (newVote === 0) {
       const stmt = db.prepare('DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?');
@@ -1002,12 +1007,36 @@ function createDbProcessing({
   }
 
   function deleteTeacherById(id) {
-    const stmt = db.prepare('DELETE FROM teachers WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes > 0) {
-      invalidateTeacherCaches();
-    }
-    return info.changes > 0;
+    // Удаление учителя каскадно сносит его комментарии/оценки/голоса. Чтобы
+    // денормализованные счётчики (а с ними и монеты) не завышались, сначала
+    // собираем, что нужно откатить, затем удаляем и применяем откат — атомарно.
+    const changed = db.transaction(() => {
+      const commentCounts = db.prepare(
+        `SELECT author_uid, COUNT(*) n FROM comments WHERE teacher_id = ? AND author_uid <> '' GROUP BY author_uid`
+      ).all(id);
+      const ratingCounts = db.prepare(
+        `SELECT user_id, COUNT(*) n FROM user_ratings WHERE teacher_id = ? GROUP BY user_id`
+      ).all(id);
+      const votes = db.prepare(
+        `SELECT v.user_id AS voter, v.vote AS vote, c.author_uid AS author
+         FROM comment_votes v JOIN comments c ON v.comment_id = c.id
+         WHERE c.teacher_id = ?`
+      ).all(id);
+
+      const info = db.prepare('DELETE FROM teachers WHERE id = ?').run(id);
+      if (info.changes === 0) return false;
+
+      for (const c of commentCounts) incUserStats(String(c.author_uid), { comments: -c.n });
+      for (const r of ratingCounts) incUserStats(String(r.user_id), { ratings: -r.n });
+      for (const v of votes) {
+        incUserStats(String(v.voter), { cast_like: v.vote === 1 ? -1 : 0, cast_dislike: v.vote === -1 ? -1 : 0 });
+        if (v.author) incUserStats(String(v.author), { recv_like: v.vote === 1 ? -1 : 0, recv_dislike: v.vote === -1 ? -1 : 0 });
+      }
+      return true;
+    })();
+
+    if (changed) invalidateTeacherCaches();
+    return changed;
   }
 
   function logSecurityEvent(eventType, details = {}) {
@@ -1434,6 +1463,7 @@ function createDbProcessing({
     deleteComment,
     getAllCommentsByUser,
     getUserVote,
+    getVotersForComment,
     setUserVote,
     countVotesForCommentBulk,
     getUserVotesForComments,
