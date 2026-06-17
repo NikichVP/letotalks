@@ -1435,7 +1435,7 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
 
     const moderationResult = textStr
       ? await moderateComment(textStr, {
-          gptApiKey: process.env.OPENAI_API_KEY,
+          gptApiKey: GPT_MODERATION_API_KEY,
           gptApiUrl: GPT_MODERATION_URL,
           gptModel: GPT_MODERATION_MODEL,
           onLocalBan: handleLocalBan
