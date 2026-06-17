@@ -883,6 +883,41 @@ function createDbProcessing({
     return row ? row.item_name : null;
   }
 
+  // Bulk-загрузка пользователей одним запросом (вместо N отдельных findUserById).
+  function getUsersByIds(ids) {
+    const result = new Map();
+    const unique = [...new Set((ids || []).filter(Boolean).map(String))];
+    if (!unique.length) return result;
+    const CHUNK = 400; // запас до лимита переменных SQLite (999)
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      const ph = slice.map(() => '?').join(',');
+      const rows = db.prepare(`SELECT * FROM users WHERE id IN (${ph})`).all(...slice);
+      for (const r of rows) result.set(String(r.id), r);
+    }
+    return result;
+  }
+
+  // Bulk-загрузка активных ников одним запросом.
+  function getActiveNicknamesByIds(userIds) {
+    const result = new Map();
+    const unique = [...new Set((userIds || []).filter(Boolean).map(String))];
+    if (!unique.length) return result;
+    const CHUNK = 400;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      const ph = slice.map(() => '?').join(',');
+      const rows = db.prepare(
+        `SELECT user_id, item_name FROM user_inventory
+         WHERE item_type = 'nickname' AND is_active = 1 AND user_id IN (${ph})`
+      ).all(...slice);
+      for (const r of rows) {
+        if (!result.has(String(r.user_id))) result.set(String(r.user_id), r.item_name);
+      }
+    }
+    return result;
+  }
+
   function findUserByEmail(email) {
     const stmt = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)');
     return stmt.get(email);
@@ -930,6 +965,12 @@ function createDbProcessing({
     const stmt = db.prepare('SELECT is_banned FROM banned_users WHERE user_id = ?');
     const row = stmt.get(userId);
     return row ? !!row.is_banned : false;
+  }
+
+  // Множество id всех забаненных пользователей — для проверки списков без N+1.
+  function getBannedUserIdSet() {
+    const rows = db.prepare('SELECT user_id FROM banned_users WHERE is_banned = 1').all();
+    return new Set(rows.map(r => String(r.user_id)));
   }
 
   function setBanStatus(userId, banned, reason = '') {
@@ -1391,6 +1432,9 @@ function createDbProcessing({
     countVotesForCommentBulk,
     getUserVotesForComments,
     getActiveNickname,
+    getUsersByIds,
+    getActiveNicknamesByIds,
+    getBannedUserIdSet,
     findUserByEmail,
     findUserById,
     upsertUserOnLogin,

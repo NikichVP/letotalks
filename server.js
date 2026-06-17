@@ -249,6 +249,9 @@ const {
   setUserVote,
   countVotesForCommentBulk,
   getActiveNickname,
+  getUsersByIds,
+  getActiveNicknamesByIds,
+  getBannedUserIdSet,
   findUserByEmail,
   findUserById,
   upsertUserOnLogin,
@@ -590,19 +593,15 @@ function buildTeacherBaseCached(teacherId) {
   const commentIds = commentsRaw.map(c => String(c.id));
   const { counts } = countVotesForCommentBulk(commentIds, null);
 
-  const userCache = new Map();
-  const resolveUser = (uid) => {
-    if (!uid) return null;
-    const key = String(uid);
-    if (!userCache.has(key)) {
-      userCache.set(key, findUserById(key) || null);
-    }
-    return userCache.get(key);
-  };
+  // Bulk-загрузка авторов и их активных ников одним-двумя запросами вместо N+1.
+  const authorIds = [...new Set(commentsRaw.map(c => c.author_uid).filter(Boolean).map(String))];
+  const usersById = getUsersByIds(authorIds);
+  const nicksById = getActiveNicknamesByIds(authorIds);
 
   const comments = commentsRaw.map(c => {
-    const authorUser = c.author_uid ? resolveUser(c.author_uid) : null;
-    const activeNick = authorUser ? getActiveNickname(authorUser.id) : null;
+    const uid = c.author_uid ? String(c.author_uid) : null;
+    const authorUser = uid ? (usersById.get(uid) || null) : null;
+    const activeNick = uid ? (nicksById.get(uid) || null) : null;
     const displayAuthor = activeNick || 'Аноним';
     const base = {
       id: c.id,
@@ -2026,6 +2025,7 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
   }
 
   const users = getUserList();
+  const bannedSet = getBannedUserIdSet();
   const out = [];
 
   for (const u of users) {
@@ -2037,7 +2037,7 @@ app.get('/api/admin/commenters', requireAdmin, (req,res)=>{
       email: u.email || '',
       username: u.username || '',
       comment_count: cnt,
-      is_banned: isUserBanned(uid),
+      is_banned: bannedSet.has(uid),
       last_comment_ts: lastTs[uid] || 0
     });
   }
@@ -2087,6 +2087,7 @@ app.get('/api/admin/comments/by-user', requireAdmin, (req,res)=>{
 
 app.get('/api/admin/users', requireAdmin, (req,res)=>{
   const users = getUserList();
+  const bannedSet = getBannedUserIdSet();
 
   const out = users.map(u=>({
     id: u.id,
@@ -2094,7 +2095,7 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
     username: u.username || '',
     comment_count: Number(u.comment_count||0) || 0,
     rating_count: Number(u.rating_count||0) || 0,
-    is_banned: isUserBanned(u.id)
+    is_banned: bannedSet.has(String(u.id))
   }));
 
   res.json({ ok:true, users: out });
