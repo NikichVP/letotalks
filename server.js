@@ -1299,11 +1299,33 @@ function invalidateAllUserSessions(userId) {
 const cleanupTimer = setInterval(() => {
   cleanupSessionsDb();
   cleanupOldLogs();
+  // Чистим протухшие pending-авторизации, чтобы Map не рос бесконечно.
+  const now = Date.now();
+  for (const [sid, rec] of PENDING_AUTH) {
+    if (!rec || (now - (rec.created || 0)) > AUTH_SESSION_TTL_MS) {
+      PENDING_AUTH.delete(sid);
+    }
+  }
 }, SESSION_CLEANUP_INTERVAL);
 
 if (typeof cleanupTimer.unref === 'function') {
   cleanupTimer.unref();
 }
+
+// Периодический бэкап БД (раз в сутки) — единственный файл без копий = одна точка отказа.
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const dbBackupTimer = setInterval(() => {
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const target = path.join(BACKUP_DIR, 'letotalks-backup.db');
+    if (fs.existsSync(target)) fs.unlinkSync(target); // VACUUM INTO требует, чтобы файла не было
+    // VACUUM INTO даёт согласованный снимок даже в WAL-режиме.
+    db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+  } catch (err) {
+    console.warn('Не удалось сделать бэкап БД:', err && err.message ? err.message : err);
+  }
+}, 24 * 60 * 60 * 1000);
+if (typeof dbBackupTimer.unref === 'function') dbBackupTimer.unref();
 
 /* Rate limiters */
 function limitPerIp(minIntervalMs){
@@ -2346,7 +2368,7 @@ app.post('/api/auth/request', authLimiter, async (req,res)=>{
       });
     }
 
-    const code = ('' + Math.floor(100000 + Math.random()*900000)).slice(0,6);
+    const code = String(crypto.randomInt(100000, 1000000));
     const sessionId = 'a-' + crypto.randomBytes(16).toString('hex');
 
     PENDING_AUTH.set(sessionId, {
