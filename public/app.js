@@ -1594,7 +1594,7 @@ async viewHome(){
 
     const commentsHtml = (t.comments&&t.comments.length)
       ? t.comments.slice().reverse().map(c=>{
-        const authorName = c.authorDisplay || c.author || 'Аноним';
+        const authorName = c.authorDisplay || 'Аноним';
         return html`
         <div class="comment" data-cid="${escAttr(c.id)}">
           <div class="meta">

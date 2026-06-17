@@ -518,7 +518,9 @@ function buildTeacherBaseCached(teacherId) {
       teacherId: c.teacher_id,
       ts: c.ts,
       ts_iso: c.ts_iso,
-      author: c.author,
+      // Публично не раскрываем сохранённое имя автора (там может быть username) —
+      // показываем только активный ник или «Аноним».
+      author: displayAuthor,
       authorDisplay: displayAuthor,
       text: c.text,
       likes: (counts[String(c.id)]?.likes) || 0,
@@ -1395,8 +1397,11 @@ app.post('/api/comment-with-ratings', commentPerMinuteLimiter, async (req, res) 
     if (!t) return res.status(404).json({ error: 'teacher_not_found' });
 
     const u = getUserFromRequest(req);
-    const userId = u?.id || '';
-    const authorName = String(author || (u ? u.username : 'Аноним')).slice(0, 64);
+    // Регистрация обязательна: и комментарии, и оценки — только для вошедших.
+    // Это же гарантирует дедупликацию оценок по user_id (нет анонимной накрутки).
+    if (!u) return res.status(401).json({ error: 'unauthorized', message: 'login_required' });
+    const userId = u.id;
+    const authorName = String(author || u.username || 'Аноним').slice(0, 64);
     const textStr = String(text || '').trim();
 
     const validRatingKeys = [];
