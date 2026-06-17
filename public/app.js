@@ -47,8 +47,6 @@ function coinsOf(u){
 
   const normalized = Math.max(0, Number.isFinite(available) ? available : 0);
 
-  console.log(`[DEBUG coinsOf] User ${u?.id}: earned=${earned}, spent=${spent}, available=${normalized}`);
-
   return normalized;
 }
 
@@ -501,8 +499,15 @@ const Auth = {
     pop.onmouseleave = ()=>{
       hover = false; scheduleHide();
     };
-    window.addEventListener('scroll', ()=>{ if(!pop.classList.contains('hidden')) positionPopover(); }, {passive:true});
-    window.addEventListener('resize', ()=>{ if(!pop.classList.contains('hidden')) positionPopover(); });
+    // Слушатели scroll/resize вешаем ОДИН раз; актуальную функцию позиционирования
+    // храним на window, чтобы не накапливать обработчики при каждом ре-рендере.
+    window.__ltPositionPopover = positionPopover;
+    if (!window.__ltPopoverReflowBound) {
+      window.__ltPopoverReflowBound = true;
+      const reflow = ()=>{ const p=$('#userPopover'); if(p && !p.classList.contains('hidden') && window.__ltPositionPopover) window.__ltPositionPopover(); };
+      window.addEventListener('scroll', reflow, {passive:true});
+      window.addEventListener('resize', reflow);
+    }
   }
 };
 
@@ -839,6 +844,9 @@ const App = {
   },
 
   async mountNavbar(){
+    // Отключаем infinite-scroll наблюдатель прошлой страницы, чтобы он не висел
+    // на удалённом из DOM сентинеле (утечка + лишние подгрузки).
+    if (App._listObserver) { App._listObserver.disconnect(); App._listObserver = null; }
     const btn  = $('#deptBtn');
     const menu = $('#deptMenu');
     const searchInput = $('#searchInput');
@@ -888,12 +896,18 @@ const App = {
       btn.setAttribute('aria-expanded','false');
       Router.go(route);
     };
-    document.addEventListener('click', (e)=>{
-      if (!e.target.closest('#deptSelectWrap')) { menu.classList.add('hidden'); btn.setAttribute('aria-expanded','false'); }
-    });
-    document.addEventListener('keydown', (e)=>{
-      if(e.key==='Escape'){ menu.classList.add('hidden'); btn.setAttribute('aria-expanded','false'); }
-    });
+    // Навешиваем document-слушатели один раз: иначе при каждой навигации
+    // накапливаются дубликаты (память/CPU, многократное срабатывание).
+    if (!App._navDocHandlersAttached) {
+      document.addEventListener('click', (e)=>{
+        const m = $('#deptMenu'), b = $('#deptBtn');
+        if (m && b && !e.target.closest('#deptSelectWrap')) { m.classList.add('hidden'); b.setAttribute('aria-expanded','false'); }
+      });
+      document.addEventListener('keydown', (e)=>{
+        if(e.key==='Escape'){ const m=$('#deptMenu'), b=$('#deptBtn'); if(m) m.classList.add('hidden'); if(b) b.setAttribute('aria-expanded','false'); }
+      });
+      App._navDocHandlersAttached = true;
+    }
   },
 
   search(){
@@ -1393,6 +1407,7 @@ async viewHome(){
       }
     }, { rootMargin: '200px 0px' });
     io.observe(sentinel);
+    App._listObserver = io; // отключим при следующей навигации (см. mountNavbar)
 
     // initial chunk
     loadMore();
@@ -1585,7 +1600,7 @@ async viewHome(){
           <div class="current">Средняя: ${fmtStars(cur)}</div>
           <div class="stars" role="radiogroup" aria-label="${c.name}">
             ${[5,4,3,2,1].map(v=>html`
-              <input type="radio" id="${g}-${v}" name="${g}" value="${v}" ${Auth.isLogged()?'':'disabled'}/>
+              <input type="radio" id="${g}-${v}" name="${g}" value="${v}" aria-label="Оценка ${v} из 5" ${Auth.isLogged()?'':'disabled'}/>
               <label for="${g}-${v}" title="${v}">★</label>
             `).join('')}
           </div>
@@ -1606,9 +1621,9 @@ async viewHome(){
           </div>
           <div class="ctext">${esc(c.text||'')}</div>
           <div class="cactions" style="display:flex;gap:8px;align-items:center">
-            <button class="iconbtn like ${c.myVote===1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👍 <span class="cnt">${c.likes||0}</span></button>
-            <button class="iconbtn dislike ${c.myVote===-1?'active':''}" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':''}">👎 <span class="cnt">${c.dislikes||0}</span></button>
-            <button class="btn small outline report-btn">🚩 Пожаловаться</button>
+            <button class="iconbtn like ${c.myVote===1?'active':''}" aria-label="Лайк" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':'Лайк'}">👍 <span class="cnt">${c.likes||0}</span></button>
+            <button class="iconbtn dislike ${c.myVote===-1?'active':''}" aria-label="Дизлайк" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':'Дизлайк'}">👎 <span class="cnt">${c.dislikes||0}</span></button>
+            <button class="btn small outline report-btn" aria-label="Пожаловаться">🚩 Пожаловаться</button>
             ${amAdmin ? html`<button class="btn small outline del-comment">Удалить</button>`:''}
           </div>
         </div>`;
@@ -2700,7 +2715,7 @@ async viewHome(){
               <div style="text-align: center; padding: 40px;">
                 <h3 style="color: var(--muted);">🛒 Товары временно отсутствуют</h3>
                 <p class="muted">Попробуйте обновить страницу или зайти позже.</p>
-                <button class="btn outline" onclick="location.reload()">Обновить страницу</button>
+                <button class="btn outline" id="shopReloadBtn">Обновить страницу</button>
               </div>
             </div>
           </div>
@@ -2729,6 +2744,7 @@ async viewHome(){
 
     if (!this._shopClickHandler) {
       this._shopClickHandler = async (event) => {
+        if (event.target.closest('#shopReloadBtn')) { location.reload(); return; }
         const targetBtn = event.target.closest('.buy-btn, .activate-btn, .deactivate-btn');
         if (!targetBtn) return;
         const itemId = targetBtn.dataset.item;
