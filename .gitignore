@@ -1,13 +1,27 @@
 node_modules/
-!node_modules/.package-lock.json
-.tmp/
-tmp/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+
+# Runtime data
+data/
+letotalks.db
+*.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite-journal
-letotalks.db-wal
-letotalks.db-shm
-package-lock.json
-# coverage or test artifacts
+
+# Uploaded / production media
+photos/*
+!photos/default_photo.png
+
+# Test / debug artifacts
 coverage/
-.DS_Store
+.tmp/
+tmp/
+patch.diff
 npm-debug.log*
