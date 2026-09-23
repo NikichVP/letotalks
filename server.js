@@ -153,17 +153,8 @@ const CHARACTERISTICS_KEYS=['clarity','humor','strict','favorites'];
 // Один Collator на процесс — его создание дорогое, не пересоздаём на каждый вызов.
 const RU_COLLATOR = new Intl.Collator('ru', { sensitivity: 'base' });
 
-const DEFAULT_SHOP_ITEMS = [
-  { id: 'nick-0', name: 'Новичок', price: 1, category: 'nickname' },
-  { id: 'nick-1', name: 'Умник', price: 20, category: 'nickname' },
-  { id: 'nick-2', name: 'Отличник', price: 50, category: 'nickname' },
-  { id: 'nick-3', name: 'Эрудит', price: 75, category: 'nickname' },
-  { id: 'nick-4', name: 'Профи', price: 150, category: 'nickname' },
-  { id: 'nick-5', name: 'Гуру', price: 200, category: 'nickname' },
-  { id: 'nick-6', name: 'Легенда', price: 300, category: 'nickname' },
-  { id: 'nick-7', name: 'Мастер', price: 250, category: 'nickname' },
-  { id: 'nick-8', name: 'kinnijin', price: 180, category: 'nickname' }
-];
+// Ассортимент магазина ников — в shop_items.js (общий с migrate.js).
+const { DEFAULT_SHOP_ITEMS } = require('./shop_items');
 
 const TEACHER_REQUEST_STATUSES = {
   PENDING: 'pending',
@@ -350,6 +341,7 @@ const {
   getUserList,
   getAdminComments,
   getShopItems,
+  getActiveNicknameRaritiesByIds,
   getUserPurchasedItems,
   getActiveInventoryForUser,
   getShopItemById,
@@ -715,6 +707,7 @@ function buildTeacherBaseCached(teacherId) {
   const authorIds = [...new Set(commentsRaw.map(c => c.author_uid).filter(Boolean).map(String))];
   const usersById = getUsersByIds(authorIds);
   const nicksById = getActiveNicknamesByIds(authorIds);
+  const raritiesById = getActiveNicknameRaritiesByIds(authorIds);
 
   const comments = commentsRaw.map(c => {
     const uid = c.author_uid ? String(c.author_uid) : null;
@@ -730,6 +723,8 @@ function buildTeacherBaseCached(teacherId) {
       // показываем только активный ник или «Аноним».
       author: displayAuthor,
       authorDisplay: displayAuthor,
+      // Редкость ника (для цвета имени); у «Аноним» — null.
+      authorRarity: activeNick ? (raritiesById.get(uid) || 'common') : null,
       text: c.text,
       likes: (counts[String(c.id)]?.likes) || 0,
       dislikes: (counts[String(c.id)]?.dislikes) || 0

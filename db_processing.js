@@ -410,30 +410,41 @@ function createDbProcessing({
 
     try {
       const columns = db.prepare('PRAGMA table_info(shop_items)').all();
-      const hasIsActive = columns.some(col => col.name === 'is_active');
-      if (!hasIsActive) {
-        db.exec('ALTER TABLE shop_items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
-      }
+      const has = name => columns.some(col => col.name === name);
+      if (!has('is_active')) db.exec('ALTER TABLE shop_items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
+      if (!has('rarity')) db.exec("ALTER TABLE shop_items ADD COLUMN rarity TEXT NOT NULL DEFAULT 'common'");
+      if (!has('description')) db.exec("ALTER TABLE shop_items ADD COLUMN description TEXT NOT NULL DEFAULT ''");
     } catch (err) {
       console.error('Не удалось обновить схему shop_items:', err);
     }
 
-    const upsert = db.prepare(`
-      INSERT OR IGNORE INTO shop_items (id, name, price, category, is_active)
-      VALUES (?, ?, ?, ?, 1)
+    // Новые товары — с ценой из кода; у существующих обновляем всё, КРОМЕ цены
+    // (цена в БД главнее). Название купленного ника синхронизируем и в инвентаре,
+    // иначе у владельцев остался бы старый вариант.
+    const insertItem = db.prepare(`
+      INSERT OR IGNORE INTO shop_items (id, name, price, category, rarity, description, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, 1)
     `);
     const updateMeta = db.prepare(`
       UPDATE shop_items
-      SET name = ?, category = ?, is_active = 1
+      SET name = ?, category = ?, rarity = ?, description = ?, is_active = 1
       WHERE id = ?
     `);
+    const syncInventoryName = db.prepare(`
+      UPDATE user_inventory SET item_name = ? WHERE item_id = ? AND item_type = ? AND item_name <> ?
+    `);
 
-    for (const item of defaultShopItems) {
-      const info = upsert.run(item.id, item.name, item.price, item.category);
-      if (!info.changes) {
-        updateMeta.run(item.name, item.category, item.id);
+    db.transaction(() => {
+      for (const item of defaultShopItems) {
+        const rarity = item.rarity || 'common';
+        const description = item.description || '';
+        const info = insertItem.run(item.id, item.name, item.price, item.category, rarity, description);
+        if (!info.changes) {
+          updateMeta.run(item.name, item.category, rarity, description, item.id);
+          syncInventoryName.run(item.name, item.id, item.category, item.name);
+        }
       }
-    }
+    })();
   }
 
   function ensureUserRatingsTable() {
@@ -1386,11 +1397,33 @@ function createDbProcessing({
 
   function getShopItems() {
     return db.prepare(`
-      SELECT id, name, price, category
+      SELECT id, name, price, category, rarity, description
       FROM shop_items
       WHERE is_active = 1
       ORDER BY price ASC, name ASC
     `).all();
+  }
+
+  // Редкость активного ника у каждого из пользователей — чтобы подсветить имя
+  // автора в отзывах цветом редкости.
+  function getActiveNicknameRaritiesByIds(userIds) {
+    const result = new Map();
+    const unique = [...new Set((userIds || []).filter(Boolean).map(String))];
+    if (!unique.length) return result;
+    const CHUNK = 400;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      const ph = slice.map(() => '?').join(',');
+      const rows = db.prepare(
+        `SELECT inv.user_id AS user_id, COALESCE(si.rarity, 'common') AS rarity
+         FROM user_inventory inv LEFT JOIN shop_items si ON si.id = inv.item_id
+         WHERE inv.item_type = 'nickname' AND inv.is_active = 1 AND inv.user_id IN (${ph})`
+      ).all(...slice);
+      for (const r of rows) {
+        if (!result.has(String(r.user_id))) result.set(String(r.user_id), r.rarity);
+      }
+    }
+    return result;
   }
 
   function getUserPurchasedItems(userId) {
@@ -1558,6 +1591,7 @@ function createDbProcessing({
     getUserList,
     getAdminComments,
     getShopItems,
+    getActiveNicknameRaritiesByIds,
     getUserPurchasedItems,
     getActiveInventoryForUser,
     getShopItemById,

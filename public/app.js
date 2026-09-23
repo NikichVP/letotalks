@@ -42,6 +42,13 @@ function plural(n, forms){
 }
 const countLabel = (n, forms) => `${n} ${plural(n, forms)}`;
 const RATING_FORMS = ['оценка','оценки','оценок'];
+// Редкости ников в магазине (синхронно с shop_items.js на сервере).
+const SHOP_TIERS = [
+  { key:'common', title:'Обычные' },
+  { key:'rare', title:'Редкие' },
+  { key:'epic', title:'Эпические' },
+  { key:'legendary', title:'Легендарные' },
+];
 const COMMENT_FORMS = ['отзыв','отзыва','отзывов'];
 
 // Поиск по ФИО: без учёта регистра и ё/е, слова в любом порядке («Артём Сухов» = «Сухов Артем»).
@@ -1312,7 +1319,7 @@ const App = {
           </ul>
           <p>
             Мы вправе без предупреждения <strong>скрывать или удалять</strong> сообщения, нарушающие данные правила.
-            За нецензурную лексику аккаунт блокируется автоматически; за другие нарушения доступ может быть ограничен.
+            Отзывы с нецензурной лексикой не публикуются, а после трёх таких попыток за месяц аккаунт блокируется автоматически; за другие нарушения доступ тоже может быть ограничен.
           </p>
 
           <h2>3. Конфиденциальность</h2>
@@ -1338,7 +1345,8 @@ const App = {
           <h2>5. Порядок уведомления и удаления (Notice &amp; Takedown)</h2>
           <p>
             Если вы считаете, что какой-либо отзыв нарушает закон, ваши права или данные правила, нажмите «Пожаловаться» под ним —
-            жалоба сразу уходит модераторам. Для ускорения рассмотрения укажите:
+            жалоба сразу уходит модераторам. По остальным вопросам (в том числе если у вас нет аккаунта) пишите в Telegram:
+            <a class="link" href="https://t.me/letotalks" target="_blank" rel="noopener">@letotalks</a>. Для ускорения рассмотрения укажите:
           </p>
           <ul>
             <li>основание претензии (например, клевета, нарушение авторских прав, разглашение персональных данных);</li>
@@ -1349,7 +1357,8 @@ const App = {
           <h2>6. Фотографии и авторские права</h2>
           <p>
             Изображения на сайте используются в информационных целях. Если вы являетесь правообладателем и считаете,
-            что материал использован неправомерно, сообщите нам — мы оперативно удалим или заменим изображение.
+            что материал использован неправомерно, напишите в Telegram <a class="link" href="https://t.me/letotalks" target="_blank" rel="noopener">@letotalks</a> —
+            мы оперативно удалим или заменим изображение.
           </p>
 
           <h2>7. Изменения документа</h2>
@@ -1488,7 +1497,7 @@ const App = {
         return html`
           <div class="comment ${own ? 'own' : ''}" data-cid="${escAttr(c.id)}">
             <div class="meta">
-              <span class="author">${esc(c.authorDisplay || 'Аноним')}</span>
+              <span class="author ${c.authorRarity ? `rarity-${esc(c.authorRarity)}` : ''}">${esc(c.authorDisplay || 'Аноним')}</span>
               <span>${fmtDate(c.ts)}</span>
               ${own ? '<span class="badge">Ваш отзыв</span>' : ''}
               ${amAdmin && (c.author_email || c.author_uid) ? html`<span class="badge muted" title="Видно только администраторам">${esc(c.author_email || c.author_uid)}</span>` : ''}
@@ -1831,7 +1840,7 @@ const App = {
       e.preventDefault();
       UI.confirm({
         title: 'Коротко о правилах',
-        text: 'Отзывы анонимны для других учеников, администраторы видят автора для модерации. Запрещены мат, оскорбления, травля и личные данные — за мат аккаунт блокируется автоматически. Полный текст правил — в подвале сайта после входа.',
+        text: 'Отзывы анонимны для других учеников, администраторы видят автора для модерации. Запрещены мат, оскорбления, травля и личные данные — за повторный мат аккаунт блокируется автоматически. Полный текст правил — в подвале сайта после входа. Связь с нами: Telegram @letotalks.',
         confirmText: 'Понятно', cancelText: 'Закрыть'
       });
     });
@@ -2511,21 +2520,29 @@ const App = {
             <li>👍 Лайк на ваш отзыв — <b>+1</b>, 👎 дизлайк — <b>−1</b></li>
           </ul>
         </div>
-        <p class="page-sub" style="margin-top:12px">Выбранный ник показывается вместо «Аноним» у ваших отзывов. Ник можно сменить или снять в любой момент.</p>
+        <p class="page-sub" style="margin-top:12px">Выбранный ник показывается вместо «Аноним» у ваших отзывов — и светится цветом своей редкости. Сменить или снять ник можно в любой момент.</p>
 
-        ${shopData.items.length ? html`
-          <div class="shop-grid">
-            ${shopData.items.map(item => html`
-              <div class="shop-item ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
-                <div class="shop-item-header">
-                  <h3>${esc(item.name)}</h3>
-                  ${item.purchased
-                    ? html`<span class="badge lg ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Куплен'}</span>`
-                    : html`<span class="badge lg price">${Number(item.price)} coins</span>`}
-                </div>
-                ${itemButton(item)}
-              </div>`).join('')}
-          </div>` : html`
+        ${shopData.items.length ? SHOP_TIERS.map(tier => {
+          const items = shopData.items.filter(item => (item.rarity || 'common') === tier.key);
+          if (!items.length) return '';
+          return html`
+            <section class="shop-tier">
+              <h3 class="shop-tier-title rarity-${tier.key}">${tier.title}</h3>
+              <div class="shop-grid">
+                ${items.map(item => html`
+                  <div class="shop-item rarity-${esc(item.rarity || 'common')} ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
+                    <div class="shop-item-header">
+                      <h4 class="shop-item-name">${esc(item.name)}</h4>
+                      ${item.purchased
+                        ? html`<span class="badge lg ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Выбран' : 'Куплен'}</span>`
+                        : html`<span class="badge lg price">${Number(item.price)} coins</span>`}
+                    </div>
+                    ${item.description ? html`<p class="shop-item-desc">${esc(item.description)}</p>` : ''}
+                    ${itemButton(item)}
+                  </div>`).join('')}
+              </div>
+            </section>`;
+        }).join('') : html`
           <div class="empty-state">
             <p>Товары временно отсутствуют. Загляните позже.</p>
           </div>`}

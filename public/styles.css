@@ -518,9 +518,31 @@ body.lockout #app{padding:0}
 .shop-item:hover{box-shadow:var(--shadow-md)}
 .shop-item.purchased{border-color:var(--blue-500);background:var(--blue-50)}
 .shop-item.active{border-color:var(--gold-500);background:var(--gold-50);box-shadow:inset 0 0 0 1px var(--gold-500)}
-.shop-item-header{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.shop-item-header h3{margin:0;font-size:var(--fs-lg);overflow-wrap:anywhere}
+.shop-item-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 8px}
+.shop-item-name{margin:0;font-size:var(--fs-base);overflow-wrap:break-word;min-width:0}
+.shop-item-desc{margin:-4px 0 0;font-size:var(--fs-sm);color:var(--muted);line-height:1.4}
 .shop-item .btn{margin-top:auto}
+
+/* Редкости ников: цвет названия секции, полоска у карточки, цвет имени автора. */
+:root{
+  --rarity-common:#5b6b82; --rarity-rare:#2f66b1; --rarity-epic:#7c3aed; --rarity-legendary:#b45309;
+}
+.shop-tier{margin-top:22px}
+.shop-tier-title{margin:0;font-size:var(--fs-lg);display:flex;align-items:center;gap:8px}
+.shop-tier-title::before{content:"";width:10px;height:10px;border-radius:50%;background:currentColor}
+.shop-tier + .shop-tier .shop-grid,.shop-tier .shop-grid{margin-top:10px}
+.rarity-common{--rarity:var(--rarity-common)}
+.rarity-rare{--rarity:var(--rarity-rare)}
+.rarity-epic{--rarity:var(--rarity-epic)}
+.rarity-legendary{--rarity:var(--rarity-legendary)}
+.shop-tier-title[class*="rarity-"]{color:var(--rarity)}
+.shop-item[class*="rarity-"]{border-top:3px solid var(--rarity)}
+.shop-item.rarity-legendary{background:linear-gradient(180deg,#fffaf0 0%, var(--card) 60%)}
+.comment .author[class*="rarity-"]{color:var(--rarity)}
+.comment .author.rarity-legendary{
+  background:linear-gradient(90deg,#b45309,#d97706,#b45309);
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+}
 
 /* ---------- Уведомления (тосты) ---------- */
 .toast-host{
