@@ -788,6 +788,17 @@ function createDbProcessing({
     return result;
   }
 
+  // Оценки конкретного пользователя конкретному учителю: { clarity: 4, ... }.
+  const userRatingsForTeacherStmt = db.prepare('SELECT key, value FROM user_ratings WHERE user_id = ? AND teacher_id = ?');
+  function getUserRatingsForTeacher(userId, teacherId) {
+    const out = {};
+    if (!userId || !teacherId) return out;
+    for (const row of userRatingsForTeacherStmt.all(String(userId), String(teacherId))) {
+      if (characteristicsKeys.includes(row.key)) out[row.key] = Number(row.value);
+    }
+    return out;
+  }
+
   function getCommentsForTeacher(teacherId) {
     const stmt = db.prepare('SELECT * FROM comments WHERE teacher_id = ? ORDER BY ts DESC');
     return stmt.all(teacherId);
@@ -1091,14 +1102,17 @@ function createDbProcessing({
     }
   }
 
-  function getRecentLoginAttempts(email, ip, windowMs = 3600000) {
-    const cutoff = Date.now() - windowMs;
-    const stmt = db.prepare(`
-      SELECT COUNT(*) as count, SUM(success) as successful
-      FROM login_attempts
-      WHERE (email = ? OR ip = ?) AND ts > ?
-    `);
-    return stmt.get(email, ip, cutoff) || { count: 0, successful: 0 };
+  // Неверные коды для email за окно (по умолчанию час), считая только после
+  // последнего успешного входа — удачный вход обнуляет счётчик.
+  const countRecentLoginFailuresStmt = db.prepare(`
+    SELECT COUNT(*) AS n FROM login_attempts
+    WHERE email = ? AND success = 0
+      AND ts > MAX(?, COALESCE((SELECT MAX(ts) FROM login_attempts WHERE email = ? AND success = 1), 0))
+  `);
+  function countRecentLoginFailures(email, windowMs = 3600000) {
+    const e = String(email || '');
+    const row = countRecentLoginFailuresStmt.get(e, Date.now() - windowMs, e);
+    return Number(row?.n || 0);
   }
 
   function getUserFromSessionTokenHash(tokenHash) {
@@ -1478,6 +1492,7 @@ function createDbProcessing({
     ensureUniqueTeacherId,
     updateRatings,
     getCommentsForTeacher,
+    getUserRatingsForTeacher,
     getAllComments,
     getCommentById,
     addComment,
@@ -1504,7 +1519,7 @@ function createDbProcessing({
     deleteTeacherById,
     logSecurityEvent,
     recordLoginAttempt,
-    getRecentLoginAttempts,
+    countRecentLoginFailures,
     getUserFromSessionTokenHash,
     updateSessionActivity,
     updateSessionClient,

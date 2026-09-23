@@ -1,8 +1,8 @@
 // migrate.js — инициализация БД: создаёт каталоги и всю схему идемпотентно.
 // Безопасно запускать многократно: существующие данные не трогаются.
 //   npm run migrate
-require('dotenv').config();
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 const { ensureDirsAndDb, createDbProcessing } = require('./db_processing');
 
 const ROOT_DIR = __dirname;
