@@ -30,7 +30,7 @@ const OUTBOUND_PROXY_URL = resolveProxyUrl();
 const outboundDispatcher = createDispatcher({ allowH2: false });
 
 if (OUTBOUND_PROXY_URL) {
-  console.log(`[proxy] letotalks via ${OUTBOUND_PROXY_URL}`);
+  console.log(`[proxy] letotalks via ${OUTBOUND_PROXY_URL.replace(/\/\/[^@/]*@/, '//***@')}`);
 }
 
 function fetchWithProxy(url, init = {}) {
@@ -42,7 +42,9 @@ function fetchWithProxy(url, init = {}) {
 
 const ROOT_DIR    = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
-const DATA_DIR    = path.join(ROOT_DIR, 'data');
+const DATA_DIR    = process.env.LETOTALKS_DATA_DIR
+  ? path.resolve(process.env.LETOTALKS_DATA_DIR)
+  : path.join(ROOT_DIR, 'data');
 const PHOTO_DIR   = path.join(ROOT_DIR, 'photos');
 const REQUEST_PHOTO_DIR = path.join(DATA_DIR, 'teacher_request_photos');
 const DEFAULT_PHOTO = '/photo/default_photo.png';
@@ -90,30 +92,59 @@ const AUTH_EMAIL_FROM = (process.env.AUTH_EMAIL_FROM || 'LetoTalks <noreply@leto
 const ROOT_ADMIN_EMAIL = (process.env.ROOT_ADMIN_EMAIL || '').trim().toLowerCase();
 
 // Кто может войти/зарегистрироваться: домены школы + явные адреса (например админ).
+// Домен всегда хранится с «@», иначе «letovo.ru» пропускал бы и «x@notletovo.ru».
 const ALLOWED_EMAIL_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || '@student.letovo.ru')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  .map(d => (d.startsWith('@') ? d : `@${d}`));
 const ALLOWED_LOGIN_EMAILS = new Set(
-  (process.env.ALLOWED_LOGIN_EMAILS || ROOT_ADMIN_EMAIL)
-    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  [...String(process.env.ALLOWED_LOGIN_EMAILS || '').split(','), ROOT_ADMIN_EMAIL]
+    .map(s => s.trim().toLowerCase()).filter(Boolean)
 );
-const ALLOWED_EMAIL_DOMAIN = ALLOWED_EMAIL_DOMAINS[0] || '@student.letovo.ru'; // для обратной совместимости сообщений
+const ALLOWED_EMAIL_DOMAIN = ALLOWED_EMAIL_DOMAINS[0] || '@student.letovo.ru'; // для текстов ошибок
+const MAX_EMAIL_LENGTH = 254;
+
+// Приводим адрес к каноническому виду: нижний регистр и без «+метки» в школьных
+// доменах (ivanov+1@… и ivanov+2@… — это один ящик, иначе один ученик заводит
+// сколько угодно аккаунтов и голосует за себя).
+function canonicalEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  const at = e.lastIndexOf('@');
+  if (at <= 0) return e;
+  const domain = e.slice(at);
+  if (!ALLOWED_EMAIL_DOMAINS.includes(domain)) return e;
+  return e.slice(0, at).split('+')[0] + domain;
+}
+
 function isEmailAllowed(email) {
   const e = String(email || '').trim().toLowerCase();
   if (!e) return false;
   if (ALLOWED_LOGIN_EMAILS.has(e)) return true;
-  return ALLOWED_EMAIL_DOMAINS.some(d => e.endsWith(d));
+  return ALLOWED_EMAIL_DOMAINS.some(d => e.endsWith(d) && e.length > d.length);
 }
 const SESSION_COOKIE = 'lt_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 дней
 const AUTH_SESSION_TTL_MS = 1000 * 60 * 10; // 10 минут (срок жизни кода входа)
 const MAX_SESSIONS_PER_USER = 1; // Максимум одна одновременная сессия
 const SESSION_CLEANUP_INTERVAL = 1000 * 60 * 60; // Очистка каждый час
-const MAX_LOGIN_ATTEMPTS = 10; // неверных кодов на один email за час
 const AUTH_FAILURES_PER_IP_PER_HOUR = 60; // неудачных запросов входа с одного IP за час
-const AUTH_CODE_COOLDOWN_MS = 60 * 1000; // не чаще одного письма с кодом в минуту на email
-const AUTH_CODES_PER_EMAIL_PER_HOUR = 5; // и не больше 5 писем в час (защита от спама ящика)
+// Коды входа. Лимиты рассчитаны так, чтобы и перебор был бесполезен (5 попыток на
+// код, не больше AUTH_CODES_PER_EMAIL_PER_DAY кодов в сутки), и чтобы посторонний
+// не мог «запереть» чужую почту: код действует, пока жив, новые запросы его не
+// отменяют (живут до AUTH_MAX_ACTIVE_CODES последних кодов).
+const AUTH_CODE_COOLDOWN_MS = 60 * 1000;      // одно письмо в минуту на пару (почта, IP)
+const AUTH_CODES_PER_EMAIL_PER_HOUR = 12;     // на почту в целом
+const AUTH_CODES_PER_EMAIL_PER_DAY = 30;
+const AUTH_CODES_PER_IP_PER_10MIN = 60;       // с одного IP (школьный NAT — щедро)
+const AUTH_MAX_ACTIVE_CODES = 3;
+const AUTH_MAX_CODE_TRIES = 5;
 const COMMENT_COOLDOWN_MS = 20 * 1000; // пауза между текстовыми комментариями одного пользователя
+const REPORT_COOLDOWN_MS = 30 * 1000;  // пауза между жалобами
+const TEACHER_REQUEST_COOLDOWN_MS = 60 * 1000; // пауза между заявками на учителя
 const MAX_COMMENT_LENGTH = 2000; // символов в одном комментарии
+// Нецензурщина: отзыв отклоняется, на PROFANITY_STRIKES_TO_BAN-й раз за окно — блокировка.
+// (Раньше блокировали навсегда с первого срабатывания — а фильтр ошибался на обычных словах.)
+const PROFANITY_STRIKES_TO_BAN = 3;
+const PROFANITY_STRIKE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const SECURITY_HEADERS_ENABLED = true;
 const SESSION_BINDING_MODE = (process.env.SESSION_BINDING_MODE || 'strict').toLowerCase(); // soft | strict
 
@@ -250,7 +281,6 @@ const dbCtx = createDbProcessing({
 
 const {
   db,
-  loadAdminEmails,
   isAdminUser,
   isSuperAdminUser,
   listAdminEmails,
@@ -259,7 +289,6 @@ const {
   calculateEarnedCoins,
   getUserSpentCoins,
   getAvailableCoins,
-  coinsOf,
   overall,
   getAllTeachers,
   getTeacherById,
@@ -281,6 +310,7 @@ const {
   setUserVote,
   countVotesForCommentBulk,
   getActiveNickname,
+  countUserSecurityEvents,
   getUsersByIds,
   getActiveNicknamesByIds,
   getBannedUserIdSet,
@@ -294,12 +324,10 @@ const {
   deleteTeacherById,
   logSecurityEvent,
   recordLoginAttempt,
-  countRecentLoginFailures,
   getUserFromSessionTokenHash,
   updateSessionActivity,
   updateSessionClient,
   countActiveSessions,
-  deleteOldestSession,
   insertSession,
   deactivateSessionByHash,
   deactivateSessionsByUser,
@@ -338,6 +366,27 @@ const {
   getUserVotesForComments
 } = dbCtx;
 
+// Жёсткие лимиты multipart: иначе поле вида lastName[200000000]=x превращалось в
+// разреженный массив на сотни МБ и вешало сервер на секунды.
+const UPLOAD_LIMITS = {
+  fileSize: 5 * 1024 * 1024, // 5 MB
+  files: 1,
+  fields: 20,
+  parts: 25,
+  fieldSize: 16 * 1024,
+  fieldNameSize: 100,
+  fieldNestingDepth: 0,
+  fieldArrayIndexLimit: 0
+};
+
+function photoFileFilter(_req, file, cb) {
+  if (!file) return cb(null, true);
+  if (ALLOWED_REQUEST_PHOTO_TYPES.has(file.mimetype)) return cb(null, true);
+  const err = new Error('unsupported_file_type');
+  err.code = 'UNSUPPORTED_FILE_TYPE';
+  cb(err);
+}
+
 const teacherRequestUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, REQUEST_PHOTO_DIR),
@@ -348,17 +397,36 @@ const teacherRequestUpload = multer({
       cb(null, name);
     }
   }),
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5 MB
-  },
-  fileFilter: (_req, file, cb) => {
-    if (!file) return cb(null, true);
-    if (ALLOWED_REQUEST_PHOTO_TYPES.has(file.mimetype)) return cb(null, true);
-    const err = new Error('unsupported_file_type');
-    err.code = 'UNSUPPORTED_FILE_TYPE';
-    cb(err);
-  }
+  limits: UPLOAD_LIMITS,
+  fileFilter: photoFileFilter
 }).single('photo');
+
+// Загрузка фото учителя из админки — сразу в photos/ под безопасным именем.
+const adminPhotoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, PHOTO_DIR),
+    filename: (_req, file, cb) => {
+      const ext = ALLOWED_REQUEST_PHOTO_TYPES.get(file.mimetype) || '.jpg';
+      cb(null, `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
+    }
+  }),
+  limits: UPLOAD_LIMITS,
+  fileFilter: photoFileFilter
+}).single('photo');
+
+// Ответ на ошибки multer: лимиты — 4xx, остальное — 500.
+function uploadErrorResponse(res, uploadErr, logLabel) {
+  const code = uploadErr?.code || uploadErr?.message;
+  if (code === 'LIMIT_FILE_SIZE') return res.status(413).json({ ok: false, error: 'photo_too_large' });
+  if (code === 'UNSUPPORTED_FILE_TYPE') return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
+  if (typeof code === 'string' && code.startsWith('LIMIT_')) return res.status(400).json({ ok: false, error: 'bad_request' });
+  console.error(logLabel, uploadErr);
+  return res.status(500).json({ ok: false, error: 'upload_failed' });
+}
+
+function removeFileQuietly(filePath) {
+  try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+}
 
 
 // === БЕЗОПАСНОСТЬ: Helmet для HTTP заголовков ===
@@ -396,10 +464,16 @@ app.use(express.json({ limit: '1mb' }));
 app.use(compression());
 
 app.use(express.static(PUBLIC_DIR));
-// Фото статичны и редко меняются — кэшируем у клиента; nosniff против подмены типа.
-app.use('/photo', express.static(PHOTO_DIR, {
-  maxAge: '7d',
-  setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff')
+// Фото учителей — только вошедшим (как и всё остальное). Кэшируем у клиента
+// приватно; nosniff против подмены типа.
+app.use('/photo', (req, res, next) => {
+  if (!getUserFromRequest(req, res)) return res.status(401).end();
+  next();
+}, express.static(PHOTO_DIR, {
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'private, max-age=604800');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
 }));
 
 // === БЕЗОПАСНОСТЬ: Rate Limiting ===
@@ -452,7 +526,10 @@ function generateSecureToken() {
 }
 
 const PENDING_AUTH = new Map(); // sessionId -> { email, code, created, tries, ip, ua }
-const AUTH_CODE_SENDS = new Map(); // email -> [ts отправленных кодов за последний час]
+// Учёт отправленных кодов (в памяти процесса; чистится ежечасно).
+const AUTH_SENDS_BY_EMAIL = new Map(); // email -> [ts] за последние сутки
+const AUTH_SENDS_BY_IP = new Map();    // ip -> [ts] за последние 10 минут
+const AUTH_SENDS_BY_PAIR = new Map();  // "email|ip" -> ts последней отправки
 
 const CYRILLIC_TO_LATIN = {
   'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
@@ -498,12 +575,15 @@ function generateTeacherIdFromPayload(payload) {
   return ensureUniqueTeacherId(base);
 }
 
+// Принимаем только строки: массивы/объекты из multipart или JSON превращаем в ''.
 function sanitizeRequestField(value, maxLength = 160) {
-  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+  if (typeof value !== 'string') return '';
+  return value.slice(0, maxLength * 2).replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
 function sanitizeRequestMultiline(value, maxLength = 1500) {
-  const normalized = String(value || '')
+  if (typeof value !== 'string') return '';
+  const normalized = value.slice(0, maxLength * 2)
     .replace(/\r/g, '')
     .split('\n')
     .map(line => line.trim())
@@ -513,7 +593,8 @@ function sanitizeRequestMultiline(value, maxLength = 1500) {
 }
 
 function normalizeSubjectsList(value) {
-  return String(value || '')
+  if (typeof value !== 'string') return [];
+  return value.slice(0, 2000)
     .split(/[,|\n]+/g)
     .map(item => sanitizeRequestField(item, 80))
     .filter(Boolean)
@@ -1042,28 +1123,25 @@ async function queueCommentForReview({ teacherRow, teacherId, text, authorName, 
   let telegramMeta = { chatId: null, messageId: null };
 
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_REVIEW_CHAT_ID) {
-    try {
-      const message = await callTelegramApi('sendMessage', {
-        chat_id: TELEGRAM_REVIEW_CHAT_ID,
-        text: messageText,
-        disable_web_page_preview: true,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '✅ Одобрить', callback_data: `comment_review:approve:${reviewId}` },
-              { text: '🚫 Отклонить', callback_data: `comment_review:reject:${reviewId}` }
-            ]
+    // Если отправить модераторам не удалось — ошибка уходит наверх: иначе отзыв
+    // «висел бы на проверке» без кнопок одобрения, и никто бы его не увидел.
+    const message = await callTelegramApi('sendMessage', {
+      chat_id: TELEGRAM_REVIEW_CHAT_ID,
+      text: messageText,
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Одобрить', callback_data: `comment_review:approve:${reviewId}` },
+            { text: '🚫 Отклонить', callback_data: `comment_review:reject:${reviewId}` }
           ]
-        }
-      });
-      telegramMeta = {
-        chatId: message?.chat?.id ? String(message.chat.id) : TELEGRAM_REVIEW_CHAT_ID,
-        messageId: message?.message_id ? String(message.message_id) : null
-      };
-    } catch (err) {
-      const details = err?.description || err?.message || err;
-      console.warn('Не удалось отправить комментарий в Telegram на модерацию:', details);
-    }
+        ]
+      }
+    });
+    telegramMeta = {
+      chatId: message?.chat?.id ? String(message.chat.id) : TELEGRAM_REVIEW_CHAT_ID,
+      messageId: message?.message_id ? String(message.message_id) : null
+    };
   }
 
   insertPendingReview({
@@ -1139,6 +1217,13 @@ async function handleCommentReviewCallback(callback) {
       await clearButtons();
       return true;
     }
+    // Пока отзыв ждал проверки, автора могли заблокировать — такой не публикуем.
+    if (pending.userId && isUserBanned(String(pending.userId))) {
+      deletePendingReview(reviewId);
+      await safeAnswerCallback(callback, 'Автор заблокирован — отзыв не опубликован', true);
+      await clearButtons();
+      return true;
+    }
 
     try {
       addComment({
@@ -1187,7 +1272,14 @@ function getDisplayName(user) {
 }
 
 /* Sessions & Auth */
-if (IS_PRODUCTION) {
+// За каким прокси стоит сервер. TRUST_PROXY задаётся явно (например «loopback»
+// для nginx на той же машине, «1» — один прокси впереди). Без него: в production
+// доверяем локальным/приватным адресам, иначе — никому. Если сервер за nginx, но
+// прокси не доверен, все запросы выглядят как 127.0.0.1 и лимиты станут общими.
+const TRUST_PROXY = (process.env.TRUST_PROXY || '').trim();
+if (TRUST_PROXY) {
+  app.set('trust proxy', /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : (TRUST_PROXY === 'true' ? true : TRUST_PROXY));
+} else if (IS_PRODUCTION) {
   app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 } else {
   app.set('trust proxy', false);
@@ -1220,7 +1312,9 @@ function parseCookies(req){
   header.split(';').forEach(p=>{
     const [k, ...v] = p.trim().split('=');
     if (!k) return;
-    out[k] = decodeURIComponent(v.join('='));
+    const raw = v.join('=');
+    // Кривая cookie (например «x=50%») не должна ронять каждый запрос в 500.
+    try { out[k] = decodeURIComponent(raw); } catch { out[k] = raw; }
   });
   return out;
 }
@@ -1279,6 +1373,15 @@ function createSession(userId, req){
 }
 
 function getUserFromRequest(req, res = null){
+  // В рамках одного запроса пользователь не меняется — не ходим в БД повторно
+  // (гейт, лимитер и обработчик раньше каждый раз заново читали сессию).
+  if (req && Object.prototype.hasOwnProperty.call(req, '_ltUser')) return req._ltUser;
+  const user = resolveUserFromRequest(req, res);
+  if (req) req._ltUser = user;
+  return user;
+}
+
+function resolveUserFromRequest(req, res = null){
   const response = res || req.res || null;
   const cookies = parseCookies(req);
   const token = cookies[SESSION_COOKIE];
@@ -1360,8 +1463,13 @@ function invalidateAllUserSessions(userId) {
 
 // Запускаем очистку периодически
 const cleanupTimer = setInterval(() => {
-  cleanupSessionsDb();
-  cleanupOldLogs();
+  // Ошибка БД (занята, диск полон) в таймере не должна ронять весь процесс.
+  try {
+    cleanupSessionsDb();
+    cleanupOldLogs();
+  } catch (err) {
+    console.warn('Не удалось почистить сессии/логи:', err && err.message ? err.message : err);
+  }
   // Чистим протухшие pending-авторизации, чтобы Map не рос бесконечно.
   const now = Date.now();
   for (const [sid, rec] of PENDING_AUTH) {
@@ -1369,8 +1477,14 @@ const cleanupTimer = setInterval(() => {
       PENDING_AUTH.delete(sid);
     }
   }
-  for (const [email, times] of AUTH_CODE_SENDS) {
-    if (!times.some(ts => now - ts < 60 * 60 * 1000)) AUTH_CODE_SENDS.delete(email);
+  for (const [email, times] of AUTH_SENDS_BY_EMAIL) {
+    if (!times.some(ts => now - ts < 24 * 60 * 60 * 1000)) AUTH_SENDS_BY_EMAIL.delete(email);
+  }
+  for (const [ip, times] of AUTH_SENDS_BY_IP) {
+    if (!times.some(ts => now - ts < 10 * 60 * 1000)) AUTH_SENDS_BY_IP.delete(ip);
+  }
+  for (const [key, ts] of AUTH_SENDS_BY_PAIR) {
+    if (now - ts > AUTH_CODE_COOLDOWN_MS) AUTH_SENDS_BY_PAIR.delete(key);
   }
 }, SESSION_CLEANUP_INTERVAL);
 
@@ -1378,29 +1492,34 @@ if (typeof cleanupTimer.unref === 'function') {
   cleanupTimer.unref();
 }
 
-// Периодический бэкап БД (раз в сутки) — единственный файл без копий = одна точка отказа.
+// Бэкап БД: через минуту после старта и дальше раз в сутки. Храним 7 копий по
+// дням недели (letotalks-backup-1.db … -7.db). Новый снимок пишем во временный
+// файл и только потом подменяем старый — неудачный бэкап не уничтожает прошлый.
+// Для надёжности копируйте data/backups на другой диск/сервер.
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-const dbBackupTimer = setInterval(() => {
+function backupDatabase() {
+  const day = new Date().getDay() || 7;
+  const target = path.join(BACKUP_DIR, `letotalks-backup-${day}.db`);
+  const tmp = `${target}.tmp`;
   try {
     if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const target = path.join(BACKUP_DIR, 'letotalks-backup.db');
-    if (fs.existsSync(target)) fs.unlinkSync(target); // VACUUM INTO требует, чтобы файла не было
+    removeFileQuietly(tmp); // VACUUM INTO требует, чтобы файла не было
     // VACUUM INTO даёт согласованный снимок даже в WAL-режиме.
-    db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+    db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+    fs.renameSync(tmp, target);
   } catch (err) {
+    removeFileQuietly(tmp);
     console.warn('Не удалось сделать бэкап БД:', err && err.message ? err.message : err);
   }
-}, 24 * 60 * 60 * 1000);
+}
+const dbBackupStartTimer = setTimeout(backupDatabase, 60 * 1000);
+const dbBackupTimer = setInterval(backupDatabase, 24 * 60 * 60 * 1000);
+if (typeof dbBackupStartTimer.unref === 'function') dbBackupStartTimer.unref();
 if (typeof dbBackupTimer.unref === 'function') dbBackupTimer.unref();
 
 /* Rate limiters */
-// Лимиты привязываем к пользователю/сессии, а не только к IP: за школьным NAT
-// десятки учеников выглядят как один адрес, и лимит «на IP» бил бы по всем сразу.
-function sessionRateKey(req) {
-  const token = parseCookies(req)[SESSION_COOKIE];
-  return token ? `s:${hashToken(token)}` : `ip:${getClientIp(req)}`;
-}
-
+// Лимиты привязываем к пользователю, а не только к IP: за школьным NAT десятки
+// учеников выглядят как один адрес, и лимит «на IP» бил бы по всем сразу.
 function createSlidingWindowLimiter({ windowMs, maxRequests, keyFn = getClientIp, message }) {
   const buckets = new Map();
 
@@ -1442,27 +1561,41 @@ function createSlidingWindowLimiter({ windowMs, maxRequests, keyFn = getClientIp
 function createCooldown(minIntervalMs) {
   const lastByKey = new Map();
   return {
-    // Возвращает, сколько мс ещё ждать (0 — можно) и сразу фиксирует попытку.
-    hit(key, now = Date.now()) {
-      const last = lastByKey.get(key) || 0;
-      const wait = minIntervalMs - (now - last);
-      if (wait > 0) return wait;
+    // Сколько мс ещё ждать (0 — можно), без записи попытки.
+    peek(key, now = Date.now()) {
+      return Math.max(0, minIntervalMs - (now - (lastByKey.get(key) || 0)));
+    },
+    // Зафиксировать действие.
+    mark(key, now = Date.now()) {
       lastByKey.set(key, now);
       if (lastByKey.size > 5000) {
         for (const [k, ts] of lastByKey) if (now - ts > minIntervalMs) lastByKey.delete(k);
       }
+    },
+    // Проверить и сразу зафиксировать: 0 — можно, иначе сколько мс ждать.
+    hit(key, now = Date.now()) {
+      const wait = this.peek(key, now);
+      if (wait > 0) return wait;
+      this.mark(key, now);
       return 0;
     }
   };
 }
 
 const commentCooldown = createCooldown(COMMENT_COOLDOWN_MS);
+const reportCooldown = createCooldown(REPORT_COOLDOWN_MS);
+const teacherRequestCooldown = createCooldown(TEACHER_REQUEST_COOLDOWN_MS);
 
-// Общий лимит на /api: на сессию (или IP для анонимов) + более высокий потолок на IP
-// целиком, чтобы поток запросов с подставными cookie тоже упирался в лимит.
-const apiRateLimiter = createSlidingWindowLimiter({ windowMs: 60_000, maxRequests: 240, keyFn: sessionRateKey });
+// Общий лимит на /api: высокий потолок на IP целиком (до проверки сессии) и
+// обычный лимит на ПРОВЕРЕННОГО пользователя (после гейта ниже) — поддельные
+// cookie не дают «свежих» корзин.
 const apiIpCeiling = createSlidingWindowLimiter({ windowMs: 60_000, maxRequests: 2000 });
-app.use('/api', apiIpCeiling, apiRateLimiter);
+const apiUserLimiter = createSlidingWindowLimiter({
+  windowMs: 60_000,
+  maxRequests: 240,
+  keyFn: req => (req.user ? `u:${req.user.id}` : `ip:${getClientIp(req)}`)
+});
+app.use('/api', apiIpCeiling);
 
 
 /* Отправка кода входа письмом через Resend (https://resend.com).
@@ -1514,8 +1647,10 @@ app.use('/api', (req, res, next) => {
   if (req.path.startsWith('/auth/') || req.path === '/telegram/webhook') return next();
   const u = getUserFromRequest(req, res);
   if (!u) return res.status(401).json({ error: 'unauthorized' });
+  req.user = u;
   next();
 });
+app.use('/api', apiUserLimiter);
 
 /* --- PUBLIC API (доступно только вошедшим, см. гейт выше) --- */
 
@@ -1595,8 +1730,8 @@ app.get('/api/teacher/:id',(req,res)=>{
 // Комментарии + рейтинг + модерация (локальная + опциональная модель)
 app.post('/api/comment-with-ratings', async (req, res) => {
   try {
-    const { teacherId, text, author, ratings } = req.body || {};
-    if (!teacherId) return res.status(400).json({ error: 'bad_request' });
+    const { teacherId, text, ratings } = req.body || {};
+    if (!teacherId || typeof teacherId !== 'string') return res.status(400).json({ error: 'bad_request' });
 
     const t = getTeacherById(teacherId);
     if (!t) return res.status(404).json({ error: 'teacher_not_found' });
@@ -1606,8 +1741,9 @@ app.post('/api/comment-with-ratings', async (req, res) => {
     // Это же гарантирует дедупликацию оценок по user_id (нет анонимной накрутки).
     if (!u) return res.status(401).json({ error: 'unauthorized', message: 'login_required' });
     const userId = u.id;
-    const authorName = String(author || u.username || 'Аноним').slice(0, 64);
-    const textStr = String(text || '').trim();
+    // Подпись автора — только публичное имя (ник или «Аноним»); клиенту её задавать нельзя.
+    const authorName = String(getActiveNickname(u.id) || 'Аноним').slice(0, 64);
+    const textStr = typeof text === 'string' ? text.trim() : '';
 
     const validRatingKeys = [];
     if (ratings && typeof ratings === 'object') {
@@ -1647,43 +1783,40 @@ app.post('/api/comment-with-ratings', async (req, res) => {
       }
     }
 
-    const handleLocalBan = async () => {
-      if (!u?.id) return;
-      try {
-        setBanStatus(u.id, true, 'local_profanity');
-        logSecurityEvent('user_auto_banned_for_profanity', {
-          userId: u.id,
-          teacherId,
-          snippet: textStr.slice(0, 180)
-        });
-      } catch (err) {
-        console.warn('Не удалось автоматически забанить пользователя за мат:', err && err.message ? err.message : err);
-      }
-    };
-
     const moderationResult = textStr
       ? await moderateComment(textStr, {
           gptApiKey: GPT_MODERATION_API_KEY,
           gptApiUrl: GPT_MODERATION_URL,
-          gptModel: GPT_MODERATION_MODEL,
-          onLocalBan: handleLocalBan
+          gptModel: GPT_MODERATION_MODEL
         })
       : { decision: COMMENT_DECISIONS.ALLOW };
 
     if (textStr && moderationResult.decision === COMMENT_DECISIONS.DELETE) {
-      try {
-        logSecurityEvent('comment_blocked', {
-          teacherId,
-          userId: u?.id || null,
-          reason: moderationResult.reason || 'forbidden'
-        });
-      } catch (err) {
-        console.warn('Не удалось записать блокировку комментария:', err && err.message ? err.message : err);
+      const isProfanity = moderationResult.reason === 'profanity';
+      logSecurityEvent(isProfanity ? 'comment_blocked_profanity' : 'comment_blocked', {
+        teacherId,
+        userId: u.id,
+        reason: moderationResult.reason || 'forbidden',
+        snippet: textStr.slice(0, 180)
+      });
+      // Мат: отзыв отклоняем и засчитываем нарушение; на N-й раз за окно — блокировка.
+      let bannedNow = false;
+      let strikesLeft;
+      if (isProfanity) {
+        const strikes = countUserSecurityEvents('comment_blocked_profanity', u.id, Date.now() - PROFANITY_STRIKE_WINDOW_MS);
+        if (strikes >= PROFANITY_STRIKES_TO_BAN) {
+          setBanStatus(u.id, true, 'local_profanity');
+          logSecurityEvent('user_auto_banned_for_profanity', { userId: u.id, teacherId, strikes, severity: 'warning' });
+          bannedNow = true;
+        } else {
+          strikesLeft = PROFANITY_STRIKES_TO_BAN - strikes;
+        }
       }
       return res.status(400).json({
         error: 'comment_blocked',
         reason: moderationResult.reason || 'forbidden',
-        score: moderationResult.score || 0
+        banned: bannedNow || undefined,
+        strikes_left: strikesLeft
       });
     }
 
@@ -1817,27 +1950,24 @@ app.post('/api/comment/vote', (req,res)=>{
 app.post('/api/teacher-request', (req, res) => {
   const u = getActiveUser(req, res);
   if (!u) return;
+  // Не чаще одной отправленной заявки в минуту от пользователя.
+  const waitMs = teacherRequestCooldown.peek(`u:${u.id}`);
+  if (waitMs > 0) {
+    res.setHeader('Retry-After', Math.ceil(waitMs / 1000));
+    return res.status(429).json({ ok: false, error: 'rate_limited', message: `Следующую заявку можно отправить через ${Math.ceil(waitMs / 1000)} сек.`, retry_after_ms: waitMs });
+  }
   teacherRequestUpload(req, res, async uploadErr => {
     if (uploadErr) {
-      const code = uploadErr?.code || uploadErr?.message;
-      if (code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ ok: false, error: 'photo_too_large' });
-      }
-      if (code === 'UNSUPPORTED_FILE_TYPE' || uploadErr.message === 'unsupported_file_type') {
-        return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
-      }
-      console.error('Ошибка загрузки файла заявки учителя:', uploadErr);
-      return res.status(500).json({ ok: false, error: 'upload_failed' });
+      if (req.file) removeFileQuietly(path.join(REQUEST_PHOTO_DIR, req.file.filename));
+      return uploadErrorResponse(res, uploadErr, 'Ошибка загрузки файла заявки учителя:');
     }
 
+    const photoPath = req.file ? path.join(REQUEST_PHOTO_DIR, req.file.filename) : null;
+    let keepPhoto = false; // фото остаётся на диске, только если заявка ушла модераторам
     try {
       // multer доверяет Content-Type из запроса — проверяем реальную сигнатуру файла.
-      if (req.file) {
-        const photoPath = path.join(REQUEST_PHOTO_DIR, req.file.filename);
-        if (!hasValidImageSignature(photoPath)) {
-          try { fs.unlinkSync(photoPath); } catch {}
-          return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
-        }
+      if (photoPath && !hasValidImageSignature(photoPath)) {
+        return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
       }
 
       const fields = req.body || {};
@@ -1889,12 +2019,11 @@ app.post('/api/teacher-request', (req, res) => {
         userAgent: req.headers['user-agent'] || ''
       };
 
-      const { id } = insertTeacherRequest(payload, meta);
-
       if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_REVIEW_CHAT_ID) {
-        updateTeacherRequestError(id, 'telegram_not_configured');
-        return res.status(503).json({ ok: false, error: 'telegram_not_configured', requestId: id });
+        return res.status(503).json({ ok: false, error: 'telegram_not_configured' });
       }
+
+      const { id } = insertTeacherRequest(payload, meta);
 
       const fio = [lastName, firstName, patronymic].filter(Boolean).join(' ');
       const summaryLines = [
@@ -1968,6 +2097,8 @@ app.post('/api/teacher-request', (req, res) => {
         const telegramChatId = message?.chat?.id ? String(message.chat.id) : TELEGRAM_REVIEW_CHAT_ID;
         const telegramMessageId = message?.message_id ? String(message.message_id) : null;
         setTeacherRequestTelegramMeta(id, telegramChatId, telegramMessageId);
+        keepPhoto = true;
+        teacherRequestCooldown.mark(`u:${u.id}`);
 
         res.json({ ok: true, requestId: id });
       } catch (err) {
@@ -1984,6 +2115,9 @@ app.post('/api/teacher-request', (req, res) => {
     } catch (err) {
       console.error('Ошибка обработки заявки на добавление учителя:', err);
       return res.status(500).json({ ok: false, error: 'server_error' });
+    } finally {
+      // Отклонённая/неотправленная заявка не должна оставлять файлы на диске.
+      if (photoPath && !keepPhoto) removeFileQuietly(photoPath);
     }
   });
 });
@@ -2032,12 +2166,12 @@ app.get('/api/admin/admins', requireSuperAdmin, (req, res) => {
 
 app.post('/api/admin/admins/add', requireSuperAdmin, express.json({ limit: '1mb' }), (req, res) => {
   try {
-    const emailRaw = req.body?.email;
-    const email = String(emailRaw || '').trim().toLowerCase();
-    if (!email || !email.includes('@')) {
+    const email = canonicalEmail(typeof req.body?.email === 'string' ? req.body.email : '');
+    if (!email || email.length > MAX_EMAIL_LENGTH || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       return res.status(400).json({ ok: false, error: 'invalid_email' });
     }
-    if (!email.endsWith(ALLOWED_EMAIL_DOMAIN)) {
+    // Администратором можно сделать только того, кто вообще может войти.
+    if (!isEmailAllowed(email)) {
       return res.status(400).json({ ok: false, error: 'invalid_domain' });
     }
 
@@ -2058,8 +2192,7 @@ app.post('/api/admin/admins/add', requireSuperAdmin, express.json({ limit: '1mb'
 
 app.post('/api/admin/admins/remove', requireSuperAdmin, express.json({ limit: '1mb' }), (req, res) => {
   try {
-    const emailRaw = req.body?.email;
-    const email = String(emailRaw || '').trim().toLowerCase();
+    const email = String(typeof req.body?.email === 'string' ? req.body.email : '').trim().toLowerCase();
     if (!email || !email.includes('@')) {
       return res.status(400).json({ ok: false, error: 'invalid_email' });
     }
@@ -2190,14 +2323,16 @@ app.get('/api/admin/users', requireAdmin, (req,res)=>{
 });
 
 app.get('/api/admin/comments', requireAdmin, (req,res)=>{
-  const limit = Math.max(1, Math.min(500, Number(req.query.limit||100)));
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
   const all = getAdminComments(limit);
   const usersById = getUsersByIds(all.map(c => c.author_uid).filter(Boolean));
+  const teacherNames = new Map(getAllTeachers().map(t => [t.id, [t.last_name, t.first_name, t.patronymic].filter(Boolean).join(' ')]));
 
   const out = all.map(c=>{
     const u = c.author_uid ? usersById.get(String(c.author_uid)) : null;
     return {
-      id:c.id, teacherId:c.teacher_id, ts:c.ts, ts_iso:c.ts_iso,
+      id:c.id, teacherId:c.teacher_id, teacher_name: teacherNames.get(c.teacher_id) || '',
+      ts:c.ts, ts_iso:c.ts_iso,
       text:c.text, author:c.author,
       author_uid:c.author_uid||'',
       author_email:u?.email||''
@@ -2264,19 +2399,27 @@ app.post('/api/report-comment', express.json(), async (req, res) => {
   const u = getActiveUser(req, res);
   if (!u) return;
   const { commentId, reason } = req.body || {};
-  const cleanedReason = String(reason || '').trim();
+  const cleanedReason = typeof reason === 'string' ? reason.trim() : '';
   if (!commentId || !cleanedReason) return res.status(400).json({ error: 'bad_request' });
 
   const comment = getCommentById(commentId);
   if (!comment) return res.status(404).json({ error: 'comment_not_found' });
 
+  // Жалобы идут в Telegram, у которого свой лимит (~20 сообщений/мин на чат):
+  // без паузы один пользователь мог бы «забить» канал модераторов.
+  const waitMs = reportCooldown.hit(`u:${u.id}`);
+  if (waitMs > 0) {
+    res.setHeader('Retry-After', Math.ceil(waitMs / 1000));
+    return res.status(429).json({ error: 'rate_limited', message: `Слишком часто. Следующую жалобу можно отправить через ${Math.ceil(waitMs / 1000)} сек.`, retry_after_ms: waitMs });
+  }
 
   const reporter = u.email;
   const messageParts = [
     '🚩 Жалоба на комментарий',
     `ID: ${commentId}`,
     `От: ${reporter}`,
-    `Текст: ${String(comment.text || '(без текста)')}`,
+    `Учитель: ${comment.teacher_id}`,
+    `Текст: ${String(comment.text || '(без текста)').slice(0, 3000)}`,
     `Причина: ${cleanedReason.slice(0, 500)}`
   ];
   const msg = messageParts.join('\n');
@@ -2386,6 +2529,25 @@ app.post('/api/admin/teacher/upsert', requireAdmin, express.json(), (req,res)=>{
   return res.json({ ok:true, id, created, total: getAllTeachers().length });
 });
 
+// Загрузка фото учителя из админки: файл сразу кладётся в photos/, в ответ —
+// имя файла, которое форма подставляет в карточку.
+app.post('/api/admin/teacher/photo', requireAdmin, (req, res) => {
+  adminPhotoUpload(req, res, (uploadErr) => {
+    if (uploadErr) {
+      if (req.file) removeFileQuietly(path.join(PHOTO_DIR, req.file.filename));
+      return uploadErrorResponse(res, uploadErr, 'Ошибка загрузки фото учителя:');
+    }
+    if (!req.file) return res.status(400).json({ ok: false, error: 'bad_request' });
+    const filePath = path.join(PHOTO_DIR, req.file.filename);
+    if (!hasValidImageSignature(filePath)) {
+      removeFileQuietly(filePath);
+      return res.status(400).json({ ok: false, error: 'unsupported_photo_type' });
+    }
+    logSecurityEvent('teacher_photo_uploaded', { adminId: req.user.id, file: req.file.filename });
+    return res.json({ ok: true, file: req.file.filename });
+  });
+});
+
 app.post('/api/admin/teacher/delete', requireAdmin, express.json(), (req,res)=>{
   const { id } = req.body || {};
   if (!id) return res.status(400).json({error:'bad_request'});
@@ -2398,9 +2560,9 @@ app.post('/api/admin/teacher/delete', requireAdmin, express.json(), (req,res)=>{
 
 // Просмотр логов безопасности
 app.get('/api/admin/security/logs', requireAdmin, (req,res)=>{
-  const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
-  const offset = parseInt(req.query.offset) || 0;
-  const severity = req.query.severity || null;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 1000));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  const severity = typeof req.query.severity === 'string' ? req.query.severity : null;
 
   const { logs, total } = getSecurityLogs({ limit, offset, severity });
 
@@ -2533,7 +2695,11 @@ app.post('/api/user/revoke-other-sessions', (req,res)=>{
 app.post('/api/auth/request', authLimiter, express.json(), async (req,res)=>{
   const ip = getClientIp(req);
   const ua = req.headers['user-agent'] || '';
-  const email = String(req.body?.email || '').trim().toLowerCase();
+  const rawEmail = typeof req.body?.email === 'string' ? req.body.email : '';
+  if (rawEmail.length > MAX_EMAIL_LENGTH) {
+    return res.status(400).json({ error: 'invalid_email', message: 'Введите корректный email.' });
+  }
+  const email = canonicalEmail(rawEmail);
 
   if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     return res.status(400).json({ error: 'invalid_email', message: 'Введите корректный email.' });
@@ -2543,43 +2709,58 @@ app.post('/api/auth/request', authLimiter, express.json(), async (req,res)=>{
     return res.status(403).json({ error: 'email_not_allowed', message: `Разрешён вход только с почты ${ALLOWED_EMAIL_DOMAIN}.`, required_domain: ALLOWED_EMAIL_DOMAIN });
   }
 
-  // Много неверных кодов для этого email за последний час — временно не шлём новые.
-  // (Считаем по email, а не по IP: за школьным NAT все ученики — один адрес.)
-  const failures = countRecentLoginFailures(email);
-  if (failures >= MAX_LOGIN_ATTEMPTS) {
-    logSecurityEvent('login_rate_limit_exceeded', { email, ip, userAgent: ua, attempts: failures, severity: 'warning' });
-    return res.status(429).json({ error: 'too_many_attempts', message: 'Слишком много неверных кодов. Попробуйте через час.' });
-  }
-
-  // Не чаще одного письма в минуту и не больше AUTH_CODES_PER_EMAIL_PER_HOUR в час на
-  // адрес: иначе эндпоинт превращается в «бомбилку» чужого ящика и сжигает квоту Resend.
   const now = Date.now();
-  const sentTimes = (AUTH_CODE_SENDS.get(email) || []).filter(ts => now - ts < 60 * 60 * 1000);
-  const lastSent = sentTimes.length ? sentTimes[sentTimes.length - 1] : 0;
-  if (now - lastSent < AUTH_CODE_COOLDOWN_MS) {
-    const retryMs = AUTH_CODE_COOLDOWN_MS - (now - lastSent);
+  const HOUR = 60 * 60 * 1000;
+  const DAY = 24 * HOUR;
+  const pairKey = `${email}|${ip}`;
+
+  // 1) Не чаще письма в минуту для пары (почта, IP) — «отправить ещё раз» для своих.
+  const lastPairSend = AUTH_SENDS_BY_PAIR.get(pairKey) || 0;
+  if (now - lastPairSend < AUTH_CODE_COOLDOWN_MS) {
+    const retryMs = AUTH_CODE_COOLDOWN_MS - (now - lastPairSend);
     res.setHeader('Retry-After', Math.ceil(retryMs / 1000));
     return res.status(429).json({ error: 'code_cooldown', message: `Код уже отправлен. Новый можно запросить через ${Math.ceil(retryMs / 1000)} сек.`, retry_after_ms: retryMs });
   }
-  if (sentTimes.length >= AUTH_CODES_PER_EMAIL_PER_HOUR) {
-    return res.status(429).json({ error: 'too_many_codes', message: 'Слишком много запросов кода для этой почты. Попробуйте через час.' });
+  // 2) Потолки на почту (час / сутки) — перебор кода бесполезен, ящик не заспамить.
+  const emailSends = (AUTH_SENDS_BY_EMAIL.get(email) || []).filter(ts => now - ts < DAY);
+  if (emailSends.filter(ts => now - ts < HOUR).length >= AUTH_CODES_PER_EMAIL_PER_HOUR || emailSends.length >= AUTH_CODES_PER_EMAIL_PER_DAY) {
+    logSecurityEvent('login_code_limit_exceeded', { email, ip, userAgent: ua, severity: 'warning' });
+    return res.status(429).json({ error: 'too_many_codes', message: 'Слишком много запросов кода для этой почты. Попробуйте позже.' });
+  }
+  // 3) Потолок на IP — чтобы с одного адреса нельзя было рассылать коды по всей школе.
+  const ipSends = (AUTH_SENDS_BY_IP.get(ip) || []).filter(ts => now - ts < 10 * 60 * 1000);
+  if (ipSends.length >= AUTH_CODES_PER_IP_PER_10MIN) {
+    return res.status(429).json({ error: 'rate_limited', message: 'Слишком много запросов. Попробуйте через несколько минут.' });
   }
 
-  // Новый код отменяет предыдущие: одновременно действует только один.
-  for (const [sid, rec] of PENDING_AUTH) {
-    if (rec && rec.email === email) PENDING_AUTH.delete(sid);
-  }
+  // Резервируем лимиты ДО отправки (параллельные запросы не проскочат), при
+  // неудачной отправке — откатываем.
+  emailSends.push(now); ipSends.push(now);
+  AUTH_SENDS_BY_EMAIL.set(email, emailSends);
+  AUTH_SENDS_BY_IP.set(ip, ipSends);
+  AUTH_SENDS_BY_PAIR.set(pairKey, now);
+  const rollback = () => {
+    emailSends.splice(emailSends.indexOf(now), 1);
+    ipSends.splice(ipSends.indexOf(now), 1);
+    if (AUTH_SENDS_BY_PAIR.get(pairKey) === now) AUTH_SENDS_BY_PAIR.set(pairKey, lastPairSend);
+  };
+
+  // Действуют несколько последних кодов: новый запрос (свой или чужой) не
+  // отменяет код, который пользователь уже ждёт в почте.
+  const active = [...PENDING_AUTH.entries()]
+    .filter(([, rec]) => rec && rec.email === email && now - rec.created <= AUTH_SESSION_TTL_MS)
+    .sort((a, b) => a[1].created - b[1].created);
+  while (active.length >= AUTH_MAX_ACTIVE_CODES) PENDING_AUTH.delete(active.shift()[0]);
 
   const code = String(crypto.randomInt(100000, 1000000));
   const sessionId = 'a-' + crypto.randomBytes(16).toString('hex');
   PENDING_AUTH.set(sessionId, { email, code, created: now, tries: 0, ip, ua });
-  sentTimes.push(now);
-  AUTH_CODE_SENDS.set(email, sentTimes);
 
   const sent = await sendAuthCodeEmail(email, code);
   if (!sent) {
     if (IS_PRODUCTION) {
       PENDING_AUTH.delete(sessionId);
+      rollback();
       return res.status(503).json({ error: 'email_send_failed', message: 'Не удалось отправить письмо. Попробуйте позже.' });
     }
     // dev-режим без настроенного Resend: показываем код в консоли сервера
@@ -2592,10 +2773,10 @@ app.post('/api/auth/request', authLimiter, express.json(), async (req,res)=>{
 
 // Шаг 2: пользователь вводит код → проверяем и логиним.
 app.post('/api/auth/verify', authLimiter, express.json(), (req,res)=>{
-  const sessionId = String(req.body?.session_id || '');
-  const code = String(req.body?.code || '').trim();
+  const sessionId = typeof req.body?.session_id === 'string' ? req.body.session_id : '';
+  const code = String(typeof req.body?.code === 'string' || typeof req.body?.code === 'number' ? req.body.code : '').trim();
   const rec = PENDING_AUTH.get(sessionId);
-  if (!rec) return res.status(404).json({ error: 'no_auth_session' });
+  if (!rec) return res.status(404).json({ error: 'no_auth_session', message: 'Код больше не действует. Запросите новый.' });
 
   if (Date.now() - rec.created > AUTH_SESSION_TTL_MS) {
     PENDING_AUTH.delete(sessionId);
@@ -2603,25 +2784,30 @@ app.post('/api/auth/verify', authLimiter, express.json(), (req,res)=>{
   }
 
   rec.tries = (rec.tries || 0) + 1;
-  if (rec.tries > 5) {
+  if (rec.tries > AUTH_MAX_CODE_TRIES) {
     PENDING_AUTH.delete(sessionId);
     return res.status(429).json({ error: 'too_many_attempts', message: 'Слишком много попыток. Запросите новый код.' });
   }
 
   if (!timingSafeEqualStr(code, rec.code)) {
-    recordLoginAttempt(rec.email, rec.ip, false);
-    logSecurityEvent('login_invalid_code', { email: rec.email, ip: rec.ip, userAgent: rec.ua, severity: 'warning' });
-    return res.status(401).json({ error: 'invalid_code', message: 'Неверный код.' });
+    recordLoginAttempt(rec.email, getClientIp(req), false);
+    logSecurityEvent('login_invalid_code', { email: rec.email, ip: getClientIp(req), userAgent: req.headers['user-agent'] || '', severity: 'warning' });
+    const triesLeft = Math.max(0, AUTH_MAX_CODE_TRIES - rec.tries);
+    if (!triesLeft) PENDING_AUTH.delete(sessionId);
+    return res.status(401).json({ error: 'invalid_code', message: 'Неверный код.', tries_left: triesLeft });
   }
 
-  PENDING_AUTH.delete(sessionId);
+  // Вход выполнен — остальные коды для этой почты больше не нужны.
+  for (const [sid, other] of PENDING_AUTH) {
+    if (other && other.email === rec.email) PENDING_AUTH.delete(sid);
+  }
   const user = upsertUserOnLogin(rec.email);
-  recordLoginAttempt(rec.email, rec.ip, true);
+  recordLoginAttempt(rec.email, getClientIp(req), true);
 
   const token = createSession(user.id, req);
   setSessionCookie(res, token);
   try { insertLoginEvent({ action: 'login', email: user.email, ip: getClientIp(req), ua: req.headers['user-agent'] || '' }); } catch {}
-  logSecurityEvent('login_successful', { userId: user.id, email: user.email, ip: rec.ip, userAgent: rec.ua });
+  logSecurityEvent('login_successful', { userId: user.id, email: user.email, ip: getClientIp(req), userAgent: req.headers['user-agent'] || '' });
 
   return res.json({ ok: true, user: serializeUser(user) });
 });
@@ -2743,8 +2929,8 @@ app.post('/api/shop/buy', express.json(), (req, res) => {
   const u = getActiveUser(req, res);
   if (!u) return;
 
-  const { itemId } = req.body;
-  if (!itemId) return res.status(400).json({ error: 'bad_request' });
+  const { itemId } = req.body || {};
+  if (!itemId || typeof itemId !== 'string') return res.status(400).json({ error: 'bad_request' });
 
   const item = getShopItemById(itemId);
   if (!item) return res.status(404).json({ error: 'item_not_found' });
@@ -2804,8 +2990,8 @@ app.post('/api/shop/activate', express.json(), (req, res) => {
   const u = getActiveUser(req, res);
   if (!u) return;
 
-  const { itemId } = req.body;
-  if (!itemId) return res.status(400).json({ error: 'bad_request' });
+  const { itemId } = req.body || {};
+  if (!itemId || typeof itemId !== 'string') return res.status(400).json({ error: 'bad_request' });
 
   const shopItem = getShopItemMeta(itemId);
   if (!shopItem) {
@@ -2907,6 +3093,20 @@ app.use('/api', (req, res) => {
   res.status(404).json({ error: 'not_found' });
 });
 
+// Любая необработанная ошибка — короткий JSON без стектрейса (он только в лог).
+// Битый JSON в теле запроса — 400, а не 500.
+app.use((err, req, res, _next) => {
+  if (res.headersSent) return;
+  if (err && (err.type === 'entity.parse.failed' || err.status === 400)) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'payload_too_large' });
+  }
+  console.error('Необработанная ошибка:', err && err.stack ? err.stack : err);
+  return res.status(500).json({ error: 'server_error' });
+});
+
 /* Catch-all для SPA (исключаем /api и файлы с расширением) */
 app.get(/^\/(?!api\/)(?!.*\.).*$/, (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
@@ -2914,6 +3114,14 @@ app.get(/^\/(?!api\/)(?!.*\.).*$/, (req, res) => {
 
 function printStartupInfo(port = PORT) {
   const stats = getStartupStats();
+  // Похоже на боевой запуск (настроена почта), но не production: cookie без Secure,
+  // а при сбое отправки письма код входа уходит в консоль. Предупреждаем громко.
+  if (!IS_PRODUCTION && RESEND_API_KEY) {
+    console.warn('⚠️  NODE_ENV не равен production, хотя почта настроена. Для боевого сервера задайте NODE_ENV=production (Secure-cookie, коды входа не пишутся в лог).');
+  }
+  if (IS_PRODUCTION && !TELEGRAM_WEBHOOK_SECRET) {
+    console.warn('⚠️  TELEGRAM_WEBHOOK_SECRET не задан — кнопки модерации в Telegram работать не будут.');
+  }
 
   console.log('\n' + '='.repeat(60));
   console.log('🎓  LETO TALKS — Платформа рейтинга учителей');
@@ -2934,8 +3142,13 @@ function printStartupInfo(port = PORT) {
   console.log('');
 }
 
+// HOST=127.0.0.1 — если сервер стоит за nginx на той же машине и не должен
+// быть доступен напрямую. По умолчанию слушаем все интерфейсы.
+const HOST = (process.env.HOST || '').trim() || undefined;
+let httpServer = null;
+
 function startServer(port = PORT, onListen = null) {
-  const server = app.listen(port, () => {
+  const server = app.listen(port, HOST, () => {
     const address = server.address();
     const actualPort = typeof address === 'object' && address ? address.port : PORT;
     printStartupInfo(actualPort);
@@ -2943,23 +3156,29 @@ function startServer(port = PORT, onListen = null) {
       onListen(actualPort);
     }
   });
+  httpServer = server;
   return server;
 }
 
-/* Graceful shutdown */
+/* Graceful shutdown: перестаём принимать соединения, даём текущим запросам
+   закончиться (до 5 сек), затем закрываем БД. */
+let shuttingDown = false;
 function closeDatabaseAndExit(signal) {
-  console.log(`\n👋 (${signal}) Закрываем соединение с базой данных...`);
-  try {
-    clearInterval(cleanupTimer);
-  } catch (err) {
-    console.warn('Не удалось остановить таймер очистки:', err);
-  }
-  try {
-    db.close();
-  } catch (err) {
-    console.error('Ошибка при закрытии базы данных:', err);
-  }
-  process.exit(0);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n👋 (${signal}) Останавливаем сервер и закрываем базу данных...`);
+  clearInterval(cleanupTimer);
+  clearInterval(dbBackupTimer);
+  clearTimeout(dbBackupStartTimer);
+  const finish = () => {
+    try { db.close(); } catch (err) { console.error('Ошибка при закрытии базы данных:', err); }
+    process.exit(0);
+  };
+  if (!httpServer) return finish();
+  const force = setTimeout(finish, 5000);
+  if (typeof force.unref === 'function') force.unref();
+  httpServer.close(() => { clearTimeout(force); finish(); });
+  if (typeof httpServer.closeIdleConnections === 'function') httpServer.closeIdleConnections();
 }
 
 process.on('SIGINT', () => closeDatabaseAndExit('SIGINT'));

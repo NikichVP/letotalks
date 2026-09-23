@@ -358,6 +358,9 @@ function createDbProcessing({
   // Свежие БД получают финальную схему сразу из блока выше; здесь приводим
   // старые базы к ней: AUTOINCREMENT для comments и CHECK-констрейнты.
   runSchemaMigrations(db);
+  // Учителя с id = NULL могли появиться из-за старой ошибки админ-формы (пустой ID):
+  // они недоступны и неудаляемы через интерфейс — убираем.
+  db.exec('DELETE FROM teachers WHERE id IS NULL');
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS user_inventory (
@@ -1093,6 +1096,13 @@ function createDbProcessing({
     }
   }
 
+  // Сколько раз событие случалось у пользователя начиная с sinceTs (напр. нарушения).
+  const countUserSecurityEventsStmt = db.prepare('SELECT COUNT(*) AS n FROM security_log WHERE event_type = ? AND user_id = ? AND ts >= ?');
+  function countUserSecurityEvents(eventType, userId, sinceTs = 0) {
+    if (!userId) return 0;
+    return Number(countUserSecurityEventsStmt.get(eventType, String(userId), Number(sinceTs) || 0)?.n || 0);
+  }
+
   function recordLoginAttempt(email, ip, success) {
     try {
       const stmt = db.prepare('INSERT INTO login_attempts (email, ip, ts, success) VALUES (?, ?, ?, ?)');
@@ -1518,6 +1528,7 @@ function createDbProcessing({
     upsertTeacher,
     deleteTeacherById,
     logSecurityEvent,
+    countUserSecurityEvents,
     recordLoginAttempt,
     countRecentLoginFailures,
     getUserFromSessionTokenHash,

@@ -20,6 +20,8 @@ const browserGlobals = {
   MouseEvent: 'readonly', WeakMap: 'readonly', getComputedStyle: 'readonly',
   IntersectionObserver: 'readonly', requestAnimationFrame: 'readonly', Intl: 'readonly',
   FormData: 'readonly', Event: 'readonly', CustomEvent: 'readonly',
+  sessionStorage: 'readonly', performance: 'readonly', cancelAnimationFrame: 'readonly',
+  Profanity: 'readonly',
 };
 
 module.exports = [
@@ -39,6 +41,11 @@ module.exports = [
       'no-unused-vars': ['warn', { args: 'none', varsIgnorePattern: '^_' }],
       'no-fallthrough': 'error',
     },
+  },
+  {
+    // Общий модуль (сервер + браузер): UMD-обёртка.
+    files: ['public/profanity.js'],
+    languageOptions: { ecmaVersion: 2023, sourceType: 'script', globals: { self: 'readonly', module: 'writable' } },
   },
   {
     // Браузерный SPA — отдельный набор глобалей.

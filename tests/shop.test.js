@@ -6,64 +6,15 @@ const os = require('os');
 const crypto = require('crypto');
 const http = require('node:http');
 const { Duplex } = require('node:stream');
-const { once } = require('events');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'letotalks-test-'));
 const fixtureDb = path.join(tmpDir, 'letotalks.db');
 // Свежая пустая БД: схему создаёт сам код (createDbProcessing), тесты вставляют
 // нужные данные сами. Не зависим от (gitignored) репозиторного letotalks.db.
 
-const repoRoot = path.join(__dirname, '..');
-const repoDataDir = path.join(repoRoot, 'data');
-const dataBackupDir = path.join(tmpDir, 'data-backup');
-let restoreDataDir = false;
-let dataDirHandled = false;
-const shouldIsolateDataDir = process.env.RUN_INTEGRATION_TESTS !== '1';
-
-if (shouldIsolateDataDir && fs.existsSync(repoDataDir)) {
-  try {
-    fs.cpSync(repoDataDir, dataBackupDir, { recursive: true });
-    restoreDataDir = true;
-  } catch (err) {
-    if (err?.code !== 'ENOENT') throw err;
-  }
-  try {
-    fs.rmSync(repoDataDir, { recursive: true, force: true });
-  } catch (err) {
-    if (err?.code !== 'ENOENT') throw err;
-  }
-}
-
-function ensureRepoDataRestored() {
-  if (!shouldIsolateDataDir) return;
-  if (dataDirHandled) return;
-  if (restoreDataDir) {
-    try {
-      fs.rmSync(repoDataDir, { recursive: true, force: true });
-      fs.cpSync(dataBackupDir, repoDataDir, { recursive: true });
-    } catch (err) {
-      console.error('Failed to restore data directory after tests:', err);
-    }
-  } else {
-    try {
-      fs.rmSync(repoDataDir, { recursive: true, force: true });
-    } catch (err) {
-      // ignore removal errors for recreated data dir
-    }
-  }
-  dataDirHandled = true;
-}
-
-process.once('exit', ensureRepoDataRestored);
-process.once('SIGINT', () => {
-  ensureRepoDataRestored();
-  process.exit(130);
-});
-process.once('SIGTERM', () => {
-  ensureRepoDataRestored();
-  process.exit(143);
-});
-
+// Отдельная временная папка данных: раньше тесты перемещали НАСТОЯЩУЮ data/
+// (фото заявок, бэкапы) и при падении теста могли её потерять.
+process.env.LETOTALKS_DATA_DIR = path.join(tmpDir, 'data');
 process.env.LETOTALKS_DB_PATH = fixtureDb;
 process.env.NODE_ENV = 'test';
 process.env.ROOT_ADMIN_EMAIL = 'root-admin@student.letovo.ru';
@@ -77,7 +28,6 @@ test.after(async () => {
   } catch (err) {
     // ignore errors on shutdown
   }
-  ensureRepoDataRestored();
   try {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch (err) {

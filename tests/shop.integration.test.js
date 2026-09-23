@@ -16,46 +16,8 @@ if (!shouldRun) {
   const fixtureDb = path.join(tmpDir, 'letotalks.db');
   // Свежая БД: схему создаёт код, тесты вставляют данные сами (не зависим от letotalks.db).
 
-  const repoRoot = path.join(__dirname, '..');
-  const repoDataDir = path.join(repoRoot, 'data');
-  const dataBackupDir = path.join(tmpDir, 'data-backup');
-  let restoreDataDir = false;
-  let dataDirHandled = false;
-
-  if (fs.existsSync(repoDataDir)) {
-    fs.cpSync(repoDataDir, dataBackupDir, { recursive: true });
-    fs.rmSync(repoDataDir, { recursive: true, force: true });
-    restoreDataDir = true;
-  }
-
-  function ensureRepoDataRestored() {
-    if (dataDirHandled) return;
-    if (restoreDataDir) {
-      try {
-        fs.rmSync(repoDataDir, { recursive: true, force: true });
-        fs.cpSync(dataBackupDir, repoDataDir, { recursive: true });
-      } catch (err) {
-        console.error('Failed to restore data directory after tests:', err);
-      }
-    } else {
-      try {
-        fs.rmSync(repoDataDir, { recursive: true, force: true });
-      } catch (err) {
-        // ignore removal errors for recreated data dir
-      }
-    }
-    dataDirHandled = true;
-  }
-
-  process.once('exit', ensureRepoDataRestored);
-  process.once('SIGINT', () => {
-    ensureRepoDataRestored();
-    process.exit(130);
-  });
-  process.once('SIGTERM', () => {
-    ensureRepoDataRestored();
-    process.exit(143);
-  });
+  // Отдельная временная папка данных — настоящую data/ тесты не трогают.
+  process.env.LETOTALKS_DATA_DIR = path.join(tmpDir, 'data');
 
   process.env.LETOTALKS_DB_PATH = fixtureDb;
   process.env.NODE_ENV = 'test';
@@ -92,7 +54,6 @@ if (!shouldRun) {
     } catch (err) {
       // ignore errors on shutdown
     }
-    ensureRepoDataRestored();
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch (err) {
