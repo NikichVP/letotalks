@@ -1497,10 +1497,11 @@ function backupDatabase() {
   const target = path.join(BACKUP_DIR, `letotalks-backup-${day}.db`);
   const tmp = `${target}.tmp`;
   try {
-    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true, mode: 0o700 });
     removeFileQuietly(tmp); // VACUUM INTO требует, чтобы файла не было
     // VACUUM INTO даёт согласованный снимок даже в WAL-режиме.
     db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+    fs.chmodSync(tmp, 0o600); // в бэкапе почты пользователей — только владельцу
     fs.renameSync(tmp, target);
   } catch (err) {
     removeFileQuietly(tmp);
