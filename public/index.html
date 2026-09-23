@@ -2,50 +2,51 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="theme-color" content="#214e8a"/>
+  <meta name="description" content="leto talks — отзывы и оценки учителей от учеников."/>
   <title>leto talks — рейтинги учителей</title>
   <link rel="stylesheet" href="/styles.css"/>
-  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%23214E8A'/><text x='50' y='60' font-size='60' text-anchor='middle' fill='%23FFC237'>L</text></svg>">
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23214E8A'/><text x='50' y='68' font-size='60' font-family='Arial' font-weight='bold' text-anchor='middle' fill='%23FFC237'>L</text></svg>">
 </head>
 <body class="lockout">
   <header class="topbar">
-    <a class="brand" href="#/" aria-label="На главную">
-      <div class="brand-icon">L</div>
+    <a class="brand" href="#/" aria-label="leto talks — на главную">
+      <div class="brand-icon" aria-hidden="true">L</div>
       <div class="brand-text">leto<span>talks</span></div>
     </a>
 
-    <div class="search-group">
-      <input id="searchInput" type="search" placeholder="Поиск учителя (имя, фамилия)"/>
-      <button id="searchBtn" class="btn primary" aria-label="Поиск">Найти</button>
-    </div>
+    <form class="search-group" id="searchForm" role="search">
+      <input id="searchInput" class="input" type="search" placeholder="Поиск учителя" aria-label="Поиск учителя" autocomplete="off"/>
+      <button class="btn primary" type="submit">Найти</button>
+    </form>
 
     <div class="filters">
-      <!-- Кастомный выпадающий список кафедр -->
-      <div class="select custom-select" id="deptSelectWrap">
-        <button id="deptBtn" class="select-btn" type="button" aria-haspopup="listbox" aria-expanded="false">Кафедры…</button>
-        <div id="deptMenu" class="select-menu hidden" role="listbox" aria-label="Кафедры"></div>
+      <!-- Выпадающий список кафедр (навигация) -->
+      <div class="custom-select" id="deptSelectWrap">
+        <button id="deptBtn" class="select-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="deptMenu">Кафедры…</button>
+        <div id="deptMenu" class="select-menu hidden" aria-label="Кафедры"></div>
       </div>
 
-      <!-- Логин -->
-      <button id="loginBtn" class="btn outline">Войти</button>
-      <a id="shopLink" class="btn small outline hidden" href="#/shop" aria-label="Магазин">Магазин</a>
-      <a id="adminLink" class="link hidden" href="#/admin" aria-label="Админка">Админка</a>
-      <!-- Иконка аккаунта (справа). «Выйти» — в оверлее при наведении. -->
-      <button id="userBadge" class="badge user-badge hidden" type="button" aria-label="Аккаунт">Student</button>
+      <a id="shopLink" class="btn outline hidden" href="#/shop">Магазин</a>
+      <a id="adminLink" class="btn outline hidden" href="#/admin">Админка</a>
+      <!-- Аккаунт: наведение или клик открывает меню с балансом и «Выйти». -->
+      <button id="userBadge" class="user-badge hidden" type="button" aria-haspopup="dialog" aria-expanded="false">Аккаунт</button>
     </div>
   </header>
 
   <main id="app"></main>
 
   <footer class="footer">
-    <div>© <span id="year"></span> leto talks</div>
-    <div class="muted">
-      <a class="link" href="#/policy">Правила, конфиденциальность и отказ от ответственности</a><br>
+    <div>© <span id="year"></span> leto talks — студенческий проект, не связан с администрацией школы</div>
+    <div class="footer-links">
+      <a class="link" href="#/policy">Правила и конфиденциальность</a>
+      <a class="link" href="#/teacher-request">Предложить учителя</a>
       <a class="link" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ" target="_blank" rel="noopener">Создатели проекта</a>
-
     </div>
   </footer>
 
+  <script src="/profanity.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

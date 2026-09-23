@@ -1,8 +1,11 @@
-// app.js — SPA с авторизацией по почте, лайками/дизлайками, статистикой, админкой и предмодерацией
-const APP_VERSION = '2025-10-04-admin-2';
+// app.js — SPA «leto talks»: вход по коду на почту, каталог и профили учителей,
+// оценки и отзывы с модерацией, лайки, магазин ников и админ-панель.
+const APP_VERSION = '2026-09-24';
 const EMAIL_DOMAIN = '@student.letovo.ru';
-const AUTH_REFRESH_INTERVAL_MS = 60 * 1000; // чаще обновляем состояние (раз в минуту)
+const AUTH_REFRESH_INTERVAL_MS = 60 * 1000; // раз в минуту сверяем сессию с сервером
 const SEARCH_QUERY_MAX_LEN = 50;
+const COMMENT_MAX_LEN = 2000;               // синхронно с MAX_COMMENT_LENGTH на сервере
+const AUTH_CODE_RESEND_SEC = 60;            // синхронно с AUTH_CODE_COOLDOWN_MS на сервере
 
 const CHARACTERISTICS = [
   { key:'clarity',   name:'Понятно объясняет' },
@@ -11,6 +14,7 @@ const CHARACTERISTICS = [
   { key:'favorites', name:'Есть любимчики' },
 ];
 
+/* ---------- мелкие помощники ---------- */
 const $  = (s,r=document)=>r.querySelector(s);
 const $$ = (s,r=document)=>Array.from(r.querySelectorAll(s));
 const html = (a,...v)=>a.reduce((x,s,i)=>x+s+(v[i]??''),'');
@@ -19,9 +23,41 @@ const html = (a,...v)=>a.reduce((x,s,i)=>x+s+(v[i]??''),'');
 const esc = (v)=>String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const escAttr = esc;
 const fmtNum = v => Math.round((v||0)*10)/10;
-const fmtStars = v => html`<span class="rating" title="${fmtNum(v)} / 5"><span class="star">★</span>${fmtNum(v)}</span>`;
+// Оценки 1..5, поэтому среднее 0 = «оценок ещё нет»: показываем прочерк, а не «★ 0».
+const fmtStars = v => v > 0
+  ? html`<span class="rating" title="${fmtNum(v)} из 5"><span class="star">★</span>${fmtNum(v)}</span>`
+  : '<span class="rating none" title="Пока нет оценок">—</span>';
+const fmtDate = ts => {
+  const d = new Date(Number(ts) || 0);
+  try { return d.toLocaleString('ru-RU', { dateStyle:'medium', timeStyle:'short' }); }
+  catch { return d.toISOString(); }
+};
+// Склонение: plural(3, ['оценка','оценки','оценок']) -> 'оценки'.
+function plural(n, forms){
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return forms[2];
+  if (b > 1 && b < 5) return forms[1];
+  if (b === 1) return forms[0];
+  return forms[2];
+}
+const countLabel = (n, forms) => `${n} ${plural(n, forms)}`;
+const RATING_FORMS = ['оценка','оценки','оценок'];
+const COMMENT_FORMS = ['отзыв','отзыва','отзывов'];
+
+// Поиск по ФИО: без учёта регистра и ё/е, слова в любом порядке («Артём Сухов» = «Сухов Артем»).
+const normName = v => String(v ?? '').toLowerCase().replace(/ё/g, 'е');
+function matchesQuery(t, q){
+  const words = normName(q).split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  const fio = normName([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' '));
+  return words.every(w => fio.includes(w));
+}
+const fullName = t => [t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
 function characteristicAvg(t,k){ const r=t.ratings?.[k]; return r&&r.count?(r.sum/r.count):0; }
+function characteristicCount(t,k){ return Number(t.ratings?.[k]?.count || 0); }
 function overall(t){ let tot=0,cnt=0; for(const c of CHARACTERISTICS){ const r=t.ratings?.[c.key]; if(r&&r.count){ tot+=r.sum/r.count; cnt++; } } return cnt?tot/cnt:0; }
+// Сколько человек оценили учителя (примерно: максимум оценок по одной характеристике).
+function ratersCount(t){ return Math.max(0, ...CHARACTERISTICS.map(c => characteristicCount(t, c.key))); }
 const collator = new Intl.Collator('ru',{sensitivity:'base'});
 function normalizeSearchQuery(v){
   const text = String(v ?? '');
@@ -30,139 +66,114 @@ function normalizeSearchQuery(v){
 
 function coinsOf(u){
   if (!u) return 0;
-
-  const hasAvailable = typeof u.available_coins === 'number' && !Number.isNaN(u.available_coins);
-  const hasEarned = typeof u.earned_coins === 'number' && !Number.isNaN(u.earned_coins);
-  const hasSpent = typeof u.spent_coins === 'number' && !Number.isNaN(u.spent_coins);
-
-  const comments = Number(u?.comment_count||0);
-  const ratings  = Number(u?.rating_count||0);
-  const recLikes = Number(u?.received_likes||0);
-  const recDis   = Number(u?.received_dislikes||0);
-
-  const earnedFallback = 5*comments + ratings + recLikes - recDis;
-  const earned = hasEarned ? Number(u.earned_coins) : earnedFallback;
-  const spent = hasSpent ? Number(u.spent_coins) : 0;
-  const available = hasAvailable ? Number(u.available_coins) : (earned - spent);
-
-  const normalized = Math.max(0, Number.isFinite(available) ? available : 0);
-
-  return normalized;
+  const num = v => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+  const earned = num(u.earned_coins) ?? (5*Number(u.comment_count||0) + Number(u.rating_count||0) + Number(u.received_likes||0) - Number(u.received_dislikes||0));
+  const available = num(u.available_coins) ?? (earned - (num(u.spent_coins) ?? 0));
+  return Math.max(0, Number.isFinite(available) ? available : 0);
 }
 
-/* ---------- Глобальное поведение кликов: "последний запрос побеждает" ---------- */
-// Идея:
-// - Любой клик по кнопке/ссылке создаёт "группу запроса" с AbortController.
-// - Все fetch-запросы, начатые во время обработки этого клика, получают общий AbortSignal этой группы.
-// - Новый клик абортирует предыдущую группу (тем самым отменяя старые запросы), т. е. последний клик выигрывает.
-// - Кнопка/ссылка временно блокируется (anti-double-click) до завершения всех запросов этой группы или по таймауту.
-// Реализация максимально ненавязчивая: без изменения существующих вызовов fetch/обработчиков.
+// Блокирует кнопку на время асинхронного действия — защита от двойного клика
+// (двойная публикация, двойная покупка и т.п.).
+async function withBusy(btn, fn){
+  if (btn && btn.disabled) return undefined;
+  if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
+  try { return await fn(); }
+  finally {
+    if (btn && btn.isConnected) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
+  }
+}
 
-// Анти-двойной-клик БЕЗ отмены чужих запросов: кнопка блокируется, пока её
-// СОБСТВЕННЫЕ запросы в полёте, и разблокируется по их завершении. Не патчим
-// поведение fetch (не абортим), поэтому клик по одной кнопке не отменяет
-// запрос, начатый другой кнопкой.
-(function setupClickBusyGuard(){
-  if (typeof window === 'undefined') return;
-  if (window.__clickBusyGuardInstalled) return;
-  window.__clickBusyGuardInstalled = true;
+/* ---------- предпроверка мата ----------
+   Та же функция, что на сервере (public/profanity.js подключён перед app.js):
+   предупреждаем ровно о том, за что сервер отклонит отзыв и засчитает нарушение. */
+function hasProfanity(text){
+  return !!(window.Profanity && window.Profanity.hasBadWords(text));
+}
 
-  const busyCounts = new WeakMap(); // el -> число активных запросов, начатых этим кликом
-  let pendingEl = null;             // элемент текущей синхронной фазы клика
-  let inClickPhase = false;
-
-  function disableEl(el){
-    if (!el) return;
-    const isButton = el.tagName === 'BUTTON' ||
-      (el.tagName === 'INPUT' && ['button','submit'].includes((el.getAttribute('type')||'').toLowerCase()));
-    if (isButton && el.disabled) return; // уже реально disabled — не трогаем
-    if (el.dataset._cbgPrevPe === undefined) el.dataset._cbgPrevPe = el.style.pointerEvents || '';
-    el.style.pointerEvents = 'none';
-    if (!el.hasAttribute('aria-disabled')) {
-      el.dataset._cbgAria = '1';
-      el.setAttribute('aria-disabled','true');
+/* ---------- уведомления и диалоги (вместо alert / prompt / confirm) ---------- */
+const UI = {
+  toast(message, tone = 'info', ms = 3800){
+    let host = $('#toastHost');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'toastHost';
+      host.className = 'toast-host';
+      host.setAttribute('role', 'status');
+      host.setAttribute('aria-live', 'polite');
+      document.body.appendChild(host);
     }
-  }
-  function restoreEl(el){
-    if (!el) return;
-    try{
-      if (el.dataset._cbgPrevPe !== undefined){ el.style.pointerEvents = el.dataset._cbgPrevPe; }
-      if (el.dataset._cbgAria === '1'){ el.removeAttribute('aria-disabled'); }
-    }catch{}
-    delete el.dataset._cbgPrevPe;
-    delete el.dataset._cbgAria;
-  }
+    const el = document.createElement('div');
+    el.className = `toast ${tone}`;
+    el.textContent = message;
+    host.appendChild(el);
+    while (host.children.length > 3) host.firstElementChild.remove();
+    setTimeout(()=>{ el.remove(); }, ms);
+  },
 
-  // Патчим fetch один раз — только чтобы знать, когда запросы кнопки завершились.
-  if (!window.__originalFetch){
-    window.__originalFetch = window.fetch.bind(window);
-    window.fetch = function(input, init){
-      const el = inClickPhase ? pendingEl : null;
-      const p = window.__originalFetch(input, init); // сигнал НЕ подменяем — ничего не абортим
-      if (el){
-        busyCounts.set(el, (busyCounts.get(el) || 0) + 1);
-        disableEl(el);
-        p.finally(()=>{
-          const n = (busyCounts.get(el) || 1) - 1;
-          if (n <= 0){ busyCounts.delete(el); restoreEl(el); }
-          else { busyCounts.set(el, n); }
-        });
-      }
-      return p;
-    };
-  }
-
-  document.addEventListener('click', (e)=>{
-    try{
-      pendingEl = (e.target && e.target.closest('button, [role="button"], input[type="button"], input[type="submit"]')) || null;
-      inClickPhase = true;
-      queueMicrotask(()=>{ inClickPhase = false; pendingEl = null; });
-    }catch{ inClickPhase = false; pendingEl = null; }
-  }, true);
-})();
-
-/* ---------- client-side предмодерация (минимальная, но умная) ---------- */
-const BW_STEMS = ['бля','бляд','хуй','хуе','пизд','еб','ёб','сука','сук','мраз','гандон','пидор','пидр','чмо','урод','нахуй','нехуй','охуе','долбоёб','долбаёб','долбаеб','долбоеб'];
-const LAT2CYR = { a:'а',b:'в',c:'с',e:'е',h:'н',k:'к',m:'м',o:'о',p:'р',t:'т',x:'х',y:'у' };
-const LEET = { '0':'о','1':'i','3':'е','4':'а','5':'с','6':'б','7':'т','8':'в','9':'д' };
-function normBW(s){
-  let t = String(s||'').toLowerCase();
-  t = t.replace(/[0-9]/g, ch => LEET[ch] || ch).replace(/[a-z]/g, ch => LAT2CYR[ch] || ch);
-  t = t.replace(/[\s\.\,\-\_\*\+\=\!\?\(\)\[\]\{\}\/\\\|\'\"\:;@#\$%^&`~]+/g,'').replace(/(.)\1{2,}/g,'$1$1');
-  return t;
-}
-function hasBW(s){ const n=normBW(s); return BW_STEMS.some(st=>n.includes(st)); }
+  // Модальное окно. Возвращает Promise: true/строка — подтвердили, null/false — отмена.
+  _modal({ title, text = '', input = null, confirmText = 'OK', cancelText = 'Отмена', danger = false }){
+    return new Promise(resolve => {
+      const prevFocus = document.activeElement;
+      const backdrop = document.createElement('div');
+      backdrop.className = 'modal-backdrop';
+      backdrop.innerHTML = html`
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+          <h3 class="modal-title" id="modalTitle">${esc(title)}</h3>
+          ${text ? html`<p class="modal-text">${esc(text)}</p>` : ''}
+          ${input ? html`<textarea class="input" id="modalInput" rows="3" maxlength="${input.maxLength || 500}" placeholder="${escAttr(input.placeholder || '')}"></textarea>` : ''}
+          <div class="modal-actions">
+            <button type="button" class="btn outline" data-act="cancel">${esc(cancelText)}</button>
+            <button type="button" class="btn ${danger ? 'danger solid' : 'primary'}" data-act="ok">${esc(confirmText)}</button>
+          </div>
+        </div>`;
+      const field = input ? backdrop.querySelector('#modalInput') : null;
+      const finish = (value) => {
+        document.removeEventListener('keydown', onKey, true);
+        backdrop.remove();
+        try { prevFocus?.focus?.(); } catch {}
+        resolve(value);
+      };
+      const confirm = () => {
+        if (!field) return finish(true);
+        const v = field.value.trim();
+        if (input.required && !v) { field.focus(); field.classList.add('invalid'); return; }
+        finish(v);
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(field ? null : false); }
+        else if (e.key === 'Enter' && (!field || !e.shiftKey) && document.activeElement !== backdrop.querySelector('[data-act="cancel"]')) {
+          e.preventDefault(); confirm();
+        }
+      };
+      backdrop.addEventListener('click', (e) => {
+        if (e.target === backdrop) finish(field ? null : false);
+        const act = e.target.closest('[data-act]')?.dataset.act;
+        if (act === 'cancel') finish(field ? null : false);
+        if (act === 'ok') confirm();
+      });
+      document.addEventListener('keydown', onKey, true);
+      document.body.appendChild(backdrop);
+      (field || backdrop.querySelector('[data-act="ok"]')).focus();
+    });
+  },
+  confirm(opts){ return this._modal({ confirmText: 'Да', ...opts }); },
+  prompt(opts){ return this._modal({ ...opts, input: { placeholder: opts.placeholder, required: opts.required, maxLength: opts.maxLength } }); },
+};
 
 function makeLoggedOutState(){
   return {
-    loggedIn:false,
-    id:null,
-    email:null,
-    username:null,
-    display_name:null,
-    comment_count:0,
-    rating_count:0,
-    cast_likes:0,
-    cast_dislikes:0,
-    received_likes:0,
-    received_dislikes:0,
-    available_coins:0,
-    earned_coins:0,
-    spent_coins:0,
-    _isAdmin:false,
-    _isSuperAdmin:false,
-    _isBanned:false
+    loggedIn:false, id:null, email:null, username:null, display_name:null,
+    comment_count:0, rating_count:0, cast_likes:0, cast_dislikes:0,
+    received_likes:0, received_dislikes:0, available_coins:0, earned_coins:0, spent_coins:0,
+    _isAdmin:false, _isSuperAdmin:false, _isBanned:false
   };
 }
 
-/* ---------- auth (server-backed) ---------- */
+/* ---------- авторизация (состояние берётся с сервера) ---------- */
 const Auth = {
   _state: makeLoggedOutState(),
-  _logoutInProgress: false,
   _ready: false,
   _readyPromise: null,
-
-  _blankState(){ return makeLoggedOutState(); },
 
   get(){ return this._state; },
   set(o){
@@ -176,61 +187,64 @@ const Auth = {
     }
     this._state = merged;
     this.render();
-    this.renderProfilePopover(); // обновление поповера
+    this.renderProfilePopover();
+  },
+
+  // Единое применение пользователя из ответа сервера (/api/auth/me, /verify, /user/stats).
+  applyUser(u){
+    if (!u) return;
+    this.set({
+      loggedIn:true,
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      display_name: u.display_name || u.username || String(u.email || '').split('@')[0],
+      comment_count: Number(u.comment_count || 0),
+      rating_count: Number(u.rating_count || 0),
+      cast_likes: Number(u.cast_likes || 0),
+      cast_dislikes: Number(u.cast_dislikes || 0),
+      received_likes: Number(u.received_likes || 0),
+      received_dislikes: Number(u.received_dislikes || 0),
+      available_coins: Number(u.available_coins ?? coinsOf(u)),
+      earned_coins: Number(u.earned_coins ?? 0),
+      spent_coins: Number(u.spent_coins ?? 0),
+      _isAdmin: !!u.is_admin,
+      _isSuperAdmin: !!u.is_super_admin,
+      _isBanned: !!u.is_banned
+    });
+  },
+
+  // Сессия закончилась на сервере (истекла, вход с другого устройства, отзыв):
+  // сбрасываем состояние и, если пользователь был внутри, показываем экран входа.
+  _dropSession(){
+    const wasLoggedIn = this.isLogged();
+    this.set(makeLoggedOutState());
+    App.resetUserScopedState();
+    if (wasLoggedIn) {
+      UI.toast('Сессия завершилась — войдите снова.', 'warn');
+      Router.match();
+    }
   },
 
   async me(){
     let r = null;
-    try{
-      r = await fetch('/api/auth/me', { cache: 'no-store' });
-    }catch{
-      this._ready = true;
-      return;
-    }
+    try{ r = await fetch('/api/auth/me', { cache: 'no-store' }); }
+    catch{ this._ready = true; return; }
 
-    if (r.status === 401) {
-      this.set(this._blankState());
-      this._ready = true;
-      return;
-    }
-
-    if (!r.ok) {
-      this._ready = true;
-      return;
-    }
+    if (r.status === 401) { this._dropSession(); this._ready = true; return; }
+    if (!r.ok) { this._ready = true; return; }
 
     let j = null;
-    try{
-      j = await r.json();
-    }catch{
-      this._ready = true;
-      return;
-    }
+    try{ j = await r.json(); }catch{ this._ready = true; return; }
 
     if (j?.loggedIn){
-      this.set({
-        loggedIn:true,
-        id: j.user.id,
-        email: j.user.email,
-        username: j.user.username,
-        display_name: j.user.display_name || j.user.username || j.user.email.split('@')[0],
-        comment_count: j.user.comment_count,
-        rating_count: j.user.rating_count,
-        cast_likes: j.user.cast_likes||0,
-        cast_dislikes: j.user.cast_dislikes||0,
-        received_likes: j.user.received_likes||0,
-        received_dislikes: j.user.received_dislikes||0,
-        available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
-        earned_coins: Number(j.user.earned_coins ?? 0),
-        spent_coins: Number(j.user.spent_coins ?? 0),
-        _isAdmin: !!j.user.is_admin,
-        _isSuperAdmin: !!j.user.is_super_admin,
-        _isBanned: !!j.user.is_banned
-      });
+      const wasBanned = this._state._isBanned;
+      this.applyUser(j.user);
+      // Бан/разбан, пришедший при фоновой сверке, — перерисовываем текущий экран.
+      if (wasBanned !== this._state._isBanned) Router.match();
     }else if (j && j.loggedIn === false){
-      this.set(this._blankState());
+      this._dropSession();
     }
-
     this._ready = true;
   },
 
@@ -245,235 +259,181 @@ const Auth = {
     return this._readyPromise;
   },
 
-  login(){ Router.go('/login'); },
-
   async logout(){
     try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
-    const wasLoggedIn = !!this._state.loggedIn;
-    this.set(this._blankState());
-    if (wasLoggedIn) window.Router?.match();
+    const wasLoggedIn = this.isLogged();
+    this.set(makeLoggedOutState());
+    App.resetUserScopedState();
+    if (wasLoggedIn) Router.go('/login', { replace:true });
   },
 
-  async handleUnauthorized(reason = ''){
-    if (this._logoutInProgress) return;
-    const wasLoggedIn = !!this._state.loggedIn;
-    this._logoutInProgress = true;
-    try{
-      if (wasLoggedIn) {
-        try{ await fetch('/api/auth/logout',{method:'POST'}); }catch{}
-      }
-    }finally{
-      this._logoutInProgress = false;
-    }
-    this.set(this._blankState());
-    if (wasLoggedIn) window.Router?.match();
+  // Любой 401 от API: сессия уже недействительна на сервере.
+  handleUnauthorized(){
+    if (this.isLogged()) this._dropSession();
+  },
+
+  // 403 banned от API: аккаунт заблокирован — обновляем состояние и экран.
+  markBanned(){
+    if (this._state._isBanned) return;
+    this.set({ _isBanned: true });
+    UI.toast('Ваш аккаунт заблокирован за нарушение правил.', 'error', 6000);
+    Router.match();
   },
 
   isLogged(){ return !!this._state.loggedIn; },
 
   render(){
-  const loginBtn=$('#loginBtn'), userBadge=$('#userBadge');
-  const adminLink=$('#adminLink');
-  const shopLink=$('#shopLink'); // ← эта строка должна быть
+    const userBadge = $('#userBadge');
+    const adminLink = $('#adminLink'), shopLink = $('#shopLink');
+    const logged = this.isLogged();
 
-  if(this.isLogged()){
-    loginBtn?.classList.add('hidden');
-    userBadge?.classList.remove('hidden');
+    userBadge?.classList.toggle('hidden', !logged);
+    // Админка — только администраторам; магазин — всем, кроме заблокированных.
+    adminLink?.classList.toggle('hidden', !(logged && this._state._isAdmin));
+    shopLink?.classList.toggle('hidden', !(logged && !this._state._isBanned));
 
-    if (userBadge){
+    if (logged && userBadge) {
       const nick = this._state.display_name || (this._state.username || this._state.email || 'Student').split('@')[0] || 'Student';
       userBadge.textContent = nick;
+      userBadge.title = `${nick} — аккаунт`;
     }
+  },
 
-    // Админка показывается только администраторам
-    if (this._state._isAdmin) adminLink?.classList.remove('hidden');
-    else adminLink?.classList.add('hidden');
-
-    // ↓↓↓ ВАЖНО: Магазин должен показываться всем авторизованным ↓↓↓
-    if (!this._state._isBanned) {
-      shopLink?.classList.remove('hidden');
-    } else {
-      shopLink?.classList.add('hidden');
-    }
-    // ↑↑↑ ВАЖНО: Магазин должен показываться всем авторизованным ↑↑↑
-
-  }else{
-    loginBtn?.classList.remove('hidden');
-    userBadge?.classList.add('hidden');
-    adminLink?.classList.add('hidden');
-    shopLink?.classList.add('hidden');
-  }
-    },
-
+  // При смене версии фронтенда сбрасываем закэшированный список учителей.
   migrate(){
-    const vkey='letotalks:version'; const old=localStorage.getItem(vkey);
-    if (old!==APP_VERSION){ localStorage.setItem(vkey, APP_VERSION); }
+    try {
+      const vkey = 'letotalks:version';
+      if (localStorage.getItem(vkey) !== APP_VERSION) {
+        clearTeacherCacheInStorage();
+        localStorage.setItem(vkey, APP_VERSION);
+      }
+    } catch { /* localStorage недоступен (приватный режим) — не критично */ }
   },
 
   async refreshStatsAndPopover(){
     if (!this.isLogged()) return;
-    try{
-      const r = await fetch('/api/user/stats');
-      const j = await r.json();
-      if (j.ok){
-        this.set({
-          comment_count: j.user.comment_count,
-          rating_count: j.user.rating_count,
-          cast_likes: j.user.cast_likes,
-          cast_dislikes: j.user.cast_dislikes,
-          received_likes: j.user.received_likes,
-          received_dislikes: j.user.received_dislikes,
-          display_name: j.user.display_name || this._state.display_name,
-          available_coins: Number(j.user.available_coins ?? coinsOf(j.user)),
-          earned_coins: Number(j.user.earned_coins ?? 0),
-          spent_coins: Number(j.user.spent_coins ?? 0)
-        });
-      }
-    }catch{}
+    const j = await apiFetch('/api/user/stats');
+    if (!j.ok || !j.user || !this.isLogged()) return;
+    this.applyUser(j.user);
   },
 
-  // --- поповер профиля при ховере на бейдже
+  // --- поповер аккаунта: наведение на ПК, тап/клик и клавиатура — везде.
   renderProfilePopover(){
+    const pop = this._ensurePopover();
+    if (pop && !pop.classList.contains('hidden')) this._fillPopover(pop);
+  },
+
+  _fillPopover(pop){
+    const u = this._state;
+    const nick = u.display_name || (u.username||u.email||'Student').split('@')[0]||'Student';
+    const coins = coinsOf(u);
+    const earned = Number(u.earned_coins || 0);
+    const spent = Number(u.spent_coins || 0);
+    pop.innerHTML = html`
+      <div class="popover-head">
+        <div class="tname" title="${escAttr(nick)}">${esc(nick)}</div>
+        <div class="coin-pill" title="Доступно coins">${coins} coins</div>
+      </div>
+      <div class="muted popover-email">${esc(u.email || '')}</div>
+      ${u._isBanned ? '<div class="notice danger" style="margin-top:10px">Аккаунт заблокирован</div>' : ''}
+      <div class="hr"></div>
+      <ul class="stats">
+        <li>Заработано: <b>${earned}</b>, потрачено: <b>${spent}</b></li>
+        <li>Отзывов: <b>${u.comment_count||0}</b> <span class="muted">(+5 за каждый)</span></li>
+        <li>Оценок по критериям: <b>${u.rating_count||0}</b> <span class="muted">(+1 за каждую)</span></li>
+        <li>Реакции на ваши отзывы: 👍 <b>${u.received_likes||0}</b> · 👎 <b>${u.received_dislikes||0}</b> <span class="muted">(±1)</span></li>
+        <li>Вы поставили: 👍 <b>${u.cast_likes||0}</b> · 👎 <b>${u.cast_dislikes||0}</b></li>
+      </ul>
+      <div class="popover-actions">
+        ${u._isBanned ? '' : '<a class="btn small outline" href="#/shop">Магазин ников</a>'}
+        <button class="btn small danger" id="popoverLogout" type="button">Выйти</button>
+      </div>
+    `;
+  },
+
+  _ensurePopover(){
     const badge = $('#userBadge');
+    if (!badge) return null;
     let pop = $('#userPopover');
-    if (!badge) return;
-    if (!pop){
-      pop = document.createElement('div');
-      pop.id = 'userPopover';
-      pop.className = 'popover hidden';
-      document.body.appendChild(pop);
-    }
-    const updateContent = ()=>{
-      const u = this._state;
-      const nick = u.display_name || (u.username||u.email||'Student').split('@')[0]||'Student';
-      const coins = coinsOf(u);
-      const earned = typeof u.earned_coins === 'number' ? Number(u.earned_coins) : coins + Number(u.spent_coins||0);
-      const spent = typeof u.spent_coins === 'number' ? Number(u.spent_coins) : Math.max(0, earned - coins);
-      pop.innerHTML = `
-        <div class="popover-inner">
-          <div class="row space-between" style="margin-bottom:6px">
-            <div class="tname">@${esc(nick)}</div>
-            <div class="badge">${coins} coins</div>
-          </div>
-          <div class="muted" style="margin-bottom:6px">${esc(u.email || '')}</div>
-          <div class="hr"></div>
-          <ul class="stats">
-            <li>Заработано: <b>${earned}</b> coins</li>
-            <li>Потрачено: <b>${spent}</b> coins</li>
-            <li>Комментарии: <b>${u.comment_count||0}</b> (×5 coins)</li>
-            <li>Оценки по критериям: <b>${u.rating_count||0}</b> (×1 coin)</li>
-            <li>Поставил лайков: <b>${u.cast_likes||0}</b>, дизлайков: <b>${u.cast_dislikes||0}</b></li>
-            <li>Получил на своих комментариях: 👍 <b>${u.received_likes||0}</b>, 👎 <b>${u.received_dislikes||0}</b></li>
-          </ul>
-          <div class="hr"></div>
-          <div class="muted" style="font-size:12px;margin-bottom:8px">Лайки/дизлайки учитываются только на ваших комментариях.</div>
-          <button class="btn small outline" id="popoverLogout" type="button" style="width:100%">Выйти</button>
-        </div>
-      `;
-    };
-    updateContent();
+    if (pop) return pop;
 
-    // «Выйти» внутри оверлея (innerHTML пересобирается — вешаем делегированно, один раз).
-    if (!pop.__logoutBound) {
-      pop.__logoutBound = true;
-      pop.addEventListener('click', (e)=>{
-        if (e.target.closest('#popoverLogout')) { pop.classList.add('hidden'); Auth.logout(); }
-      });
-    }
+    pop = document.createElement('div');
+    pop.id = 'userPopover';
+    pop.className = 'popover hidden';
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', 'Аккаунт');
+    document.body.appendChild(pop);
 
-    let hover = false;
-    let hideTimer = null;
+    // Состояние и обработчики создаются ОДИН раз.
+    const st = { hover: false, pinned: false, hideTimer: null };
+    const canHover = !!window.matchMedia?.('(hover: hover) and (pointer: fine)').matches;
 
-    function positionPopover(){
+    const position = ()=>{
       const r = badge.getBoundingClientRect();
-      const popWidth = pop.offsetWidth || 320;
+      const popWidth = pop.offsetWidth || 330;
       const viewportW = document.documentElement.clientWidth;
-      // Иконка аккаунта справа -> прижимаем поповер к её правому краю и держим
-      // внутри вьюпорта (иначе он вылезает за правый край экрана).
       let left = window.scrollX + r.right - popWidth;
-      const minLeft = window.scrollX + 8;
-      const maxLeft = window.scrollX + viewportW - popWidth - 8;
-      left = Math.max(minLeft, Math.min(left, maxLeft));
+      left = Math.max(window.scrollX + 8, Math.min(left, window.scrollX + viewportW - popWidth - 8));
       pop.style.left = Math.round(left) + 'px';
       pop.style.top  = Math.round(window.scrollY + r.bottom + 8) + 'px';
-    }
-    function show(){
+    };
+    const show = ()=>{
       if (!Auth.isLogged()) return;
-      updateContent();
-      positionPopover();
+      this._fillPopover(pop);
       pop.classList.remove('hidden');
-    }
-    function scheduleHide(){
-      if (hideTimer) clearTimeout(hideTimer);
-      hideTimer = setTimeout(()=>{ if(!hover) pop.classList.add('hidden'); }, 140);
-    }
+      position();
+      badge.setAttribute('aria-expanded', 'true');
+    };
+    const hide = ()=>{
+      clearTimeout(st.hideTimer);
+      st.pinned = false;
+      pop.classList.add('hidden');
+      badge.setAttribute('aria-expanded', 'false');
+    };
+    const scheduleHide = ()=>{
+      clearTimeout(st.hideTimer);
+      st.hideTimer = setTimeout(()=>{ if (!st.hover && !st.pinned) hide(); }, 180);
+    };
+    const isOpen = ()=> !pop.classList.contains('hidden');
 
-    badge.onmouseenter = async ()=>{
-      await Auth.refreshStatsAndPopover();
-      positionPopover();
-      hover = true; show();
-    };
-    badge.onmouseleave = ()=>{
-      hover = false; scheduleHide();
-    };
-    pop.onmouseenter = ()=>{
-      hover = true; if (hideTimer) clearTimeout(hideTimer);
-    };
-    pop.onmouseleave = ()=>{
-      hover = false; scheduleHide();
-    };
-    // Слушатели scroll/resize вешаем ОДИН раз; актуальную функцию позиционирования
-    // храним на window, чтобы не накапливать обработчики при каждом ре-рендере.
-    window.__ltPositionPopover = positionPopover;
-    if (!window.__ltPopoverReflowBound) {
-      window.__ltPopoverReflowBound = true;
-      const reflow = ()=>{ const p=$('#userPopover'); if(p && !p.classList.contains('hidden') && window.__ltPositionPopover) window.__ltPositionPopover(); };
-      window.addEventListener('scroll', reflow, {passive:true});
-      window.addEventListener('resize', reflow);
+    if (canHover) {
+      badge.addEventListener('mouseenter', ()=>{
+        st.hover = true; clearTimeout(st.hideTimer);
+        if (!isOpen()) { show(); Auth.refreshStatsAndPopover(); }
+      });
+      badge.addEventListener('mouseleave', ()=>{ st.hover = false; scheduleHide(); });
+      pop.addEventListener('mouseenter', ()=>{ st.hover = true; clearTimeout(st.hideTimer); });
+      pop.addEventListener('mouseleave', ()=>{ st.hover = false; scheduleHide(); });
     }
+    badge.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      if (!isOpen()) { st.pinned = true; show(); Auth.refreshStatsAndPopover(); }
+      else if (canHover && !st.pinned) st.pinned = true; // открыт наведением — клик закрепляет
+      else hide();
+    });
+    pop.addEventListener('click', (e)=>{
+      if (e.target.closest('#popoverLogout')) { hide(); Auth.logout(); return; }
+      if (e.target.closest('a[href^="#/"]')) hide();
+    });
+    document.addEventListener('click', (e)=>{
+      if (isOpen() && !e.target.closest('#userPopover, #userBadge')) hide();
+    });
+    document.addEventListener('keydown', (e)=>{
+      if (e.key === 'Escape' && isOpen()) { hide(); badge.focus(); }
+    });
+    window.addEventListener('scroll', ()=>{ if (isOpen()) position(); }, { passive: true });
+    window.addEventListener('resize', ()=>{ if (isOpen()) position(); });
+    window.addEventListener('hashchange', hide);
+    return pop;
   }
 };
 
-// Глобально отслеживаем ответы сервера с признаком "unauthorized"
-(function setupUnauthorizedWatcher(){
-  if (typeof window === 'undefined') return;
-  if (window.__ltAuthWatcherInstalled) return;
-  window.__ltAuthWatcherInstalled = true;
-
-  function watchUnauthorized(res){
-    if (!res) return;
-    // Ошибки самого процесса входа (неверный код и т.п.) не считаем «разлогином».
-    if (res.url && /\/api\/auth\//.test(res.url)) return;
-    if (res.status === 401){
-      Auth.handleUnauthorized('status_401');
-      return;
-    }
-    const ct = res.headers?.get ? (res.headers.get('content-type') || '') : '';
-    if (!ct.includes('application/json')) return;
-    try{
-      res.clone().json().then(payload=>{
-        if (payload && payload.error === 'unauthorized'){
-          Auth.handleUnauthorized('payload_unauthorized');
-        }
-      }).catch(()=>{});
-    }catch{}
-  }
-
-  const prevFetch = window.fetch.bind(window);
-  window.fetch = async (...args)=>{
-    const response = await prevFetch(...args);
-    try{ watchUnauthorized(response); }catch{}
-    return response;
-  };
-})();
-
-/* ---------- api ---------- */
+/* ---------- кэш списка учителей ---------- */
 const TEACHERS_CACHE_KEY = 'letotalks:cache:teachers';
-const TEACHERS_CACHE_TTL = 1000 * 60 * 3; // 3 minutes — balance freshness vs load
+const TEACHERS_CACHE_TTL = 1000 * 60 * 3; // 3 минуты — баланс свежести и нагрузки
 const teacherCacheState = { data: null, ts: 0, promise: null };
 
 function readTeacherCacheFromStorage() {
-  if (typeof localStorage === 'undefined') return null;
   try {
     const raw = localStorage.getItem(TEACHERS_CACHE_KEY);
     if (!raw) return null;
@@ -486,27 +446,16 @@ function readTeacherCacheFromStorage() {
     return null;
   }
 }
-
 function writeTeacherCacheToStorage(data, ts) {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(TEACHERS_CACHE_KEY, JSON.stringify({ data, ts }));
-  } catch {
-    /* ignore quota errors */
-  }
+  try { localStorage.setItem(TEACHERS_CACHE_KEY, JSON.stringify({ data, ts })); } catch { /* квота */ }
 }
-
 function clearTeacherCacheInStorage() {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.removeItem(TEACHERS_CACHE_KEY);
-  } catch {
-    /* ignore */
-  }
+  try { localStorage.removeItem(TEACHERS_CACHE_KEY); } catch { /* ignore */ }
 }
 
 // Единая обёртка над fetch: всегда возвращает объект (не бросает), безопасно
 // парсит JSON, нормализует ok по HTTP-статусу. Сетевые ошибки -> {ok:false,...}.
+// Здесь же централизованно реагируем на 401 (сессия умерла) и 403 banned.
 async function apiFetch(url, opts) {
   let r;
   try {
@@ -517,11 +466,38 @@ async function apiFetch(url, opts) {
   }
   let data = null;
   try { data = await r.json(); } catch { data = null; }
-  if (data === null || typeof data !== 'object') data = {};
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    // Не-JSON ответ (прокси, HTML-страница ошибки): ставим понятный код ошибки.
+    data = r.ok ? {} : { error: r.status === 429 ? 'rate_limited' : `http_${r.status}` };
+  }
   if (!('ok' in data)) data.ok = r.ok;
   else if (!r.ok) data.ok = false;
   data._status = r.status;
+
+  const isAuthCall = /\/api\/auth\//.test(String(url));
+  if (r.status === 401 && !isAuthCall) Auth.handleUnauthorized();
+  if (r.status === 403 && data.error === 'banned') Auth.markBanned();
   return data;
+}
+const postJson = (url, body) => apiFetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
+
+// Понятные тексты для кодов ошибок сервера.
+function errorText(res, fallback = 'Что-то пошло не так. Попробуйте ещё раз.'){
+  const code = res?.error;
+  const map = {
+    network_error: 'Нет соединения с сервером. Проверьте интернет.',
+    rate_limited: res?.message || 'Слишком много запросов. Подождите немного.',
+    unauthorized: 'Сессия завершилась — войдите снова.',
+    banned: 'Ваш аккаунт заблокирован за нарушение правил.',
+    forbidden: 'Недостаточно прав для этого действия.',
+    not_found: 'Не найдено — возможно, уже удалено.',
+    comment_not_found: 'Отзыв не найден — возможно, уже удалён.',
+    teacher_not_found: 'Учитель не найден.',
+    telegram_not_configured: 'Сервис модерации временно недоступен. Попробуйте позже.',
+    telegram_failed: 'Не удалось связаться с модераторами. Попробуйте позже.',
+    server_error: 'Ошибка на сервере. Попробуйте позже.',
+  };
+  return map[code] || fallback;
 }
 
 async function fetchTeachersFromServer() {
@@ -530,46 +506,38 @@ async function fetchTeachersFromServer() {
   return Array.isArray(jr?.teachers) ? jr.teachers : [];
 }
 
-const API = {
-  async departments(){ const d = await apiFetch('/api/departments'); return Array.isArray(d.departments) ? d.departments : []; },
+const DEPARTMENTS_TTL = 5 * 60 * 1000;
+const departmentsCache = { list: null, ts: 0 };
 
-  /**
-   * Лёгкий запрос для главной страницы.
-   * Возвращает только минимально необходимый набор:
-   *  - top-3 по каждой характеристике
-   *  - top-3 по каждой кафедре
-   * Это позволяет не тянуть весь список учителей при первом посещении.
-   *
-   * @returns {Promise<{characteristics: Object<string, any[]>, departments: {name:string, list:any[]}[]}>}
-   */
+const API = {
+  // Кафедры меняются редко — держим их в памяти, а не запрашиваем на каждой странице.
+  async departments({ force = false } = {}){
+    if (!force && departmentsCache.list && Date.now() - departmentsCache.ts < DEPARTMENTS_TTL) return departmentsCache.list;
+    const d = await apiFetch('/api/departments');
+    if (!d.ok) return departmentsCache.list || [];
+    departmentsCache.list = Array.isArray(d.departments) ? d.departments : [];
+    departmentsCache.ts = Date.now();
+    return departmentsCache.list;
+  },
+
+  // Лёгкий запрос для главной: топ-3 по каждой характеристике и по каждой кафедре.
   async home(){
     const d = await apiFetch('/api/home', { headers: { 'Cache-Control': 'no-cache' } });
     if (!d.ok) throw new Error('home_fetch_failed');
-    return d; // { characteristics: {key:[]}, departments: [{name,list:[]}] }
+    return d;
   },
 
-  /**
-   * Пагинированная выборка учителей.
-   * Используется для страницы «Все учителя» и аналогичных лент с бесконечной подгрузкой.
-   *
-   * @param {Object} [opts]
-   * @param {number} [opts.limit=30] - размер страницы (макс. 200 на сервере)
-   * @param {number} [opts.offset=0] - смещение
-   * @param {string} [opts.q=''] - строка поиска по ФИО
-   * @param {string} [opts.department=''] - фильтр по кафедре (точное совпадение)
-   * @returns {Promise<{teachers:any[], total:number}>}
-   */
-  async teachersPage({ limit = 30, offset = 0, q = '', department = '' } = {}){
+  // Страница «Все учителя» с подгрузкой порциями.
+  async teachersPage({ limit = 30, offset = 0 } = {}){
     const p = new URLSearchParams();
     if (limit) p.set('limit', String(limit));
     if (offset) p.set('offset', String(offset));
-    if (q) p.set('q', String(q));
-    if (department) p.set('department', String(department));
     const j = await apiFetch(`/api/teachers?${p.toString()}`, { headers: { 'Cache-Control': 'no-cache' } });
     if (!j.ok) throw new Error('teachers_page_fetch_failed');
     return { teachers: Array.isArray(j?.teachers) ? j.teachers : [], total: Number(j?.total||0) };
   },
 
+  // Полный список (для топов, кафедр и поиска): память -> localStorage -> сервер.
   async teachers(options = {}){
     const { force = false } = options;
     const now = Date.now();
@@ -577,28 +545,19 @@ const API = {
     if (!force && teacherCacheState.data && (now - teacherCacheState.ts) < TEACHERS_CACHE_TTL) {
       return teacherCacheState.data;
     }
-
     if (!force && (!teacherCacheState.data || !teacherCacheState.data.length)) {
       const stored = readTeacherCacheFromStorage();
       if (stored && Array.isArray(stored.data)) {
         teacherCacheState.data = stored.data;
         teacherCacheState.ts = stored.ts || 0;
-        if ((now - teacherCacheState.ts) < TEACHERS_CACHE_TTL) {
-          return teacherCacheState.data;
-        }
-        if (!teacherCacheState.promise) {
-          API.teachers({ force: true }).catch(()=>{});
-        }
+        if ((now - teacherCacheState.ts) < TEACHERS_CACHE_TTL) return teacherCacheState.data;
+        if (!teacherCacheState.promise) API.teachers({ force: true }).catch(()=>{});
         return teacherCacheState.data;
       }
     }
+    if (!force && teacherCacheState.promise) return teacherCacheState.promise;
 
-    if (!force && teacherCacheState.promise) {
-      return teacherCacheState.promise;
-    }
-
-    let fetchPromise;
-    fetchPromise = (async () => {
+    const fetchPromise = (async () => {
       try {
         const teachers = await fetchTeachersFromServer();
         teacherCacheState.data = teachers;
@@ -606,23 +565,12 @@ const API = {
         writeTeacherCacheToStorage(teachers, teacherCacheState.ts);
         return teachers;
       } catch (err) {
-        if (!force && teacherCacheState.data && teacherCacheState.data.length) {
-          return teacherCacheState.data;
-        }
-        const stored = readTeacherCacheFromStorage();
-        if (stored && Array.isArray(stored.data) && stored.data.length) {
-          teacherCacheState.data = stored.data;
-          teacherCacheState.ts = stored.ts || 0;
-          return stored.data;
-        }
+        if (teacherCacheState.data && teacherCacheState.data.length) return teacherCacheState.data;
         throw err;
       } finally {
-        if (teacherCacheState.promise === fetchPromise) {
-          teacherCacheState.promise = null;
-        }
+        if (teacherCacheState.promise === fetchPromise) teacherCacheState.promise = null;
       }
     })();
-
     teacherCacheState.promise = fetchPromise;
     return fetchPromise;
   },
@@ -632,107 +580,108 @@ const API = {
     teacherCacheState.promise = null;
     clearTeacherCacheInStorage();
   },
-  async teacher(id){
-    return await apiFetch(`/api/teacher/${encodeURIComponent(id)}`, {
-      cache: 'no-store',
-      headers: { 'Cache-Control': 'no-cache' }
-    });
+  teacher(id){
+    return apiFetch(`/api/teacher/${encodeURIComponent(id)}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
   },
-  async publish({teacherId, text, ratings, author}) {
-    const data = await apiFetch('/api/comment-with-ratings', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ teacherId, text, ratings, author })
-    });
-    if (!data.ok) {
-      const err = new Error(data.message || data.error || 'publish_failed');
-      err.code = data.error;
-      if (data.reason) err.reason = data.reason;
-      if (data.score != null) err.score = data.score;
-      if (data.retry_after_ms != null) err.retry_after_ms = data.retry_after_ms;
-      throw err;
-    }
-    return data;
-  },
-  async voteComment({commentId, vote}){ // vote: 'like' | 'dislike' | 'none'
-    return await apiFetch('/api/comment/vote', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ commentId, vote })
-    });
-  },
-  async myStats(){ return await apiFetch('/api/user/stats'); },
-  async teacherRequest(formData){
-    const data = await apiFetch('/api/teacher-request', { method: 'POST', body: formData });
-    if (!data.ok) {
-      const err = new Error(data.error || 'teacher_request_failed');
-      err.response = data;
-      err.status = data._status;
-      throw err;
-    }
-    return data;
-  },
+  publish({ teacherId, text, ratings }){ return postJson('/api/comment-with-ratings', { teacherId, text, ratings }); },
+  voteComment({ commentId, vote }){ return postJson('/api/comment/vote', { commentId, vote }); }, // vote: like | dislike | none
+  deleteOwnComment(commentId){ return postJson('/api/comment/delete', { commentId }); },
+  reportComment(commentId, reason){ return postJson('/api/report-comment', { commentId, reason }); },
+  teacherRequest(formData){ return apiFetch('/api/teacher-request', { method: 'POST', body: formData }); },
 
   // --- admin ---
-  _post(url, body){ return apiFetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); },
-  async adminComments(limit=100){ return apiFetch(`/api/admin/comments?limit=${encodeURIComponent(limit)}`); },
-  async adminCommenters(){ return apiFetch('/api/admin/commenters'); },
-  async adminCommentsByUser(userId){ return apiFetch('/api/admin/comments/by-user?userId='+encodeURIComponent(userId)); },
-  async adminDeleteComment(id){ return this._post('/api/admin/comment/delete', { commentId:id }); },
-  async adminFindUser(email){ return apiFetch('/api/admin/user/find?email='+encodeURIComponent(email)); },
-  async adminUsers(){ return apiFetch('/api/admin/users'); },
-  async adminBanUser({email,userId,banned,reason}){ return this._post('/api/admin/user/ban', {email,userId,banned,reason}); },
-  async adminTeachers(){ return apiFetch('/api/admin/teachers'); },
-  async adminUpsertTeacher(payload){ return this._post('/api/admin/teacher/upsert', payload); },
-  async adminDeleteTeacher(id){ return this._post('/api/admin/teacher/delete', {id}); },
-  async adminListAdmins(){ return apiFetch('/api/admin/admins'); },
-  async adminAddAdmin(email){ return this._post('/api/admin/admins/add', {email}); },
-  async adminRemoveAdmin(email){ return this._post('/api/admin/admins/remove', {email}); },
+  adminRecentComments(limit=100){ return apiFetch(`/api/admin/comments?limit=${encodeURIComponent(limit)}`); },
+  adminCommenters(){ return apiFetch('/api/admin/commenters'); },
+  adminCommentsByUser(userId){ return apiFetch('/api/admin/comments/by-user?userId='+encodeURIComponent(userId)); },
+  adminDeleteComment(id){ return postJson('/api/admin/comment/delete', { commentId:id }); },
+  adminUsers(){ return apiFetch('/api/admin/users'); },
+  adminBanUser({ userId, banned, reason }){ return postJson('/api/admin/user/ban', { userId, banned, reason }); },
+  adminTeachers(){ return apiFetch('/api/admin/teachers'); },
+  adminUpsertTeacher(payload){ return postJson('/api/admin/teacher/upsert', payload); },
+  adminDeleteTeacher(id){ return postJson('/api/admin/teacher/delete', { id }); },
+  adminUploadTeacherPhoto(formData){ return apiFetch('/api/admin/teacher/photo', { method:'POST', body: formData }); },
+  adminListAdmins(){ return apiFetch('/api/admin/admins'); },
+  adminAddAdmin(email){ return postJson('/api/admin/admins/add', { email }); },
+  adminRemoveAdmin(email){ return postJson('/api/admin/admins/remove', { email }); },
 };
 
-/* ---------- router ---------- */
+/* ---------- роутер (hash) ---------- */
+const RETURN_TO_KEY = 'letotalks:returnTo';
 const Router = {
   routes: [],
+  // Номер текущей навигации. Вьюха запоминает его в начале и после каждого await
+  // проверяет isStale(): если пользователь уже ушёл на другую страницу (или его
+  // разлогинило), устаревший рендер не должен затирать новый экран.
+  seq: 0,
+  navCount: 0,
   add(p,h){ this.routes.push({pattern:p, handler:h}); },
+  isStale(seq){ return seq !== this.seq; },
   scrollTop(){
     try { window.scrollTo({ top: 0, left: 0, behavior: 'auto' }); }
     catch { window.scrollTo(0,0); }
-    document.getElementById('app')?.scrollIntoView({ block: 'start' });
   },
-  go(p){
-    if (location.hash.slice(1) !== p) location.hash = p;
+  // replace: true — перенаправление без новой записи в истории (иначе «Назад»
+  // возвращал на /login и тут же уводил обратно — ловушка).
+  go(p, { replace = false } = {}){
+    if (location.hash.slice(1) !== p) {
+      if (replace) {
+        history.replaceState(null, '', `#${p}`);
+        this.scrollTop();
+        this.match();
+      } else {
+        location.hash = p; // match() вызовет обработчик hashchange
+      }
+      return;
+    }
     this.scrollTop();
     this.match();
   },
-  goHome(){ this.go('/'); },
+  // «Назад» внутри приложения; если страницу открыли по прямой ссылке — на главную.
+  back(){
+    if (this.navCount > 1) history.back();
+    else this.go('/');
+  },
+  rememberReturnTo(h){
+    try { if (h && h !== '/' && !h.startsWith('/login')) sessionStorage.setItem(RETURN_TO_KEY, h); } catch {}
+  },
+  takeReturnTo(){
+    try {
+      const v = sessionStorage.getItem(RETURN_TO_KEY);
+      sessionStorage.removeItem(RETURN_TO_KEY);
+      return v && v.startsWith('/') && !v.startsWith('/login') ? v : null;
+    } catch { return null; }
+  },
 
   async match(){
+    const seq = ++this.seq;
     await Auth.ensure();
+    if (this.isStale(seq)) return;
     const h = location.hash.slice(1) || '/';
-    let pathName = h;
-    try{
-      const navUrl = new URL(h.startsWith('/') ? h : `/${h}`, location.origin);
-      pathName = navUrl.pathname || h;
-    }catch{
-      pathName = h.split('?')[0] || h;
-    }
+    const pathName = h.split('?')[0] || '/';
     const isLoginRoute = pathName === '/login';
-    // Жёсткая блокировка: незалогиненный видит ТОЛЬКО экран входа (на весь экран),
-    // ни на одну другую страницу попасть нельзя. Класс lockout скрывает навбар/футер.
+    // Жёсткая блокировка: незалогиненный видит ТОЛЬКО экран входа.
     if (!Auth.isLogged()) {
       document.body.classList.add('lockout');
-      if (!isLoginRoute) { this.go('/login'); return; }
-      await App.viewLogin();
+      if (!isLoginRoute) {
+        this.rememberReturnTo(h); // вернём туда после входа (например, ссылка на учителя)
+        this.go('/login', { replace:true });
+        return;
+      }
+      App.viewLogin();
       return;
     }
     document.body.classList.remove('lockout');
     if (isLoginRoute) {
-      this.go('/');
+      this.go(this.takeReturnTo() || '/', { replace:true });
       return;
     }
+    this.navCount++;
     for (const r of this.routes) {
       const m = h.match(r.pattern);
       if (m) { await r.handler(...m); return; }
     }
-    await App.viewHome();
+    // Неизвестный адрес — на главную.
+    this.go('/', { replace:true });
   },
   init(){
     addEventListener('hashchange', ()=>{
@@ -744,108 +693,113 @@ const Router = {
   }
 };
 
-/* ---------- app ---------- */
+/* ---------- приложение ---------- */
 const App = {
   ALL_TEACHERS: [],
+
+  // Всё, что относится к конкретному пользователю, — сбрасываем при выходе.
+  resetUserScopedState(){
+    this._lastCommentNotice = null;
+    clearTeacherCacheInStorage();
+  },
 
   async getTeachers(options = {}){
     try{
       const list = await API.teachers(options);
-      const normalized = Array.isArray(list) ? list : [];
-      this.ALL_TEACHERS = normalized;
-      return normalized;
+      this.ALL_TEACHERS = Array.isArray(list) ? list : [];
+      return this.ALL_TEACHERS;
     }catch(err){
       console.warn('[App] Не удалось загрузить список учителей', err);
-      return Array.isArray(this.ALL_TEACHERS) ? this.ALL_TEACHERS : [];
+      return null; // null = ошибка загрузки (в отличие от пустого списка)
     }
   },
 
   invalidateTeachers(){
     this.ALL_TEACHERS = [];
-    if (API && typeof API.invalidateTeachersCache === 'function') {
-      API.invalidateTeachersCache();
-    }
+    API.invalidateTeachersCache();
   },
 
-  /**
-   * Список кафедр берём напрямую с сервера,
-   * чтобы не требовать предварительной загрузки всех учителей.
-   */
   async getDepartments(){
-    try{
-      const list = await API.departments();
-      return Array.isArray(list) ? list : [];
-    }catch{
-      return [];
-    }
+    try{ return await API.departments(); }catch{ return []; }
+  },
+
+  // Экран ошибки с кнопкой «Повторить».
+  renderError(message, retry){
+    $('#app').innerHTML = html`
+      <section class="section">
+        <div class="empty-state">
+          <p>${esc(message)}</p>
+          <button class="btn outline" type="button" id="retryBtn">Повторить</button>
+        </div>
+      </section>`;
+    $('#retryBtn')?.addEventListener('click', ()=> retry ? retry() : Router.match());
   },
 
   async mountNavbar(){
-    // Отключаем infinite-scroll наблюдатель прошлой страницы, чтобы он не висел
-    // на удалённом из DOM сентинеле (утечка + лишние подгрузки).
+    // Отключаем наблюдатель бесконечной ленты прошлой страницы.
     if (App._listObserver) { App._listObserver.disconnect(); App._listObserver = null; }
     // Останавливаем авто-карусели прошлой страницы.
-    this.clearCarousels?.();
+    this.clearCarousels();
     const btn  = $('#deptBtn');
     const menu = $('#deptMenu');
     const searchInput = $('#searchInput');
     if (!btn || !menu) return;
 
     const defaultDeptLabel = 'Кафедры…';
-    let currentPath = '/';
-    let currentSearch = '';
+    const h = (location.hash || '').slice(1) || '/';
+    const [pathPart, queryPart = ''] = h.split('?');
     let currentDepartment = '';
-
-    try{
-      const hash = (location.hash || '').slice(1) || '/';
-      const navUrl = new URL(hash.startsWith('/') ? hash : `/${hash}`, location.origin);
-      currentPath = navUrl.pathname || '/';
-      if (currentPath === '/search') {
-        currentSearch = normalizeSearchQuery(navUrl.searchParams.get('q') || '');
-      }
-      if (currentPath.startsWith('/department/')) {
-        currentDepartment = decodeURIComponent(currentPath.replace('/department/',''));
-      }
-    }catch{}
-
+    if (pathPart.startsWith('/department/')) {
+      try { currentDepartment = decodeURIComponent(pathPart.slice('/department/'.length)); } catch { currentDepartment = ''; }
+    }
     if (searchInput) {
-      searchInput.value = currentPath === '/search' ? currentSearch : '';
+      let q = '';
+      if (pathPart === '/search') {
+        try { q = new URLSearchParams(queryPart).get('q') || ''; } catch { q = ''; }
+      }
+      searchInput.value = normalizeSearchQuery(q);
     }
-
-    if (btn) {
-      btn.textContent = currentDepartment || defaultDeptLabel;
-      btn.setAttribute('aria-expanded','false');
-    }
+    btn.textContent = currentDepartment || defaultDeptLabel;
+    btn.title = currentDepartment || '';
+    btn.setAttribute('aria-expanded','false');
     menu.classList.add('hidden');
 
     const deps = await this.getDepartments();
     menu.innerHTML =
-      `<button class="select-item" role="option" data-route="/teachers">Все учителя</button>` +
-      deps.map(d=>html`<button class="select-item" role="option" data-route="/department/${encodeURIComponent(d)}">${esc(d)}</button>`).join('');
+      `<button class="select-item" type="button" data-route="/teachers">Все учителя</button>` +
+      deps.map(d=>html`<button class="select-item" type="button" data-route="/department/${encodeURIComponent(d)}" aria-selected="${d === currentDepartment}">${esc(d)}</button>`).join('');
 
-    btn.onclick = () => {
-      menu.classList.toggle('hidden');
-      btn.setAttribute('aria-expanded', menu.classList.contains('hidden') ? 'false':'true');
-    };
-    menu.onclick = (e) => {
-      const it = e.target.closest('.select-item'); if(!it) return;
-      const route = it.dataset.route;
-      btn.textContent = it.textContent;
-      menu.classList.add('hidden');
-      btn.setAttribute('aria-expanded','false');
-      Router.go(route);
-    };
-    // Навешиваем document-слушатели один раз: иначе при каждой навигации
-    // накапливаются дубликаты (память/CPU, многократное срабатывание).
-    if (!App._navDocHandlersAttached) {
+    if (!App._navHandlersAttached) {
+      App._navHandlersAttached = true;
+      btn.addEventListener('click', () => {
+        const willOpen = menu.classList.contains('hidden');
+        menu.classList.toggle('hidden', !willOpen);
+        btn.setAttribute('aria-expanded', String(willOpen));
+        if (willOpen) menu.querySelector('.select-item')?.focus();
+      });
+      menu.addEventListener('click', (e) => {
+        const it = e.target.closest('.select-item'); if (!it) return;
+        menu.classList.add('hidden');
+        btn.setAttribute('aria-expanded','false');
+        Router.go(it.dataset.route);
+      });
+      // Стрелки ↑/↓ по пунктам меню.
+      menu.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        e.preventDefault();
+        const items = $$('.select-item', menu);
+        const i = items.indexOf(document.activeElement);
+        const next = items[(i + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length];
+        next?.focus();
+      });
       document.addEventListener('click', (e)=>{
-        const m = $('#deptMenu'), b = $('#deptBtn');
-        if (m && b && !e.target.closest('#deptSelectWrap')) { m.classList.add('hidden'); b.setAttribute('aria-expanded','false'); }
+        if (!e.target.closest('#deptSelectWrap')) { menu.classList.add('hidden'); btn.setAttribute('aria-expanded','false'); }
       });
       document.addEventListener('keydown', (e)=>{
-        if(e.key==='Escape'){ const m=$('#deptMenu'), b=$('#deptBtn'); if(m) m.classList.add('hidden'); if(b) b.setAttribute('aria-expanded','false'); }
+        if (e.key === 'Escape' && !menu.classList.contains('hidden')) {
+          menu.classList.add('hidden'); btn.setAttribute('aria-expanded','false'); btn.focus();
+        }
       });
-      App._navDocHandlersAttached = true;
     }
   },
 
@@ -854,20 +808,34 @@ const App = {
     const raw = normalizeSearchQuery(input?.value);
     if (input && input.value !== raw) input.value = raw;
     const q = raw.trim();
-    if (!q) return;
+    if (!q) { input?.focus(); return; }
     Router.go(`/search?q=${encodeURIComponent(q)}`);
   },
 
-  teacherTile(t, rightHtml){
-    const fio = [t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+  teacherTile(t, value){
+    const fio = fullName(t);
+    const votes = ratersCount(t);
     return html`
       <div class="list-item">
-        <div class="portrait"><img src="${escAttr(t.photo || '')}" alt=""></div>
+        <div class="portrait"><img src="${escAttr(t.photo || '')}" alt="" loading="lazy"></div>
         <div>
           <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
-          <div class="meta">${esc(t.department)} · ${esc(t.subjects?.join(', ')||'')}</div>
+          <div class="meta">${esc(t.department)}${t.subjects?.length ? ' · ' + esc(t.subjects.join(', ')) : ''}</div>
         </div>
-        <div>${rightHtml||''}</div>
+        <div class="list-rating">${fmtStars(value)}${votes ? html`<div class="rating-count">${countLabel(votes, RATING_FORMS)}</div>` : ''}</div>
+      </div>`;
+  },
+
+  miniTeacher(t, value){
+    const fio = [t.lastName, t.firstName].filter(Boolean).join(' ').trim();
+    return html`
+      <div class="mini-teacher">
+        <div class="portrait"><img src="${escAttr(t.photo || '')}" alt="" loading="lazy"></div>
+        <div class="info">
+          <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
+          <div class="tdept">${esc(t.department)}</div>
+        </div>
+        <div>${fmtStars(value)}</div>
       </div>`;
   },
 
@@ -875,626 +843,447 @@ const App = {
     return list.sort((a,b)=>{
       const va = getVal(a), vb = getVal(b);
       if (vb !== va) return vb - va;
-      const an = `${a.lastName} ${a.firstName}`.trim();
-      const bn = `${b.lastName} ${b.firstName}`.trim();
-      return collator.compare(an, bn);
+      return collator.compare(`${a.lastName} ${a.firstName}`.trim(), `${b.lastName} ${b.firstName}`.trim());
     });
   },
 
-  /**
-   * Главная страница: используем лёгкий API-пакет через API.home(),
-   * чтобы не загружать полный список учителей при первом визите.
-   */
-async viewHome(){
-  await this.mountNavbar();
-  // Лёгкая загрузка данных для главной страницы
-  let homeData = null;
-  try{ homeData = await API.home(); }catch{ homeData = { characteristics:{}, departments:[] }; }
+  /* --- главная --- */
+  async viewHome(){
+    const seq = Router.seq;
+    await this.mountNavbar();
+    let homeData = null;
+    try{ homeData = await API.home(); }catch{ homeData = null; }
+    if (Router.isStale(seq)) return;
+    if (!homeData) {
+      this.renderError('Не удалось загрузить главную страницу.', ()=>this.viewHome());
+      return;
+    }
 
-  const charCards = CHARACTERISTICS.map(c=>{
-    const list = Array.isArray(homeData?.characteristics?.[c.key]) ? homeData.characteristics[c.key] : [];
-    const preview = list.map(t=>{
-      const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
-      return html`
-      <div class="row" style="gap:10px;padding:8px 0">
-        <div class="portrait"><img src="${escAttr(t.photo||'')}" alt=""></div>
-        <div style="flex:1">
-          <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
-          <div class="tdept">${esc(t.department)}</div>
-        </div>
-        <div>${fmtStars(characteristicAvg(t,c.key))}</div>
-      </div>`;
-    }).join('');
-    return html`
+    const card = ({ title, href, linkText, list, valueOf }) => html`
       <div class="card">
         <div class="card-header">
-          <h3>${c.name}</h3>
-          <a class="btn small primary" href="#/top/${c.key}">Смотреть всех</a>
+          <h3>${esc(title)}</h3>
+          <a class="btn small primary" href="${escAttr(href)}">${linkText}</a>
         </div>
         <div class="card-content">
           <div class="hr"></div>
-          ${preview || '<div class="empty">Пока нет данных</div>'}
+          ${list.length ? list.map(t => this.miniTeacher(t, valueOf(t))).join('') : '<div class="empty">Пока нет оценок</div>'}
         </div>
       </div>`;
-  }).join('');
 
-  // Карточки по кафедрам берём уже подготовленными на сервере (первые 3 по каждой)
-  const deptCards = (Array.isArray(homeData?.departments)?homeData.departments:[]).map(d=>{
-    const list = Array.isArray(d.list)?d.list:[];
-    if (!list.length) return '';
-    const preview = list.map(t=>{
-      const fio = [t.lastName,t.firstName].filter(Boolean).join(' ').trim();
-      return html`
-      <div class="row" style="gap:10px;padding:8px 0">
-        <div class="portrait"><img src="${escAttr(t.photo||'')}" alt=""></div>
-        <div style="flex:1">
-          <div class="tname"><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fio) || 'Без имени'}</a></div>
-          <div class="tdept">${esc(t.department)}</div>
-        </div>
-        <div>${fmtStars(overall(t))}</div>
-      </div>`;
-    }).join('');
-    return html`
-      <div class="card">
-        <div class="card-header">
-          <h3>${esc(d.name)}</h3>
-          <a class="btn small primary" href="#/department/${encodeURIComponent(d.name)}">Все учителя</a>
-        </div>
-        <div class="card-content">
-          <div class="hr"></div>
-          ${preview}
-        </div>
-      </div>`;
-  }).join('');
+    const charCards = CHARACTERISTICS.map(c => card({
+      title: c.name, href: `#/top/${c.key}`, linkText: 'Смотреть всех',
+      list: Array.isArray(homeData.characteristics?.[c.key]) ? homeData.characteristics[c.key] : [],
+      valueOf: t => characteristicAvg(t, c.key)
+    })).join('');
 
-  // Для бесшовной бесконечной прокрутки дублируем набор карточек (копии-обёртки).
-  const loopSets = (cards)=> `<div class="marquee-set">${cards}</div><div class="marquee-set">${cards}</div><div class="marquee-set">${cards}</div>`;
+    const deptCards = (Array.isArray(homeData.departments) ? homeData.departments : [])
+      .filter(d => Array.isArray(d.list) && d.list.length)
+      .map(d => card({
+        title: d.name, href: `#/department/${encodeURIComponent(d.name)}`, linkText: 'Все учителя',
+        list: d.list, valueOf: t => overall(t)
+      })).join('');
 
-  $('#app').innerHTML = html`
-    <section class="section">
-      <h2>Топ по характеристикам</h2>
-      <div class="hscroll">
-        <button class="hscroll-arrow left" type="button" aria-label="Влево">‹</button>
-        <div class="card-row">${loopSets(charCards)}</div>
-        <button class="hscroll-arrow right" type="button" aria-label="Вправо">›</button>
-      </div>
-    </section>
-    <section class="section">
-      <h2>По кафедрам</h2>
-      <div class="hscroll">
-        <button class="hscroll-arrow left" type="button" aria-label="Влево">‹</button>
-        <div class="card-row">${loopSets(deptCards)}</div>
-        <button class="hscroll-arrow right" type="button" aria-label="Вправо">›</button>
-      </div>
-    </section>
-    <section class="section teacher-request-cta">
-      <div class="cta-card">
-        <div class="cta-text">
-          <h2>Не нашли своего учителя?</h2>
-          <p class="muted">Отправьте заявку, и администраторы проверят информацию и добавят нового учителя в каталог.</p>
+    // Для бесшовной бесконечной прокрутки — три одинаковых набора карточек;
+    // крайние скрыты от скринридеров и клавиатуры (inert), живой — средний.
+    const loopSets = (cards)=> `<div class="marquee-set" aria-hidden="true" inert>${cards}</div><div class="marquee-set">${cards}</div><div class="marquee-set" aria-hidden="true" inert>${cards}</div>`;
+    const carousel = (title, cards) => cards ? html`
+      <section class="section">
+        <h2>${title}</h2>
+        <div class="hscroll">
+          <button class="hscroll-arrow left" type="button" aria-label="Прокрутить влево">‹</button>
+          <div class="card-row">${loopSets(cards)}</div>
+          <button class="hscroll-arrow right" type="button" aria-label="Прокрутить вправо">›</button>
         </div>
-        <a class="btn primary" href="#/teacher-request">Добавить учителя</a>
-      </div>
-    </section>
-  `;
-  this.wireHScrollers();
-},
+      </section>` : '';
 
-  // Бесконечные авто-карусели (Топ / Кафедры): медленно едут влево сами, пауза при
-  // наведении/прокрутке, зациклены (без конца). Без видимого скроллбара.
+    $('#app').innerHTML = html`
+      ${carousel('Топ по характеристикам', charCards)}
+      ${carousel('По кафедрам', deptCards)}
+      <section class="section">
+        <div class="cta-card">
+          <div class="cta-text">
+            <h2>Не нашли своего учителя?</h2>
+            <p class="muted">Отправьте заявку — модераторы проверят информацию и добавят учителя в каталог.</p>
+          </div>
+          <a class="btn primary" href="#/teacher-request">Предложить учителя</a>
+        </div>
+      </section>
+    `;
+    this.wireCarousels();
+  },
+
+  // Бесконечные авто-карусели: медленно едут сами (requestAnimationFrame), стоят,
+  // пока карусель вне экрана, под курсором, в фокусе или после ручной прокрутки.
+  // При «уменьшении движения» в системе — не едут вовсе.
   _carouselCleanup: [],
   clearCarousels(){
     (this._carouselCleanup || []).forEach(fn=>{ try{ fn(); }catch{} });
     this._carouselCleanup = [];
   },
-  wireHScrollers(){
+  wireCarousels(){
     this.clearCarousels();
+    const reduceMotion = !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
     $$('.hscroll').forEach(wrap=>{
       const row = wrap.querySelector('.card-row');
+      const sets = row ? row.querySelectorAll('.marquee-set') : [];
+      if (sets.length !== 3) return;
       const leftBtn = wrap.querySelector('.hscroll-arrow.left');
       const rightBtn = wrap.querySelector('.hscroll-arrow.right');
-      if (!row || row.children.length < 2) return;
 
-      // Точка зацикливания = расстояние от 1-й копии до 2-й (точно, с учётом gap).
+      // Карточки помещаются целиком — прокрутка не нужна: оставляем один набор.
+      if (sets[1].scrollWidth <= row.clientWidth) {
+        sets[0].remove(); sets[2].remove();
+        leftBtn?.remove(); rightBtn?.remove();
+        return;
+      }
+
       let loop = 0;
-      const measure = ()=>{ loop = row.children[1].offsetLeft - row.children[0].offsetLeft; };
+      const measure = ()=>{ loop = sets[2].offsetLeft - sets[1].offsetLeft; };
       measure();
+      let pos = loop;              // стартуем со среднего набора — влево тоже можно листать
+      row.scrollLeft = pos;
 
-      let paused = false, resumeT = null;
-      const pauseFor = (ms)=>{ paused = true; clearTimeout(resumeT); resumeT = setTimeout(()=>{ paused = false; }, ms); };
+      const SPEED = 28;            // px в секунду
+      let hovering = false, focused = false, visible = true, pausedUntil = 0;
+      let raf = 0, lastTs = 0, idleTimer = null;
 
-      // pos — дробный «источник истины» позиции (scrollLeft округляется до целого,
-      // поэтому копим позицию отдельно, иначе медленная прокрутка теряется на округлении).
-      let pos = row.scrollLeft;
-      const SPEED = 0.5; // px за тик (~16мс) => ~30px/с, медленно
-      const tick = setInterval(()=>{
+      // Держим позицию в пределах среднего набора: сдвиг ровно на ширину набора
+      // визуально незаметен (наборы одинаковые).
+      const normalize = ()=>{
+        if (!loop) return;
+        let x = row.scrollLeft;
+        if (x < loop * 0.5) x += loop;
+        else if (x >= loop * 1.5) x -= loop;
+        if (x !== row.scrollLeft) row.scrollLeft = x;
+        pos = row.scrollLeft;
+      };
+      const pause = (ms)=>{ pausedUntil = Math.max(pausedUntil, performance.now() + ms); };
+
+      const frame = (ts)=>{
+        raf = requestAnimationFrame(frame);
+        const dt = lastTs ? Math.min(0.1, (ts - lastTs) / 1000) : 0;
+        lastTs = ts;
+        if (reduceMotion || hovering || focused || !visible || ts < pausedUntil) { pos = row.scrollLeft; return; }
         if (!loop) { measure(); return; }
-        if (paused) {
-          // во время ручной прокрутки синхронизируем pos и нормализуем петлю
-          pos = row.scrollLeft;
-          if (pos >= loop) { pos -= loop; row.scrollLeft = pos; }
-          else if (pos < 0) { pos += loop; row.scrollLeft = pos; }
-          return;
-        }
-        pos += SPEED;                 // едем влево
-        if (pos >= loop) pos -= loop;  // бесшовная петля
+        pos += SPEED * dt;
+        if (pos >= loop * 1.5) pos -= loop;
         row.scrollLeft = pos;
-      }, 16);
+      };
+      raf = requestAnimationFrame(frame);
 
-      const onResize = ()=> measure();
+      const io = new IntersectionObserver(entries => { visible = entries.some(e => e.isIntersecting); });
+      io.observe(wrap);
+
+      const onResize = ()=>{ const ratio = loop ? row.scrollLeft / loop : 1; measure(); row.scrollLeft = pos = loop * ratio; };
       window.addEventListener('resize', onResize);
 
-      // Пауза при наведении и при ручной прокрутке/свайпе.
-      wrap.addEventListener('mouseenter', ()=>{ paused = true; clearTimeout(resumeT); });
-      wrap.addEventListener('mouseleave', ()=> pauseFor(500));
-      row.addEventListener('wheel', ()=> pauseFor(2500), { passive:true });
-      row.addEventListener('touchstart', ()=> pauseFor(4000), { passive:true });
-      row.addEventListener('touchend', ()=> pauseFor(2500), { passive:true });
+      wrap.addEventListener('mouseenter', ()=>{ hovering = true; });
+      wrap.addEventListener('mouseleave', ()=>{ hovering = false; pause(600); });
+      wrap.addEventListener('focusin', ()=>{ focused = true; });
+      wrap.addEventListener('focusout', ()=>{ focused = false; pause(1500); });
+      row.addEventListener('wheel', ()=> pause(2500), { passive:true });
+      row.addEventListener('touchstart', ()=> pause(5000), { passive:true });
+      row.addEventListener('pointerdown', ()=> pause(4000));
+      // После ручной прокрутки (когда она закончилась) — нормализуем петлю.
+      row.addEventListener('scroll', ()=>{
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(()=>{ if (performance.now() < pausedUntil || hovering || reduceMotion) normalize(); }, 180);
+      }, { passive:true });
 
-      const step = ()=> Math.max(240, Math.round(row.clientWidth * 0.85));
-      leftBtn?.addEventListener('click', ()=>{ row.scrollLeft -= step(); pauseFor(3000); });
-      rightBtn?.addEventListener('click', ()=>{ row.scrollLeft += step(); pauseFor(3000); });
+      const step = ()=> Math.max(260, Math.round(row.clientWidth * 0.8));
+      leftBtn?.addEventListener('click', ()=>{ pause(3500); row.scrollBy({ left: -step(), behavior:'smooth' }); });
+      rightBtn?.addEventListener('click', ()=>{ pause(3500); row.scrollBy({ left: step(), behavior:'smooth' }); });
 
-      setTimeout(measure, 400);
-      this._carouselCleanup.push(()=>{ clearInterval(tick); window.removeEventListener('resize', onResize); });
+      this._carouselCleanup.push(()=>{
+        cancelAnimationFrame(raf);
+        clearTimeout(idleTimer);
+        io.disconnect();
+        window.removeEventListener('resize', onResize);
+      });
     });
   },
 
+  /* --- заявка на добавление учителя --- */
   async viewTeacherRequest(){
+    const seq = Router.seq;
     await this.mountNavbar();
+    const departments = await this.getDepartments();
+    if (Router.isStale(seq)) return;
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Добавить учителя</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        <div class="page-head">
+          <h2>Предложить учителя</h2>
+          <a class="link" href="#/">← На главную</a>
         </div>
-        <div class="teacher-request-card">
-          <p class="muted">Заполните форму ниже. Мы отправим вашу заявку администраторам в Telegram и добавим учителя после подтверждения.</p>
-          <form id="teacherRequestForm" class="teacher-request-form" novalidate>
-            <div class="teacher-request-grid">
-              <div class="teacher-request-field">
+        <div class="panel roomy teacher-request-card" id="teacherRequestCard">
+          <p class="muted">Заполните форму — заявка уйдёт модераторам, и после проверки учитель появится в каталоге.</p>
+          <form id="teacherRequestForm" class="form-stack" novalidate>
+            <div class="form-grid">
+              <div class="field">
                 <label for="reqLastName">Фамилия*</label>
-                <input id="reqLastName" name="lastName" type="text" maxlength="120" required placeholder="Иванов">
+                <input id="reqLastName" class="input" name="lastName" type="text" maxlength="120" required placeholder="Иванов" autocomplete="off">
               </div>
-              <div class="teacher-request-field">
+              <div class="field">
                 <label for="reqFirstName">Имя*</label>
-                <input id="reqFirstName" name="firstName" type="text" maxlength="120" required placeholder="Иван">
+                <input id="reqFirstName" class="input" name="firstName" type="text" maxlength="120" required placeholder="Иван" autocomplete="off">
               </div>
-              <div class="teacher-request-field">
+              <div class="field">
                 <label for="reqPatronymic">Отчество</label>
-                <input id="reqPatronymic" name="patronymic" type="text" maxlength="120" placeholder="Иванович">
+                <input id="reqPatronymic" class="input" name="patronymic" type="text" maxlength="120" placeholder="Иванович" autocomplete="off">
               </div>
-              <div class="teacher-request-field">
-                <label for="reqDeptBtn">Кафедра*</label>
-                <div class="select custom-select" id="reqDeptSelectWrap">
-                  <button id="reqDeptBtn" class="select-btn" type="button" disabled aria-haspopup="listbox" aria-expanded="false">Загрузка списка кафедр...</button>
-                  <div id="reqDeptMenu" class="select-menu hidden" role="listbox" aria-label="Кафедры для заявки"></div>
-                </div>
-                <input type="hidden" id="reqDepartment" name="department" value="">
-                <div class="teacher-request-hint">Выберите существующую кафедру из списка.</div>
+              <div class="field">
+                <label for="reqDepartment">Кафедра*</label>
+                <select id="reqDepartment" class="input" name="department" required ${departments.length ? '' : 'disabled'}>
+                  <option value="">${departments.length ? 'Выберите кафедру' : 'Список кафедр недоступен'}</option>
+                  ${departments.map(d => html`<option value="${escAttr(d)}">${esc(d)}</option>`).join('')}
+                </select>
               </div>
-              <div class="teacher-request-field">
+              <div class="field">
                 <label for="reqSubjects">Предметы*</label>
-                <input id="reqSubjects" name="subjects" type="text" maxlength="240" required placeholder="Алгебра, Геометрия">
-                <div class="teacher-request-hint">Укажите через запятую или с новой строки.</div>
+                <input id="reqSubjects" class="input" name="subjects" type="text" maxlength="240" required placeholder="Алгебра, геометрия" autocomplete="off">
+                <div class="field-hint">Через запятую.</div>
               </div>
-              <div class="teacher-request-field">
+              <div class="field">
                 <label for="reqSubmitterName">Как к вам обращаться</label>
-                <input id="reqSubmitterName" name="submitterName" type="text" maxlength="160" placeholder="Имя или класс">
+                <input id="reqSubmitterName" class="input" name="submitterName" type="text" maxlength="160" placeholder="Имя или класс">
               </div>
-              <div class="teacher-request-field">
+              <div class="field">
                 <label for="reqSubmitterContact">Контакт для связи</label>
-                <input id="reqSubmitterContact" name="submitterContact" type="text" maxlength="160" placeholder="Почта или Telegram (по желанию)">
+                <input id="reqSubmitterContact" class="input" name="submitterContact" type="text" maxlength="160" placeholder="Telegram или почта (по желанию)">
               </div>
             </div>
-            <div class="teacher-request-field">
-              <label for="reqNotes">Комментарий или дополнительная информация</label>
-              <textarea id="reqNotes" name="notes" rows="4" maxlength="1500" placeholder="Расскажите, чему обучает учитель, какие у него особенности или достижения."></textarea>
+            <div class="field">
+              <label for="reqNotes">Комментарий</label>
+              <textarea id="reqNotes" class="input" name="notes" rows="4" maxlength="1500" placeholder="Что преподаёт, в каких классах, чем запомнился."></textarea>
             </div>
-            <div class="teacher-request-field">
-              <label for="reqPhoto">Фото учителя (до 5 МБ, JPG/PNG/WebP)</label>
-              <input id="reqPhoto" name="photo" type="file" accept="image/jpeg,image/png,image/webp">
+            <div class="field">
+              <label for="reqPhoto">Фото учителя</label>
+              <input id="reqPhoto" class="input" name="photo" type="file" accept="image/jpeg,image/png,image/webp">
+              <div class="field-hint">JPG, PNG или WebP, до 5 МБ. Лучше вертикальное, лицо по центру.</div>
             </div>
-            <div class="teacher-request-actions">
-              <button type="submit" class="btn primary" id="teacherRequestSubmit" disabled>Отправить заявку</button>
-              <button type="button" class="btn outline" id="teacherRequestCancel">Отмена</button>
+            <div class="form-actions">
+              <button type="submit" class="btn primary" id="teacherRequestSubmit">Отправить заявку</button>
+              <a class="btn outline" href="#/">Отмена</a>
             </div>
-            <div class="teacher-request-note muted">* — обязательные поля. Отправляя заявку, вы подтверждаете корректность данных.</div>
+            <p class="muted small" style="margin:0">* — обязательные поля.</p>
+            <div id="teacherRequestFeedback" class="status-msg" role="status"></div>
           </form>
-          <div id="teacherRequestFeedback" class="teacher-request-feedback"></div>
         </div>
       </section>
     `;
-    this.bindTeacherRequestForm();
-    this.loadRequestDepartments();
-  },
-
-  bindTeacherRequestForm(){
     const form = $('#teacherRequestForm');
-    if (!form) return;
-    this.setTeacherRequestFeedback('');
-    form.addEventListener('submit', (e)=>{
+    form?.addEventListener('submit', (e)=>{
       e.preventDefault();
-      this.submitTeacherRequestForm(form);
+      withBusy($('#teacherRequestSubmit'), ()=>this.submitTeacherRequestForm(form));
     });
-    $('#teacherRequestCancel')?.addEventListener('click', ()=>Router.go('/'));
   },
 
-  async loadRequestDepartments(){
-    const btn = $('#reqDeptBtn');
-    const menu = $('#reqDeptMenu');
-    const wrap = $('#reqDeptSelectWrap');
-    const hidden = $('#reqDepartment');
-    const submitBtn = $('#teacherRequestSubmit');
-    if (!btn || !menu || !hidden) return;
-
-    if (!btn.dataset.defaultLabel) {
-      btn.dataset.defaultLabel = 'Выберите кафедру';
-    }
-    const defaultBtnLabel = btn.dataset.defaultLabel || 'Выберите кафедру';
-
-    if (submitBtn && !submitBtn.dataset.defaultText) {
-      submitBtn.dataset.defaultText = submitBtn.textContent || 'Отправить заявку';
-    }
-    const defaultSubmitText = submitBtn?.dataset.defaultText || 'Отправить заявку';
-    const setSubmitState = (disabled, text) => {
-      if (!submitBtn) return;
-      submitBtn.disabled = !!disabled;
-      if (text) submitBtn.textContent = text;
-    };
-
-    const setButtonState = ({ disabled = false, text = 'Выберите кафедру', expanded = false }) => {
-      btn.disabled = !!disabled;
-      btn.textContent = text;
-      btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-      if (expanded) {
-        menu.classList.remove('hidden');
-      } else {
-        menu.classList.add('hidden');
-      }
-    };
-
-    const closeMenu = () => setButtonState({ disabled: btn.disabled, text: btn.textContent, expanded: false });
-
-    setSubmitState(true, 'Загрузка...');
-    setButtonState({ disabled: true, text: 'Загрузка списка кафедр...' });
-    hidden.value = '';
-    menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Загрузка...</div>';
-
-    const escapeHtml = (v)=>String(v ?? '').replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch] || ch));
-    const escapeAttr = (v)=>escapeHtml(v).replace(/\"/g,'&quot;');
-
-    try {
-      const departments = await this.getDepartments();
-      if (!Array.isArray(departments) || !departments.length) {
-        this.setTeacherRequestFeedback('Список кафедр сейчас недоступен. Попробуйте обновить страницу позже.', 'error');
-        menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Список кафедр недоступен</div>';
-        return;
-      }
-      const options = departments.map(d=>`<button type="button" class="select-item" role="option" data-value="${escapeAttr(d)}">${escapeHtml(d)}</button>`);
-      menu.innerHTML = options.join('');
-      setButtonState({ disabled: false, text: defaultBtnLabel });
-      setSubmitState(false, defaultSubmitText);
-
-      const onSelect = (value, label) => {
-        hidden.value = value;
-        btn.textContent = label || defaultBtnLabel;
-        closeMenu();
-        menu.querySelectorAll('.select-item').forEach(it => it.setAttribute('aria-selected', it.dataset.value === value ? 'true' : 'false'));
-      };
-
-      menu.onclick = (e) => {
-        const it = e.target.closest('.select-item'); if (!it) return;
-        const val = it.dataset.value || '';
-        if (!val) return;
-        onSelect(val, it.textContent.trim());
-      };
-
-      btn.onclick = () => {
-        if (btn.disabled) return;
-        const willExpand = menu.classList.contains('hidden');
-        setButtonState({ disabled: false, text: btn.textContent, expanded: willExpand });
-      };
-
-      if (!this._reqDeptDocHandlersAttached) {
-        const closeReqDeptMenu = () => {
-          const btnEl = $('#reqDeptBtn');
-          const menuEl = $('#reqDeptMenu');
-          if (btnEl) btnEl.setAttribute('aria-expanded','false');
-          if (menuEl) menuEl.classList.add('hidden');
-        };
-        document.addEventListener('click', (e)=>{
-          if (!e.target.closest('#reqDeptSelectWrap')) closeReqDeptMenu();
-        });
-        document.addEventListener('keydown', (e)=>{
-          if (e.key === 'Escape') closeReqDeptMenu();
-        });
-        this._reqDeptDocHandlersAttached = true;
-      }
-    } catch (err) {
-      console.warn('Не удалось загрузить список кафедр для заявки', err);
-      this.setTeacherRequestFeedback('Не удалось загрузить список кафедр. Попробуйте обновить страницу.', 'error');
-      menu.innerHTML = '<div class="select-item muted" role="option" aria-disabled="true">Список кафедр недоступен</div>';
-    } finally {
-      if (btn.disabled) {
-        setSubmitState(true, defaultSubmitText);
-      }
-    }
-  },
-
-  setTeacherRequestFeedback(message, type=''){
-    const box = $('#teacherRequestFeedback');
-    if (!box) return;
-    box.textContent = message || '';
-    box.classList.remove('success','error');
-    if (type) box.classList.add(type);
-  },
-
-  teacherRequestErrorText(code, description){
+  teacherRequestErrorText(res){
     const map = {
       missing_name: 'Укажите фамилию и имя учителя.',
-      missing_department: 'Выберите кафедру учителя из списка.',
-      invalid_department: 'Выберите кафедру из списка, новые не принимаются.',
+      missing_department: 'Выберите кафедру из списка.',
+      invalid_department: 'Выберите кафедру из списка — новые не принимаются.',
       departments_unavailable: 'Список кафедр недоступен. Попробуйте позже.',
       missing_subjects: 'Добавьте хотя бы один предмет.',
-      photo_too_large: 'Фото превышает лимит в 5 МБ.',
-      unsupported_photo_type: 'Допускаются только изображения в форматах JPG, PNG или WebP.',
-      telegram_not_configured: 'Сервис временно недоступен. Попробуйте позже.',
-      telegram_failed: 'Не удалось связаться с Telegram. Попробуйте ещё раз чуть позже.',
-      upload_failed: 'Не удалось загрузить файл. Попробуйте выбрать фото заново.',
-      teacher_request_failed: 'Не удалось отправить заявку.',
-      server_error: 'На сервере произошла ошибка. Попробуйте позже.'
+      photo_too_large: 'Фото больше 5 МБ — выберите файл поменьше.',
+      unsupported_photo_type: 'Фото должно быть в формате JPG, PNG или WebP.',
+      upload_failed: 'Не удалось загрузить фото. Попробуйте выбрать его заново.',
+      telegram_not_configured: 'Приём заявок временно недоступен. Попробуйте позже.',
+      telegram_failed: 'Не удалось передать заявку модераторам. Попробуйте чуть позже.',
     };
-    return map[code] || description || 'Не удалось отправить заявку. Попробуйте ещё раз позже.';
+    return map[res?.error] || errorText(res, 'Не удалось отправить заявку. Попробуйте позже.');
   },
 
   async submitTeacherRequestForm(form){
-    const submitBtn = $('#teacherRequestSubmit');
-    if (submitBtn?.disabled) return;
-    const departmentInput = $('#reqDepartment');
-    const departmentButton = $('#reqDeptBtn');
+    const feedback = $('#teacherRequestFeedback');
+    const setFeedback = (text, tone = '') => { if (feedback) { feedback.textContent = text; feedback.className = `status-msg ${tone}`; } };
+    setFeedback('');
+    if (!form.reportValidity()) return;
 
-    this.setTeacherRequestFeedback('');
-
-    if (departmentButton?.disabled) {
-      this.setTeacherRequestFeedback('Дождитесь загрузки списка кафедр.', 'error');
-      return;
-    }
-
-    if (!form.reportValidity()) {
-      return;
-    }
-
-    const lastName = $('#reqLastName')?.value?.trim() || '';
-    const firstName = $('#reqFirstName')?.value?.trim() || '';
-    const patronymic = $('#reqPatronymic')?.value?.trim() || '';
-    const department = departmentInput?.value?.trim() || '';
-    const subjectsRaw = $('#reqSubjects')?.value || '';
-    const subjectsValue = subjectsRaw.trim();
-    const submitterName = $('#reqSubmitterName')?.value?.trim() || '';
-    const submitterContact = $('#reqSubmitterContact')?.value?.trim() || '';
-    const notes = $('#reqNotes')?.value?.trim() || '';
-    const subjectsClean = subjectsValue.split(/[,|\n]+/).map(s=>s.trim()).filter(Boolean).join(', ');
-
-    if (!department) {
-      this.setTeacherRequestFeedback('Выберите кафедру из списка.', 'error');
-      departmentButton?.focus();
-      return;
-    }
-
-    if (!subjectsClean) {
-      this.setTeacherRequestFeedback('Добавьте хотя бы один предмет.', 'error');
+    const val = id => ($(id)?.value || '').trim();
+    const subjects = val('#reqSubjects');
+    if (!subjects.split(/[,|\n]+/).map(s=>s.trim()).filter(Boolean).length) {
+      setFeedback('Добавьте хотя бы один предмет.', 'error');
       $('#reqSubjects')?.focus();
       return;
     }
-
-    const photoInput = $('#reqPhoto');
-    const file = photoInput?.files && photoInput.files[0] ? photoInput.files[0] : null;
+    const file = $('#reqPhoto')?.files?.[0] || null;
     if (file) {
-      const allowed = ['image/jpeg','image/png','image/webp'];
-      if (!allowed.includes(file.type)) {
-        this.setTeacherRequestFeedback('Допускаются только изображения в форматах JPG, PNG или WebP.', 'error');
-        return;
-      }
-      if (file.size > 5 * 1024 * 1024) {
-        this.setTeacherRequestFeedback('Фото слишком большое (лимит 5 МБ).', 'error');
-        return;
-      }
+      if (!['image/jpeg','image/png','image/webp'].includes(file.type)) { setFeedback('Фото должно быть в формате JPG, PNG или WebP.', 'error'); return; }
+      if (file.size > 5 * 1024 * 1024) { setFeedback('Фото больше 5 МБ — выберите файл поменьше.', 'error'); return; }
     }
 
     const formData = new FormData();
-    formData.append('lastName', lastName);
-    formData.append('firstName', firstName);
-    if (patronymic) formData.append('patronymic', patronymic);
-    formData.append('department', department);
-    formData.append('subjects', subjectsValue);
-    if (submitterName) formData.append('submitterName', submitterName);
-    if (submitterContact) formData.append('submitterContact', submitterContact);
-    if (notes) formData.append('notes', notes);
+    formData.append('lastName', val('#reqLastName'));
+    formData.append('firstName', val('#reqFirstName'));
+    formData.append('patronymic', val('#reqPatronymic'));
+    formData.append('department', val('#reqDepartment'));
+    formData.append('subjects', subjects);
+    formData.append('submitterName', val('#reqSubmitterName'));
+    formData.append('submitterContact', val('#reqSubmitterContact'));
+    formData.append('notes', val('#reqNotes'));
     if (file) formData.append('photo', file, file.name);
 
-    const resetButton = () => {
-      if (submitBtn) {
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Отправить заявку';
-      }
-    };
-
-    try {
-      if (submitBtn) {
-        submitBtn.disabled = true;
-        submitBtn.textContent = 'Отправка...';
-      }
-      const response = await API.teacherRequest(formData);
-      form.reset();
-      const deptBtn = $('#reqDeptBtn');
-      const deptMenu = $('#reqDeptMenu');
-      const deptHidden = $('#reqDepartment');
-      if (deptHidden) deptHidden.value = '';
-      if (deptBtn) {
-        deptBtn.textContent = deptBtn.dataset.defaultLabel || 'Выберите кафедру';
-        deptBtn.setAttribute('aria-expanded','false');
-        deptBtn.disabled = false;
-      }
-      if (deptMenu) deptMenu.classList.add('hidden');
-      this.setTeacherRequestFeedback(`Готово! Заявка отправлена модераторам${response?.requestId ? ` (ID: ${response.requestId})` : ''}.`, 'success');
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } catch (err) {
-      const code = err?.response?.error || err?.message;
-      const description = err?.response?.description;
-      const requestId = err?.response?.requestId;
-      let message = this.teacherRequestErrorText(code, description);
-      if (requestId) {
-        message += ` (ID: ${requestId})`;
-      }
-      this.setTeacherRequestFeedback(message, 'error');
-      console.warn('teacher request failed', err);
-    } finally {
-      resetButton();
+    setFeedback('Отправляем…');
+    const res = await API.teacherRequest(formData);
+    if (!res.ok) {
+      setFeedback(this.teacherRequestErrorText(res), 'error');
+      return;
+    }
+    // Успех: вместо формы — понятное подтверждение (раньше оно пряталось под формой).
+    const card = $('#teacherRequestCard');
+    if (card) {
+      card.innerHTML = html`
+        <h3 class="panel-title">Заявка отправлена</h3>
+        <p>Спасибо! Модераторы проверят информацию, и учитель появится в каталоге после одобрения.</p>
+        <div class="form-actions">
+          <button type="button" class="btn outline" id="anotherRequestBtn">Отправить ещё одну</button>
+          <a class="btn primary" href="#/">На главную</a>
+        </div>`;
+      $('#anotherRequestBtn')?.addEventListener('click', ()=>this.viewTeacherRequest());
+      card.scrollIntoView({ block: 'center' });
     }
   },
 
-  /**
-   * Страница «Все учителя» с бесконечной подгрузкой.
-   * Сначала грузим первые 30 элементов с сервера, далее — порциями по 30
-   * при пересечении наблюдаемого «сентинела» (IntersectionObserver).
-   */
+  /* --- списки учителей --- */
+  // «Все учителя»: первые 30 с сервера, дальше порциями при прокрутке.
   async listAll(){
+    const seq = Router.seq;
     await this.mountNavbar();
+    if (Router.isStale(seq)) return;
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
+        <div class="page-head">
           <h2>Все учителя</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+          <a class="link" href="#/">← На главную</a>
         </div>
         <div id="teacherList" class="list"></div>
-        <div id="infiniteFooter" class="muted" style="text-align:center;padding:12px 0">
-          <span id="loader">Загрузка…</span>
-          <span id="end" style="display:none">Это все</span>
+        <div class="list-footer">
+          <span id="listStatus">Загрузка…</span>
+          <button id="listRetry" class="btn small outline hidden" type="button">Повторить</button>
           <div id="sentinel" style="height:1px"></div>
         </div>
       </section>`;
 
-    // Узлы интерфейса списка и «футер» с индикаторами
     const container = $('#teacherList');
-    const loader = $('#loader');
-    const endMark = $('#end');
+    const status = $('#listStatus');
+    const retryBtn = $('#listRetry');
     const sentinel = $('#sentinel');
+    const limit = 30;
+    let offset = 0, total = Infinity, loading = false, failed = false;
 
-    // Параметры пагинации и состояние
-    let limit = 30;
-    let offset = 0;
-    let total = Infinity;
-    let loading = false;
-    let list = [];
-
-    // Полная перерисовка текущего накопленного списка
-    const render = () => {
-      if (!list.length && offset===0 && total===0) {
-        container.innerHTML = '<div class="empty">Пока нет учителей</div>';
-      } else {
-        container.innerHTML = list.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('');
-      }
-    };
-
-    // Загрузить следующую страницу, если не идёт активная загрузка
     const loadMore = async () => {
-      if (loading) return;
-      if (list.length >= total) return;
+      if (loading || failed || offset >= total || Router.isStale(seq)) return;
       loading = true;
-      loader.style.display = '';
-      endMark.style.display = 'none';
+      status.textContent = 'Загрузка…';
       try{
         const { teachers, total: tot } = await API.teachersPage({ limit, offset });
-        total = Number.isFinite(tot) ? tot : tot || total;
-        list = list.concat(teachers);
+        if (Router.isStale(seq)) return;
+        total = Number.isFinite(tot) ? tot : total;
         offset += teachers.length;
-        render();
+        container.insertAdjacentHTML('beforeend', teachers.map(t => this.teacherTile(t, overall(t))).join(''));
+        if (!teachers.length) total = offset; // сервер больше ничего не отдаёт
+        status.textContent = offset >= total ? (total ? `Это все ${countLabel(total, ['учитель','учителя','учителей'])}` : 'Пока нет учителей') : 'Загрузка…';
+      } catch {
+        failed = true;
+        status.textContent = 'Не удалось загрузить список.';
+        retryBtn.classList.remove('hidden');
       } finally {
         loading = false;
-        loader.style.display = list.length < total ? '' : 'none';
-        endMark.style.display = list.length >= total && total>0 ? '' : 'none';
       }
     };
+    retryBtn.addEventListener('click', ()=>{ failed = false; retryBtn.classList.add('hidden'); loadMore(); });
 
-    // Наблюдаем за «сентинелом» внизу списка и подгружаем при приближении
     const io = new IntersectionObserver((entries)=>{
-      for (const e of entries){
-        if (e.isIntersecting) loadMore();
-      }
-    }, { rootMargin: '200px 0px' });
+      if (entries.some(e => e.isIntersecting)) loadMore();
+    }, { rootMargin: '300px 0px' });
     io.observe(sentinel);
     App._listObserver = io; // отключим при следующей навигации (см. mountNavbar)
-
-    // initial chunk
     loadMore();
   },
 
   async listByCharacteristic(_, key){
+    const seq = Router.seq;
+    const c = CHARACTERISTICS.find(x=>x.key===key);
+    if (!c) { Router.go('/', { replace:true }); return; }
     await this.mountNavbar();
     const all = await this.getTeachers();
-    const list = Array.isArray(all) ? all : [];
-    const c = CHARACTERISTICS.find(x=>x.key===key); if(!c) return Router.go('/');
-    const sorted = this.sortByValueThenAlpha([...list], t=>characteristicAvg(t,key));
+    if (Router.isStale(seq)) return;
+    if (!all) { this.renderError('Не удалось загрузить список учителей.', ()=>this.listByCharacteristic(_, key)); return; }
+    const sorted = this.sortByValueThenAlpha([...all], t=>characteristicAvg(t,key));
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Топ учителей — ${c.name}</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        <div class="page-head">
+          <h2>Топ: ${esc(c.name)}</h2>
+          <a class="link" href="#/">← На главную</a>
         </div>
         <div class="list">
-          ${sorted.map(t => this.teacherTile(t, fmtStars(characteristicAvg(t,key)))).join('')}
+          ${sorted.map(t => this.teacherTile({ ...t, ratings: { [key]: t.ratings?.[key] } }, characteristicAvg(t,key))).join('') || '<div class="empty">Пока нет учителей</div>'}
         </div>
       </section>`;
   },
 
   async listByDepartment(_, dept){
+    const seq = Router.seq;
     await this.mountNavbar();
     const all = await this.getTeachers();
-    const list = Array.isArray(all) ? all : [];
+    if (Router.isStale(seq)) return;
     let name = '';
     try { name = decodeURIComponent(dept); } catch { name = String(dept || ''); }
-    const filtered = this.sortByValueThenAlpha(list.filter(t=>t.department===name), t=>overall(t));
+    if (!all) { this.renderError('Не удалось загрузить список учителей.', ()=>this.listByDepartment(_, dept)); return; }
+    const filtered = this.sortByValueThenAlpha(all.filter(t=>t.department===name), t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Кафедра — ${esc(name)}</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        <div class="page-head">
+          <h2>${esc(name)}</h2>
+          <a class="link" href="#/">← На главную</a>
         </div>
+        ${filtered.length ? html`<p class="page-sub">${countLabel(filtered.length, ['учитель','учителя','учителей'])}</p>` : ''}
         <div class="list">
-          ${filtered.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('') || '<div class="empty">Пока нет учителей</div>'}
+          ${filtered.map(t => this.teacherTile(t, overall(t))).join('') || '<div class="empty">На этой кафедре пока нет учителей</div>'}
         </div>
       </section>`;
   },
 
   async listBySearch(_, query){
+    const seq = Router.seq;
     await this.mountNavbar();
     let decoded = '';
     try { decoded = decodeURIComponent(query) || ''; } catch { decoded = String(query || ''); }
-    const q = normalizeSearchQuery(decoded).trim().toLowerCase();
+    const q = normalizeSearchQuery(decoded).trim();
+    if (!q) { Router.go('/teachers', { replace:true }); return; }
     const all = await this.getTeachers();
-    const list = Array.isArray(all) ? all : [];
-    const matched = list.filter(t => ([t.lastName, t.firstName, t.patronymic].filter(Boolean).join(' ')).toLowerCase().includes(q));
+    if (Router.isStale(seq)) return;
+    if (!all) { this.renderError('Не удалось выполнить поиск.', ()=>this.listBySearch(_, query)); return; }
+    const matched = all.filter(t => matchesQuery(t, q));
     const sorted = this.sortByValueThenAlpha(matched, t=>overall(t));
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Результаты поиска: “${esc(q)}”</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+        <div class="page-head">
+          <h2>Поиск: «${esc(q)}»</h2>
+          <a class="link" href="#/">← На главную</a>
         </div>
         <div class="list">
-          ${sorted.map(t => this.teacherTile(t, fmtStars(overall(t)))).join('') || '<div class="empty">Ничего не найдено</div>'}
+          ${sorted.map(t => this.teacherTile(t, overall(t))).join('') || html`
+            <div class="empty-state">
+              <p>По запросу «${esc(q)}» никого не нашлось. Проверьте написание — искать можно по имени, фамилии или отчеству в любом порядке.</p>
+              <a class="btn outline" href="#/teacher-request">Предложить учителя</a>
+            </div>`}
         </div>
       </section>`;
   },
 
+  /* --- правила --- */
   async viewPolicy(){
+    const seq = Router.seq;
     await this.mountNavbar();
-    const effectiveDate = '14 сентября 2025';
+    if (Router.isStale(seq)) return;
+    const effectiveDate = '24 сентября 2026';
 
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="list-controls" style="display:flex; justify-content:flex-end">
+        <div class="page-head end">
           <a class="link" href="#/">← На главную</a>
         </div>
 
@@ -1511,8 +1300,8 @@ async viewHome(){
 
           <h2>2. Пользовательский контент и модерация</h2>
           <p>
-            Комментарии и оценки на сайте формируются пользователями и отражают их субъективные мнения. Администрация не проверяет каждое сообщение
-            до публикации и не может гарантировать его достоверность.
+            Отзывы и оценки на сайте формируются пользователями и отражают их субъективные мнения. Администрация не может гарантировать
+            их достоверность. Отзывы проходят автоматическую проверку, часть из них — ручную модерацию.
           </p>
           <p><strong>Запрещено публиковать:</strong></p>
           <ul>
@@ -1522,45 +1311,48 @@ async viewHome(){
             <li>рекламу и спам, вредоносные ссылки, материалы, нарушающие авторские и смежные права.</li>
           </ul>
           <p>
-            Мы вправе без предупреждения <strong>скрывать, редактировать или удалять</strong> сообщения, нарушающие данные правила.
-            Повторные нарушения могут повлечь ограничение доступа.
+            Мы вправе без предупреждения <strong>скрывать или удалять</strong> сообщения, нарушающие данные правила.
+            За нецензурную лексику аккаунт блокируется автоматически; за другие нарушения доступ может быть ограничен.
           </p>
 
-          <h2>3. Отказ от ответственности</h2>
-          <p>
-            Вся информация на сайте предоставляется «как есть». Администрация не несёт ответственности за:
-          </p>
+          <h2>3. Конфиденциальность</h2>
           <ul>
-            <li>содержание пользовательских комментариев и оценок;</li>
+            <li>Для входа мы храним адрес школьной почты. Другие пользователи его не видят.</li>
+            <li>Отзывы публикуются анонимно: остальные видят только купленный в магазине ник или «Аноним». Администраторы видят автора — это нужно для модерации.</li>
+            <li>Оценки учителям показываются только в виде средних значений.</li>
+            <li>Для защиты от взлома и злоупотреблений сохраняются технические данные входа (IP-адрес, браузер, время) — не дольше 90 дней.</li>
+          </ul>
+
+          <h2>4. Отказ от ответственности</h2>
+          <p>Вся информация на сайте предоставляется «как есть». Администрация не несёт ответственности за:</p>
+          <ul>
+            <li>содержание пользовательских отзывов и оценок;</li>
             <li>любой возможный ущерб, причины которого прямо или косвенно связаны с использованием сайта или размещённой на нём информации;</li>
             <li>временные сбои, перерывы в работе, изменение или удаление материалов.</li>
           </ul>
           <p>
-            Мнения пользователей могут не совпадать с позициями администрации. При получении надлежащего уведомления о нарушении прав/закона
+            Мнения пользователей могут не совпадать с позицией администрации. При получении надлежащего уведомления о нарушении прав/закона
             мы оперативно рассмотрим обращение и примем необходимые меры.
           </p>
 
-          <h2>4. Порядок уведомления и удаления (Notice &amp; Takedown)</h2>
+          <h2>5. Порядок уведомления и удаления (Notice &amp; Takedown)</h2>
           <p>
-            Если вы считаете, что какой-либо материал нарушает закон, ваши права или данные правила, направьте нам обращение.
-            Для ускорения рассмотрения укажите:
+            Если вы считаете, что какой-либо отзыв нарушает закон, ваши права или данные правила, нажмите «Пожаловаться» под ним —
+            жалоба сразу уходит модераторам. Для ускорения рассмотрения укажите:
           </p>
           <ul>
-            <li>прямую ссылку на страницу и точную цитату спорного фрагмента;</li>
             <li>основание претензии (например, клевета, нарушение авторских прав, разглашение персональных данных);</li>
-            <li>своё имя и контакт для связи; при необходимости — подтверждающие документы/правоустанавливающие сведения.</li>
+            <li>при необходимости — как с вами связаться и подтверждающие сведения.</li>
           </ul>
-          <p>
-            Мы обычно рассматриваем обращения в течение <strong>трёх рабочих дней</strong> и сообщаем о результатах на указанный контакт.
-          </p>
+          <p>Мы обычно рассматриваем обращения в течение <strong>трёх рабочих дней</strong>.</p>
 
-          <h2>5. Фотографии и авторские права</h2>
+          <h2>6. Фотографии и авторские права</h2>
           <p>
             Изображения на сайте используются в информационных целях. Если вы являетесь правообладателем и считаете,
-            что материал использован неправомерно, направьте обращение — мы оперативно удалим или заменим изображение.
+            что материал использован неправомерно, сообщите нам — мы оперативно удалим или заменим изображение.
           </p>
 
-          <h2>6. Изменения документа</h2>
+          <h2>7. Изменения документа</h2>
           <p>
             Мы можем обновлять данный документ, чтобы отражать изменения в функциональности или требованиях законодательства.
             Дата актуальной редакции указывается вверху страницы. Продолжая пользоваться сайтом, вы соглашаетесь с обновлённой редакцией.
@@ -1570,775 +1362,789 @@ async viewHome(){
     `;
   },
 
-  // --- pending ratings
-  pendingRatings: {},
-  setPending(tid,key,v){ if(!this.pendingRatings[tid]) this.pendingRatings[tid]={}; this.pendingRatings[tid][key]=v; },
-  getPending(tid){ return this.pendingRatings[tid]||{}; },
-  resetPending(tid){ this.pendingRatings[tid]={}; },
+  /* --- профиль учителя --- */
   _lastCommentNotice: null,
-  setCommentNotice(notice){
-    if (notice && notice.teacherId) {
-      this._lastCommentNotice = {
-        teacherId: notice.teacherId,
-        text: String(notice.text || ''),
-        tone: notice.tone || 'muted'
-      };
-    } else {
-      this._lastCommentNotice = null;
-    }
-  },
-  consumeCommentNotice(teacherId){
-    if (this._lastCommentNotice && this._lastCommentNotice.teacherId === teacherId) {
-      const note = this._lastCommentNotice;
-      this._lastCommentNotice = null;
-      return note;
-    }
-    return null;
-  },
 
-  async teacherProfile(_, tid, prefetched){
-    const data = prefetched || await API.teacher(tid);
-    if(!data || data.error){ Router.go('/'); return; }
+  async teacherProfile(_, tid){
+    const seq = Router.seq;
+    const data = await API.teacher(tid);
+    if (Router.isStale(seq)) return;
     await this.mountNavbar();
+    if (Router.isStale(seq)) return;
+    if (!data.ok) {
+      if (data._status === 404) {
+        $('#app').innerHTML = html`
+          <section class="section">
+            <div class="empty-state">
+              <p>Такого учителя нет в каталоге — возможно, карточку удалили или ссылка неверная.</p>
+              <a class="btn outline" href="#/teachers">Все учителя</a>
+            </div>
+          </section>`;
+      } else {
+        this.renderError(errorText(data, 'Не удалось загрузить страницу учителя.'), ()=>this.teacherProfile(_, tid));
+      }
+      return;
+    }
+    this.renderTeacherProfile(data);
+  },
 
-    const t = data; // содержит comments с like/dislike агрегацией и myVote/own (+author_email для админов)
+  renderTeacherProfile(t){
     const amAdmin = !!Auth._state._isAdmin;
-    const pendingNotice = this.consumeCommentNotice(t.id);
-
-    const charCards = CHARACTERISTICS.map(c=>{
-      const cur = characteristicAvg(t,c.key);
-      const g = `stars-${c.key}`;
-      return html`
-        <div class="char-card">
-          <h4>${c.name}</h4>
-          <div class="current">Средняя: ${fmtStars(cur)}</div>
-          <div class="stars" role="radiogroup" aria-label="${c.name}">
-            ${[5,4,3,2,1].map(v=>html`
-              <input type="radio" id="${g}-${v}" name="${g}" value="${v}" aria-label="Оценка ${v} из 5" ${Auth.isLogged()?'':'disabled'}/>
-              <label for="${g}-${v}" title="${v}">★</label>
-            `).join('')}
-          </div>
-        </div>`;
-    }).join('');
-
-    const commentsHtml = (t.comments&&t.comments.length)
-      ? t.comments.slice().reverse().map(c=>{
-        const authorName = c.authorDisplay || 'Аноним';
-        return html`
-        <div class="comment" data-cid="${escAttr(c.id)}">
-          <div class="meta">
-            ${esc(authorName)} · ${new Date(c.ts).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'})}
-            ${amAdmin && (c.author_email||c.author_uid) ? html`
-              <span class="badge" title="Видно только администраторам" style="margin-left:8px">
-                ${esc(c.author_email || c.author_uid)}
-              </span>` : ''}
-          </div>
-          <div class="ctext">${esc(c.text||'')}</div>
-          <div class="cactions" style="display:flex;gap:8px;align-items:center">
-            <button class="iconbtn like ${c.myVote===1?'active':''}" aria-label="Лайк" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':'Лайк'}">👍 <span class="cnt">${c.likes||0}</span></button>
-            <button class="iconbtn dislike ${c.myVote===-1?'active':''}" aria-label="Дизлайк" ${!Auth.isLogged() || c.isOwn ? 'disabled' : ''} title="${c.isOwn?'Нельзя голосовать за свой комментарий':'Дизлайк'}">👎 <span class="cnt">${c.dislikes||0}</span></button>
-            <button class="btn small outline report-btn" aria-label="Пожаловаться">🚩 Пожаловаться</button>
-            ${amAdmin ? html`<button class="btn small outline del-comment">Удалить</button>`:''}
-          </div>
-        </div>`;
-      }).join('')
-      : '<div class="empty">Комментариев пока нет</div>';
-
     const banned = !!Auth._state._isBanned;
+    const myRatings = t.myRatings || {};
+    const fio = fullName(t);
 
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <div class="row" style="gap:14px">
-            <button id="backBtn" class="btn small outline" type="button">← Назад</button>
-            <h2 style="margin:0">${esc([t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' '))}</h2>
-          </div>
+        <div class="profile-head">
+          <button id="backBtn" class="btn small outline" type="button">← Назад</button>
+          <h2>${esc(fio)}</h2>
         </div>
 
-        <div class="profile" style="margin-top:12px">
-          <div class="kv">
-            <div class="portrait-lg"><img src="${escAttr(t.photo||'')}" alt=""></div>
+        <div class="profile">
+          <aside class="panel profile-side">
+            <div class="portrait-lg"><img src="${escAttr(t.photo||'')}" alt="Фото: ${escAttr(fio)}"></div>
             <dl>
-              <dt>Кафедра</dt><dd>${esc(t.department)}</dd>
-              <dt>Предметы</dt><dd>${esc(t.subjects?.join(', ')||'')}</dd>
-              <dt>Общий рейтинг</dt><dd>${fmtStars(overall(t))}</dd>
+              <dt>Кафедра</dt><dd>${esc(t.department) || '—'}</dd>
+              <dt>Предметы</dt><dd>${esc(t.subjects?.join(', ')) || '—'}</dd>
+              <dt>Общий рейтинг</dt><dd id="overallRating"></dd>
             </dl>
-          </div>
+          </aside>
 
-          <div class="kv">
-            <h3 style="margin:0 0 10px;color:var(--blue-700)">Оценки по характеристикам</h3>
-            <div class="char-grid">${charCards}</div>
-            <div class="hr"></div>
-
-            <div class="comment-box">
-              <h3 style="margin:6px 0 8px;color:var(--blue-700)">Оставить комментарий</h3>
-              ${Auth.isLogged()
-                ? html`
-                    ${banned ? html`<div class="empty">У вашего аккаунта запрещены <b>текстовые</b> комментарии. Вы всё ещё можете отправлять <b>только оценки</b> без текста.</div>`:''}
-                    <textarea id="commentText" placeholder="${banned ? 'Текст сейчас отправить нельзя (бан на комментарии). Можно выставить оценки выше и нажать «Опубликовать» без текста.' : 'Напишите анонимный отзыв… (можно пусто — тогда отправятся только оценки)'}" ${banned?'':''}></textarea>
-                    <div class="row" style="margin-top:8px;justify-content:space-between">
-                      <div class="muted">Оценки отправятся вместе с комментарием. Можно отправить только оценки без текста.</div>
-                      <button class="btn primary" id="publishBtn" data-tid="${escAttr(t.id)}">Опубликовать</button>
-                    </div>`
-                : html`<div class="empty">Чтобы оставить комментарий и оценку, нажмите «Войти» сверху.</div>`
-              }
-              <div id="commentStatus" class="muted" style="margin-top:6px; min-height:18px;">${pendingNotice?.text || ''}</div>
+          <div class="panel">
+            <h3 class="panel-title">Оценки по характеристикам</h3>
+            <p class="muted small" style="margin:-6px 0 12px">${banned ? 'Оценивать нельзя: аккаунт заблокирован.' : 'Нажмите на звезду — оценка сохранится сразу. Изменить её можно в любой момент.'}</p>
+            <div class="char-grid" id="charGrid">
+              ${CHARACTERISTICS.map(c => html`
+                <div class="char-card" data-key="${c.key}">
+                  <h4>${c.name}</h4>
+                  <div class="current"></div>
+                  <div class="stars ${banned ? 'disabled' : ''}" role="radiogroup" aria-label="${escAttr(c.name)}">
+                    ${[5,4,3,2,1].map(v=>html`
+                      <input type="radio" id="stars-${c.key}-${v}" name="stars-${c.key}" value="${v}" ${myRatings[c.key] === v ? 'checked' : ''} ${banned ? 'disabled' : ''}>
+                      <label for="stars-${c.key}-${v}" title="${v} из 5" aria-label="${v} из 5">★</label>
+                    `).join('')}
+                  </div>
+                  <div class="mine"></div>
+                </div>`).join('')}
             </div>
 
             <div class="hr"></div>
-            <h3 style="margin:0 0 8px;color:var(--blue-700)">Комментарии</h3>
-            <div id="comments">${commentsHtml}</div>
+
+            <div class="comment-box">
+              <h3 class="panel-title">Оставить отзыв</h3>
+              ${banned
+                ? '<div class="notice danger">Ваш аккаунт заблокирован за нарушение правил: отзывы, оценки и лайки недоступны.</div>'
+                : html`
+                  <div class="field">
+                    <textarea id="commentText" class="input" maxlength="${COMMENT_MAX_LEN}" rows="4" placeholder="Как объясняет, как проходят уроки, что понравилось или нет…"></textarea>
+                    <div class="field-counter"><span id="commentCount">0</span> / ${COMMENT_MAX_LEN}</div>
+                  </div>
+                  <div class="form-actions">
+                    <span class="muted small">Другие ученики не видят, кто автор, — только ваш ник или «Аноним».</span>
+                    <button class="btn primary" id="publishBtn" type="button">Опубликовать</button>
+                  </div>`}
+              <div id="commentStatus" class="status-msg" role="status" style="margin-top:8px"></div>
+            </div>
+
+            <div class="hr"></div>
+            <h3 class="panel-title">Отзывы <span class="muted" id="commentsCount"></span></h3>
+            <div id="comments" class="comments"></div>
           </div>
         </div>
       </section>`;
 
-    // обработчики профиля
-    const statusBox = document.getElementById('commentStatus');
-    const setStatus = (text = '', tone = 'muted') => {
+    const state = { teacher: t };
+    const statusBox = $('#commentStatus');
+    const setStatus = (text = '', tone = '') => {
       if (!statusBox) return;
       statusBox.textContent = text || '';
-      statusBox.style.color = tone === 'success' ? '#0a7c2d'
-        : tone === 'warn' ? '#9a3412'
-        : '#6b7280';
+      statusBox.className = `status-msg ${tone}`;
     };
-    if (pendingNotice) {
-      setStatus(pendingNotice.text, pendingNotice.tone);
-    } else {
-      setStatus('', 'muted');
-    }
-    $('#backBtn')?.addEventListener('click', ()=>history.back());
-    for(const c of CHARACTERISTICS) for(const v of [1,2,3,4,5]){
-      const el = document.getElementById(`stars-${c.key}-${v}`);
-      if(el) el.addEventListener('change', ()=>App.setPending(t.id,c.key,v));
-    }
-    $('#publishBtn')?.addEventListener('click', async(e)=>{
-      const tid = e.currentTarget.dataset.tid;
-      if(!Auth.isLogged()) return alert('Нужно войти.');
-      const text=$('#commentText').value.trim();
-      const ratings={...App.getPending(tid)};
-      const hasRatings = Object.keys(ratings).length>0;
+    const notice = this._lastCommentNotice;
+    if (notice && notice.teacherId === t.id) setStatus(notice.text, notice.tone);
+    this._lastCommentNotice = null;
 
-      // клиентская предмодерация
-      if (text && hasBW(text)) {
-        return alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст.');
+    // Средние значения и «ваша оценка» — обновляются без перерисовки страницы.
+    const renderRatings = () => {
+      const cur = state.teacher;
+      const my = cur.myRatings || {};
+      $('#overallRating').innerHTML = fmtStars(overall(cur)) + (ratersCount(cur) ? html` <span class="rating-count">· ${countLabel(ratersCount(cur), RATING_FORMS)}</span>` : '');
+      for (const c of CHARACTERISTICS) {
+        const cardEl = $(`.char-card[data-key="${c.key}"]`);
+        if (!cardEl) continue;
+        const cnt = characteristicCount(cur, c.key);
+        cardEl.querySelector('.current').innerHTML = `Средняя: ${fmtStars(characteristicAvg(cur, c.key))}` + (cnt ? html`<span class="rating-count">· ${countLabel(cnt, RATING_FORMS)}</span>` : '');
+        cardEl.querySelector('.mine').textContent = my[c.key] ? `Ваша оценка: ${my[c.key]}` : '';
       }
-      if (Auth._state._isBanned && text){
-        return alert('У вашего аккаунта запрещено оставлять текстовые комментарии. Можно отправить только оценки без текста.');
-      }
+    };
 
-      if(!text && !hasRatings){
-        return alert('Нужно написать комментарий или выбрать хотя бы одну оценку.');
-      }
-      try{
-        setStatus('Отправляем...', 'muted');
-        const result = await API.publish({ teacherId:tid, text, ratings, author:'Student' });
-        const teacherPayload = result?.teacher && typeof result.teacher === 'object' ? result.teacher : null;
-        const pendingReview = !!result?.pendingReview;
-        const moderationUnavailable = !!result?.moderationUnavailable;
-        let noticeText, noticeTone;
-        if (moderationUnavailable) {
-          noticeText = result?.ratingsSaved
-            ? 'Оценки сохранены. Текст не удалось отправить на проверку — попробуйте позже.'
-            : 'Не удалось отправить текст на проверку — попробуйте позже.';
-          noticeTone = 'warn';
-        } else if (pendingReview) {
-          noticeText = 'Комментарий отправлен на модерацию — появится после проверки.';
-          noticeTone = 'warn';
-        } else {
-          noticeText = text ? 'Комментарий опубликован!' : 'Оценки сохранены!';
-          noticeTone = 'success';
-        }
-        this.setCommentNotice({ teacherId: tid, text: noticeText, tone: noticeTone });
-        App.resetPending(tid);
-        await App.teacherProfile(null,tid, teacherPayload);
+    const renderComments = () => {
+      const cur = state.teacher;
+      const list = Array.isArray(cur.comments) ? cur.comments : []; // сервер отдаёт новые сверху
+      $('#commentsCount').textContent = list.length ? `(${list.length})` : '';
+      $('#comments').innerHTML = list.length ? list.map(c => {
+        const own = !!c.isOwn;
+        return html`
+          <div class="comment ${own ? 'own' : ''}" data-cid="${escAttr(c.id)}">
+            <div class="meta">
+              <span class="author">${esc(c.authorDisplay || 'Аноним')}</span>
+              <span>${fmtDate(c.ts)}</span>
+              ${own ? '<span class="badge">Ваш отзыв</span>' : ''}
+              ${amAdmin && (c.author_email || c.author_uid) ? html`<span class="badge muted" title="Видно только администраторам">${esc(c.author_email || c.author_uid)}</span>` : ''}
+            </div>
+            <div class="ctext">${esc(c.text || '')}</div>
+            <div class="cactions">
+              <button class="iconbtn like ${c.myVote===1?'active':''}" type="button" aria-label="Нравится" aria-pressed="${c.myVote===1}" ${own || banned ? 'disabled' : ''} title="${own ? 'Нельзя голосовать за свой отзыв' : 'Нравится'}">👍 <span class="cnt">${c.likes||0}</span></button>
+              <button class="iconbtn dislike ${c.myVote===-1?'active':''}" type="button" aria-label="Не нравится" aria-pressed="${c.myVote===-1}" ${own || banned ? 'disabled' : ''} title="${own ? 'Нельзя голосовать за свой отзыв' : 'Не нравится'}">👎 <span class="cnt">${c.dislikes||0}</span></button>
+              <span class="spacer"></span>
+              ${own ? '' : '<button class="linkbtn report-btn" type="button">Пожаловаться</button>'}
+              ${own || amAdmin ? '<button class="linkbtn danger del-comment" type="button">Удалить</button>' : ''}
+            </div>
+          </div>`;
+      }).join('') : '<div class="empty">Отзывов пока нет — будьте первым.</div>';
+    };
+
+    renderRatings();
+    renderComments();
+
+    $('#backBtn')?.addEventListener('click', ()=>Router.back());
+
+    // Счётчик символов.
+    const textarea = $('#commentText');
+    textarea?.addEventListener('input', ()=>{ $('#commentCount').textContent = String(textarea.value.length); });
+
+    // Оценка сохраняется сразу по клику на звезду (раньше выбранные звёзды
+    // «висели» неотправленными и могли уйти вместе с чужим отзывом).
+    $('#charGrid')?.addEventListener('change', async (e)=>{
+      const input = e.target.closest('input[type="radio"]');
+      if (!input) return;
+      const key = input.name.replace('stars-', '');
+      const value = Number(input.value);
+      const prev = state.teacher.myRatings?.[key] || 0;
+      const mineEl = input.closest('.char-card')?.querySelector('.mine');
+      if (mineEl) mineEl.textContent = 'Сохраняем…';
+      const res = await API.publish({ teacherId: t.id, ratings: { [key]: value } });
+      if (res.ok && res.teacher) {
+        state.teacher = { ...res.teacher };
+        this.invalidateTeachers();
+        renderRatings();
         Auth.refreshStatsAndPopover();
-      }catch(err){
-        const code = err?.code || err?.message;
-        if (code === 'rate_limited'){
-          const sec = Math.max(1, Math.ceil((err.retry_after_ms ?? 60_000) / 1000));
-          setStatus(`Слишком часто. Попробуйте через ${sec} сек.`, 'warn');
-          alert(`Слишком часто. \nПопробуйте через ${sec} сек.`);
-        } else if (code === 'profanity_forbidden') {
-          setStatus('Комментарий содержит запрещённую лексику. Исправьте текст и попробуйте снова.', 'warn');
-          alert('Комментарий содержит запрещённую лексику. Пожалуйста, исправьте текст и попробуйте снова.');
-        } else if (code === 'commenting_banned' || code === 'banned') {
-          setStatus('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.', 'warn');
-          alert('Вам запрещено оставлять текстовые комментарии. Можно отправлять только оценки без текста.');
-        } else if (code === 'comment_blocked') {
-          const reasonLabel = err?.reason === 'llm_block'
-            ? 'AI-модерация отклонила текст.'
-            : 'Комментарий не прошёл проверку.';
-          setStatus(reasonLabel, 'warn');
-          alert(reasonLabel);
-        } else if (err?.code === 'toxic_comment' || (typeof err?.score === 'number' && err.score >= 0.5)) {
-          const scoreText = typeof err.score === 'number' ? ` (вероятность токсичности: ${Math.round(err.score * 100)}%)` : '';
-          setStatus('Комментарий был отклонён системой модерации как токсичный.' + scoreText, 'warn');
-          alert('Комментарий был отклонён системой модерации как токсичный.' + scoreText);
-        } else {
-          setStatus('Не удалось опубликовать комментарий. Попробуйте позже.', 'warn');
-          alert('Не удалось опубликовать :(');
-        }
+        UI.toast(prev ? 'Оценка обновлена' : 'Оценка сохранена', 'success', 2200);
+      } else {
+        // Откатываем выбор звезды к сохранённой оценке.
+        $$(`input[name="stars-${key}"]`).forEach(r => { r.checked = Number(r.value) === prev; });
+        renderRatings();
+        if (res.error !== 'banned') UI.toast(errorText(res, 'Не удалось сохранить оценку.'), 'error');
       }
     });
 
-    // лайки/дизлайки + удаление коммента (админ)
-    $('#comments')?.addEventListener('click', async (e)=>{
-      const delBtn = e.target.closest('.del-comment');
-      if (delBtn && Auth._state._isAdmin) {
-        const commentEl = e.target.closest('.comment');
-        const cid = commentEl?.dataset?.cid;
-        if (!cid) return;
-        if (!confirm('Удалить комментарий?')) return;
-        try{
-          const r = await API.adminDeleteComment(cid);
-          if (r.ok) commentEl.remove();
-          else alert('Не удалось удалить комментарий.');
-        }catch{
-          alert('Ошибка сети.');
-        }
+    $('#publishBtn')?.addEventListener('click', (e)=>withBusy(e.currentTarget, async ()=>{
+      const text = (textarea?.value || '').trim();
+      if (!text) { setStatus('Напишите текст отзыва.', 'error'); textarea?.focus(); return; }
+      if (text.length > COMMENT_MAX_LEN) { setStatus(`Слишком длинно: максимум ${COMMENT_MAX_LEN} символов.`, 'error'); return; }
+      if (hasProfanity(text)) {
+        setStatus('Уберите нецензурные слова: такие отзывы не публикуются, а за повторные попытки аккаунт блокируется.', 'error');
         return;
       }
-      // жалоба на комментарий
-      const reportBtn = e.target.closest('.report-btn');
-      if (reportBtn) {
-        const commentEl = e.target.closest('.comment');
-        const cid = commentEl?.dataset?.cid;
-        if (!cid) return;
-        const reasonRaw = prompt('Причина жалобы (оскорбления, спам и т.д.):');
-        const reason = reasonRaw?.trim();
-        if (!reason) return;
-        try {
-          const r = await fetch('/api/report-comment', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ commentId: cid, reason })
-          });
-          let data = null;
-          try {
-            data = await r.json();
-          } catch {}
-          if (r.ok && data?.ok !== false) {
-            alert('Жалоба отправлена. Спасибо!');
+      setStatus('Отправляем…');
+      const res = await API.publish({ teacherId: t.id, text });
+      if (res.ok) {
+        const teacherPayload = res.teacher && typeof res.teacher === 'object' ? res.teacher : null;
+        if (res.moderationUnavailable) {
+          setStatus('Не удалось отправить отзыв на проверку — попробуйте позже. Текст сохранён в поле.', 'warn');
+          return; // текст не теряем
+        }
+        if (textarea) { textarea.value = ''; $('#commentCount').textContent = '0'; }
+        if (res.pendingReview) setStatus('Отзыв отправлен на проверку модератору и появится после одобрения.', 'warn');
+        else { setStatus(''); UI.toast('Отзыв опубликован', 'success'); }
+        if (teacherPayload) { state.teacher = teacherPayload; renderRatings(); renderComments(); }
+        Auth.refreshStatsAndPopover();
+        return;
+      }
+      const code = res.error;
+      if (code === 'rate_limited') {
+        const sec = Math.max(1, Math.ceil((res.retry_after_ms ?? 20000) / 1000));
+        setStatus(`Слишком часто — подождите ${sec} сек. и отправьте снова.`, 'warn');
+      } else if (code === 'comment_blocked') {
+        if (res.reason === 'profanity') {
+          if (res.banned) {
+            setStatus('Аккаунт заблокирован за повторную нецензурную лексику.', 'error');
+            Auth.me();
           } else {
-            const errorText = data?.description || data?.error || 'не удалось отправить жалобу.';
-            alert('Ошибка: ' + errorText);
+            const left = Number(res.strikes_left) || 0;
+            setStatus(`Отзыв не опубликован: нецензурная лексика.${left ? ` Ещё ${countLabel(left, ['нарушение','нарушения','нарушений'])} — и аккаунт заблокируют.` : ''}`, 'error');
           }
-        } catch {
-          alert('Ошибка соединения');
+        } else {
+          setStatus('Модерация не пропустила отзыв: похоже на оскорбление. Переформулируйте, пожалуйста.', 'error');
         }
-        return;
+      } else if (code === 'too_long') {
+        setStatus(`Слишком длинно: максимум ${COMMENT_MAX_LEN} символов.`, 'error');
+      } else if (code !== 'banned') {
+        setStatus(errorText(res, 'Не удалось опубликовать отзыв. Попробуйте позже.'), 'error');
       }
-      const likeBtn = e.target.closest('.iconbtn.like');
-      const dislikeBtn = e.target.closest('.iconbtn.dislike');
-      if (!likeBtn && !dislikeBtn) return;
+    }));
 
+    // Лайки/дизлайки, жалобы, удаление.
+    $('#comments')?.addEventListener('click', async (e)=>{
       const commentEl = e.target.closest('.comment');
       const cid = commentEl?.dataset?.cid;
       if (!cid) return;
 
-      const isLike = !!likeBtn;
-      const btn = isLike ? likeBtn : dislikeBtn;
+      const delBtn = e.target.closest('.del-comment');
+      if (delBtn) {
+        const own = commentEl.classList.contains('own');
+        const ok = await UI.confirm({
+          title: 'Удалить отзыв?',
+          text: own ? 'Отзыв исчезнет насовсем, а монеты за него спишутся.' : 'Отзыв будет удалён без возможности восстановления.',
+          confirmText: 'Удалить', danger: true
+        });
+        if (!ok) return;
+        await withBusy(delBtn, async ()=>{
+          const res = own ? await API.deleteOwnComment(cid) : await API.adminDeleteComment(cid);
+          if (!res.ok) { UI.toast(errorText(res, 'Не удалось удалить отзыв.'), 'error'); return; }
+          state.teacher.comments = (state.teacher.comments || []).filter(c => String(c.id) !== String(cid));
+          renderComments();
+          UI.toast('Отзыв удалён', 'success', 2200);
+          Auth.refreshStatsAndPopover();
+        });
+        return;
+      }
+
+      const reportBtn = e.target.closest('.report-btn');
+      if (reportBtn) {
+        const reason = await UI.prompt({
+          title: 'Пожаловаться на отзыв',
+          text: 'Опишите, что не так: оскорбление, спам, личные данные… Жалоба уйдёт модераторам.',
+          placeholder: 'Причина жалобы', confirmText: 'Отправить', required: true, maxLength: 500
+        });
+        if (!reason) return;
+        await withBusy(reportBtn, async ()=>{
+          const res = await API.reportComment(cid, reason);
+          if (res.ok) UI.toast('Жалоба отправлена. Спасибо!', 'success');
+          else UI.toast(errorText(res, 'Не удалось отправить жалобу.'), 'error');
+        });
+        return;
+      }
+
+      const likeBtn = e.target.closest('.iconbtn.like');
+      const dislikeBtn = e.target.closest('.iconbtn.dislike');
+      if (!likeBtn && !dislikeBtn) return;
+      const btn = likeBtn || dislikeBtn;
       if (btn.disabled) return;
+      const vote = btn.classList.contains('active') ? 'none' : (likeBtn ? 'like' : 'dislike');
 
-      const isActive = btn.classList.contains('active');
-      const vote = isActive ? 'none' : (isLike ? 'like' : 'dislike');
-
-      // Блокируем обе кнопки на время запроса — защита от двойного голоса/гонки ответов.
+      // Блокируем обе кнопки на время запроса — защита от двойного голоса.
       const likeEl = commentEl.querySelector('.iconbtn.like');
       const dislikeEl = commentEl.querySelector('.iconbtn.dislike');
-      if (likeEl) likeEl.disabled = true;
-      if (dislikeEl) dislikeEl.disabled = true;
-
-      try{
-        const res = await API.voteComment({ commentId: cid, vote });
-        if (res.ok){
-          if (likeEl) {
-            likeEl.querySelector('.cnt').textContent = res.likes || 0;
-            likeEl.classList.toggle('active', res.myVote===1);
-          }
-          if (dislikeEl){
-            dislikeEl.querySelector('.cnt').textContent = res.dislikes || 0;
-            dislikeEl.classList.toggle('active', res.myVote===-1);
-          }
-          // обновим поповер/статы
-          Auth.refreshStatsAndPopover();
-        }else if (res.error === 'forbidden'){
-          alert('Нельзя голосовать за свой комментарий.');
-        }else if (res.error === 'unauthorized'){
-          alert('Нужно войти.');
-        }else{
-          alert('Не удалось выполнить действие.');
-        }
-      }catch{
-        alert('Ошибка сети.');
-      }finally{
-        // Сюда попадаем только для голосуемых комментариев (свои отсеяны выше по btn.disabled).
-        if (likeEl) likeEl.disabled = false;
-        if (dislikeEl) dislikeEl.disabled = false;
+      likeEl.disabled = dislikeEl.disabled = true;
+      const res = await API.voteComment({ commentId: cid, vote });
+      likeEl.disabled = dislikeEl.disabled = false;
+      if (res.ok) {
+        likeEl.querySelector('.cnt').textContent = res.likes || 0;
+        dislikeEl.querySelector('.cnt').textContent = res.dislikes || 0;
+        likeEl.classList.toggle('active', res.myVote === 1);
+        dislikeEl.classList.toggle('active', res.myVote === -1);
+        likeEl.setAttribute('aria-pressed', String(res.myVote === 1));
+        dislikeEl.setAttribute('aria-pressed', String(res.myVote === -1));
+        const saved = (state.teacher.comments || []).find(c => String(c.id) === String(cid));
+        if (saved) Object.assign(saved, { likes: res.likes, dislikes: res.dislikes, myVote: res.myVote });
+        Auth.refreshStatsAndPopover();
+      } else if (res.error === 'forbidden') {
+        UI.toast('Нельзя голосовать за свой отзыв.', 'warn');
+      } else if (res.error !== 'banned') {
+        UI.toast(errorText(res, 'Не удалось проголосовать.'), 'error');
       }
     });
   },
 
-  // --- экран логина (на весь экран, без навбара/футера — см. body.lockout)
-  async viewLogin(){
+  /* --- экран входа (на весь экран, без шапки/подвала — body.lockout) --- */
+  viewLogin(){
     document.body.classList.add('lockout');
-
     $('#app').innerHTML = html`
       <section class="login-screen">
-        <div class="login-brand"><span class="login-logo">L</span> leto<span>talks</span></div>
-        <div class="kv" id="loginBox">
-          <h2 style="margin:0 0 12px">Вход по почте</h2>
-          <!-- Шаг 1: ввод почты -->
+        <div class="login-brand" aria-hidden="true">
+          <div class="brand-icon">L</div>
+          <div class="brand-text">leto<span>talks</span></div>
+        </div>
+        <div class="panel login-box" id="loginBox">
+          <h2>Вход</h2>
+          <!-- Шаг 1: почта -->
           <div id="stageEmail">
-            <p class="muted">Введите свою почту <strong>${EMAIL_DOMAIN}</strong> — мы отправим на неё 6-значный код для входа.</p>
-            <form id="emailForm">
-              <div class="teacher-request-field">
+            <p class="muted">Введите школьную почту <strong>${EMAIL_DOMAIN}</strong> — пришлём на неё 6-значный код. Пароль не нужен.</p>
+            <form id="emailForm" novalidate>
+              <div class="field">
                 <label for="loginEmail">Электронная почта</label>
-                <input id="loginEmail" type="email" autocomplete="email" placeholder="ivanov.ii@student.letovo.ru" required>
+                <input id="loginEmail" class="input" type="email" autocomplete="email" inputmode="email" placeholder="ivanov.ii${EMAIL_DOMAIN}" required>
               </div>
-              <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">
-                <button type="submit" id="sendCodeBtn" class="btn primary">Получить код</button>
-                <div id="emailStatus" class="status-msg muted"></div>
+              <div class="form-actions">
+                <button type="submit" id="sendCodeBtn" class="btn primary block">Получить код</button>
               </div>
+              <div id="emailStatus" class="status-msg" role="status"></div>
             </form>
           </div>
 
-          <!-- Шаг 2: ввод кода -->
+          <!-- Шаг 2: код -->
           <div id="stageCode" class="hidden">
-            <p class="muted">Код отправлен на <strong id="sentToEmail"></strong>. Введите его ниже.</p>
-            <form id="codeForm">
-              <div class="teacher-request-field">
+            <p class="muted">Код отправлен на <strong id="sentToEmail"></strong>. Письмо может прийти через минуту — проверьте и «Спам».</p>
+            <form id="codeForm" novalidate>
+              <div class="field">
                 <label for="loginCode">Код из письма</label>
-                <input id="loginCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" required>
+                <input id="loginCode" class="input code-input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="••••••" required>
               </div>
-              <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">
-                <button type="submit" id="verifyBtn" class="btn primary">Войти</button>
-                <button type="button" id="changeEmailBtn" class="btn small outline">Изменить почту</button>
-                <div id="codeStatus" class="status-msg muted"></div>
+              <div class="form-actions">
+                <button type="submit" id="verifyBtn" class="btn primary block">Войти</button>
+              </div>
+              <div id="codeStatus" class="status-msg" role="status"></div>
+              <div class="form-actions" style="justify-content:space-between;margin-top:6px">
+                <button type="button" id="changeEmailBtn" class="btn small ghost">← Другая почта</button>
+                <button type="button" id="resendBtn" class="btn small ghost" disabled>Отправить ещё раз</button>
               </div>
             </form>
           </div>
         </div>
+        <a class="link small" href="#/login" id="policyLink">Правила и конфиденциальность</a>
       </section>
     `;
 
     let sessionId = null;
+    let email = '';
+    let resendTimer = null;
     const stageEmail = $('#stageEmail');
     const stageCode  = $('#stageCode');
     const emailInput = $('#loginEmail');
     const codeInput  = $('#loginCode');
-    const emailStatus = $('#emailStatus');
-    const codeStatus  = $('#codeStatus');
-    const setStatus = (el, text, variant='muted')=>{
+    const resendBtn  = $('#resendBtn');
+    const setStatus = (el, text, tone='')=>{
       if (!el) return;
       el.textContent = text || '';
-      el.classList.toggle('error', variant==='error');
-      el.classList.toggle('success', variant==='success');
-      el.classList.toggle('muted', !variant || variant==='muted');
+      el.className = `status-msg ${tone}`;
     };
-
-    $('#emailForm')?.addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const email = (emailInput?.value || '').trim();
-      if (!email) { setStatus(emailStatus, 'Введите почту.', 'error'); return; }
-      const btn = $('#sendCodeBtn');
-      if (btn) btn.disabled = true;
-      setStatus(emailStatus, 'Отправляем код…');
-      try{
-        const r = await apiFetch('/api/auth/request', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ email })
-        });
-        if (r.ok){
-          sessionId = r.session_id;
-          $('#sentToEmail').textContent = email;
-          stageEmail.classList.add('hidden');
-          stageCode.classList.remove('hidden');
-          setStatus(codeStatus, r.email_sent ? '' : 'Письмо не настроено — код показан в консоли сервера (dev).', r.email_sent ? 'muted' : 'muted');
-          codeInput?.focus();
-        } else {
-          setStatus(emailStatus, r.message || (r.error === 'email_not_allowed' ? `Разрешён вход только с почты ${EMAIL_DOMAIN}.` : 'Не удалось отправить код.'), 'error');
-        }
-      }catch{
-        setStatus(emailStatus, 'Ошибка сети. Попробуйте позже.', 'error');
-      }finally{
-        if (btn) btn.disabled = false;
-      }
-    });
-
-    $('#codeForm')?.addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const code = (codeInput?.value || '').trim();
-      if (!code) { setStatus(codeStatus, 'Введите код.', 'error'); return; }
-      const btn = $('#verifyBtn');
-      if (btn) btn.disabled = true;
-      setStatus(codeStatus, 'Проверяем…');
-      try{
-        const r = await apiFetch('/api/auth/verify', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ session_id: sessionId, code })
-        });
-        if (r.ok){
-          const u = r.user || {};
-          Auth.set({
-            loggedIn:true, id:u.id, email:u.email, username:u.username,
-            comment_count:u.comment_count, rating_count:u.rating_count,
-            cast_likes:u.cast_likes||0, cast_dislikes:u.cast_dislikes||0,
-            received_likes:u.received_likes||0, received_dislikes:u.received_dislikes||0,
-            _isAdmin:!!u.is_admin, _isSuperAdmin:!!u.is_super_admin, _isBanned:!!u.is_banned
-          });
-          Router.go('/');
-        } else if (r.error === 'expired'){
-          setStatus(codeStatus, 'Код истёк. Запросите новый.', 'error');
-        } else {
-          setStatus(codeStatus, r.message || 'Неверный код.', 'error');
-        }
-      }catch{
-        setStatus(codeStatus, 'Ошибка сети. Попробуйте позже.', 'error');
-      }finally{
-        if (btn) btn.disabled = false;
-      }
-    });
-
-    $('#changeEmailBtn')?.addEventListener('click', ()=>{
+    const startResendCountdown = (sec = AUTH_CODE_RESEND_SEC) => {
+      clearInterval(resendTimer);
+      let left = Math.max(1, Math.ceil(sec));
+      resendBtn.disabled = true;
+      resendBtn.textContent = `Отправить ещё раз (${left})`;
+      resendTimer = setInterval(()=>{
+        left -= 1;
+        if (!resendBtn.isConnected) { clearInterval(resendTimer); return; }
+        if (left <= 0) { clearInterval(resendTimer); resendBtn.disabled = false; resendBtn.textContent = 'Отправить ещё раз'; }
+        else resendBtn.textContent = `Отправить ещё раз (${left})`;
+      }, 1000);
+    };
+    const showEmailStage = (message = '', tone = '') => {
+      clearInterval(resendTimer);
       sessionId = null;
       stageCode.classList.add('hidden');
       stageEmail.classList.remove('hidden');
       if (codeInput) codeInput.value = '';
-      setStatus(codeStatus, '');
+      setStatus($('#codeStatus'), '');
+      setStatus($('#emailStatus'), message, tone);
       emailInput?.focus();
+    };
+
+    const requestCode = async (statusEl) => {
+      const r = await apiFetch('/api/auth/request', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ email })
+      });
+      if (r.ok) {
+        sessionId = r.session_id;
+        $('#sentToEmail').textContent = email;
+        stageEmail.classList.add('hidden');
+        stageCode.classList.remove('hidden');
+        setStatus($('#codeStatus'), r.email_sent ? '' : 'Почта не настроена — код выведен в консоль сервера (режим разработки).');
+        startResendCountdown();
+        codeInput?.focus();
+        return;
+      }
+      if (r.error === 'code_cooldown') {
+        const sec = Math.ceil((r.retry_after_ms || 60000) / 1000);
+        if (sessionId) { setStatus(statusEl, `Новый код можно запросить через ${sec} сек.`, 'warn'); startResendCountdown(sec); }
+        else setStatus(statusEl, `Код уже отправлен недавно. Новый можно запросить через ${sec} сек.`, 'warn');
+        return;
+      }
+      const messages = {
+        invalid_email: 'Введите корректный адрес почты.',
+        email_not_allowed: `Вход только с почты ${EMAIL_DOMAIN}.`,
+        too_many_codes: 'Слишком много запросов кода для этой почты. Попробуйте через час.',
+        too_many_attempts: 'Слишком много неверных попыток. Попробуйте через час.',
+        email_send_failed: 'Не удалось отправить письмо. Попробуйте чуть позже.',
+      };
+      setStatus(statusEl, messages[r.error] || r.message || errorText(r, 'Не удалось отправить код.'), 'error');
+    };
+
+    $('#emailForm')?.addEventListener('submit', (e)=>{
+      e.preventDefault();
+      email = (emailInput?.value || '').trim().toLowerCase();
+      const statusEl = $('#emailStatus');
+      if (!email) { setStatus(statusEl, 'Введите почту.', 'error'); emailInput?.focus(); return; }
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { setStatus(statusEl, 'Введите корректный адрес почты.', 'error'); return; }
+      withBusy($('#sendCodeBtn'), async ()=>{
+        setStatus(statusEl, 'Отправляем код…');
+        await requestCode(statusEl);
+      });
     });
+
+    const submitCode = () => withBusy($('#verifyBtn'), async ()=>{
+      const code = (codeInput?.value || '').replace(/\D/g, '');
+      const statusEl = $('#codeStatus');
+      if (code.length !== 6) { setStatus(statusEl, 'Код состоит из 6 цифр.', 'error'); codeInput?.focus(); return; }
+      setStatus(statusEl, 'Проверяем…');
+      const r = await apiFetch('/api/auth/verify', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ session_id: sessionId, code })
+      });
+      if (r.ok){
+        clearInterval(resendTimer);
+        Auth.applyUser(r.user);
+        Router.go(Router.takeReturnTo() || '/', { replace:true });
+        return;
+      }
+      if (r.error === 'invalid_code') {
+        const left = Number(r.tries_left);
+        setStatus(statusEl, Number.isFinite(left) && left > 0 ? `Неверный код. Осталось попыток: ${left}.` : 'Неверный код.', 'error');
+        codeInput?.select();
+      } else if (r.error === 'expired' || r.error === 'no_auth_session' || r.error === 'too_many_attempts') {
+        showEmailStage(r.error === 'too_many_attempts'
+          ? 'Слишком много неверных попыток — запросите новый код.'
+          : 'Код больше не действует — запросите новый.', 'warn');
+      } else {
+        setStatus(statusEl, errorText(r, 'Не удалось войти. Попробуйте ещё раз.'), 'error');
+      }
+    });
+    $('#codeForm')?.addEventListener('submit', (e)=>{ e.preventDefault(); submitCode(); });
+    // Ввели 6 цифр — входим сразу (и при вставке из буфера).
+    codeInput?.addEventListener('input', ()=>{
+      const digits = codeInput.value.replace(/\D/g, '').slice(0, 6);
+      if (codeInput.value !== digits) codeInput.value = digits;
+      if (digits.length === 6) submitCode();
+    });
+
+    resendBtn?.addEventListener('click', ()=>withBusy(resendBtn, async ()=>{
+      setStatus($('#codeStatus'), 'Отправляем новый код…');
+      await requestCode($('#codeStatus'));
+    }));
+    $('#changeEmailBtn')?.addEventListener('click', ()=>showEmailStage());
+    // Правила доступны и без входа — открываем их в модальном окне-просмотре.
+    $('#policyLink')?.addEventListener('click', (e)=>{
+      e.preventDefault();
+      UI.confirm({
+        title: 'Коротко о правилах',
+        text: 'Отзывы анонимны для других учеников, администраторы видят автора для модерации. Запрещены мат, оскорбления, травля и личные данные — за мат аккаунт блокируется автоматически. Полный текст правил — в подвале сайта после входа.',
+        confirmText: 'Понятно', cancelText: 'Закрыть'
+      });
+    });
+    emailInput?.focus();
   },
 
-  // --- админ-панель
+  /* --- админ-панель --- */
   async ensureAdmin(){
+    const seq = Router.seq;
     await this.mountNavbar();
+    if (Router.isStale(seq)) return false;
     if (!Auth.isLogged() || !Auth._state._isAdmin) {
-      $('#app').innerHTML = `<section class="section"><div class="empty">Требуются права администратора.</div></section>`;
+      $('#app').innerHTML = `<section class="section"><div class="empty-state"><p>Этот раздел доступен только администраторам.</p><a class="btn outline" href="#/">На главную</a></div></section>`;
       return false;
     }
     return true;
   },
 
   adminTabs(active){
-      const tabs = [
-        { id:'moderation', title:'Модерация комментариев', route:'/admin/moderation' },
-        { id:'bans', title:'Бан/разбан комментирования', route:'/admin/bans' },
-        { id:'teachers', title:'Изменения базы учителей', route:'/admin/teachers' }
-      ];
-      if (Auth._state._isSuperAdmin) {
-        tabs.push({ id:'admins', title:'Управление администраторами', route:'/admin/admins' });
-      }
-      return html`<div class="admin-tabs">${tabs.map(t=>html`<a class="admin-tab ${active===t.id?'active':''}" href="#${t.route}">${t.title}</a>`).join('')}</div>`;
-    },
+    const tabs = [
+      { id:'moderation', title:'Отзывы', route:'/admin/moderation' },
+      { id:'bans', title:'Блокировки', route:'/admin/bans' },
+      { id:'teachers', title:'Учителя', route:'/admin/teachers' }
+    ];
+    if (Auth._state._isSuperAdmin) tabs.push({ id:'admins', title:'Администраторы', route:'/admin/admins' });
+    return html`<nav class="admin-tabs" aria-label="Разделы админки">${tabs.map(t=>html`<a class="admin-tab ${active===t.id?'active':''}" href="#${t.route}" ${active===t.id?'aria-current="page"':''}>${t.title}</a>`).join('')}</nav>`;
+  },
 
   async viewAdminHome(){
     if (!(await this.ensureAdmin())) return;
+    const cards = [
+      { title:'Отзывы', text:'Свежие отзывы и отзывы по авторам, удаление нарушений.', route:'/admin/moderation' },
+      { title:'Блокировки', text:'Блокировка и разблокировка пользователей. Заблокированный не может писать, оценивать и голосовать.', route:'/admin/bans' },
+      { title:'Учителя', text:'Добавление, редактирование и удаление карточек учителей, загрузка фото.', route:'/admin/teachers' },
+    ];
+    if (Auth._state._isSuperAdmin) cards.push({ title:'Администраторы', text:'Выдача и снятие прав администратора.', route:'/admin/admins' });
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
+        <div class="page-head">
           <h2>Админ-панель</h2>
-          <div class="list-controls"><a class="link" href="#/">← На главную</a></div>
+          <a class="link" href="#/">← На главную</a>
         </div>
         <div class="admin-dashboard">
-          <div class="card admin-card">
-            <h3>Модерация комментариев</h3>
-            <p class="muted">Просмотр всех авторов и удаление их комментариев.</p>
-            <button class="btn primary" data-route="/admin/moderation">Перейти</button>
-          </div>
-          <div class="card admin-card">
-            <h3>Бан/Разбан комментирования</h3>
-            <p class="muted">Управление правами на публикацию комментариев.</p>
-            <button class="btn primary" data-route="/admin/bans">Перейти</button>
-          </div>
-          <div class="card admin-card">
-            <h3>Изменения базы учителей</h3>
-            <p class="muted">Добавление, редактирование и удаление карточек учителей.</p>
-            <button class="btn primary" data-route="/admin/teachers">Перейти</button>
-          </div>
-          ${Auth._state._isSuperAdmin ? html`
-          <div class="card admin-card">
-            <h3>Управление администраторами</h3>
-            <p class="muted">Добавление и удаление прав администрирования.</p>
-            <button class="btn primary" data-route="/admin/admins">Перейти</button>
-          </div>` : ''}
+          ${cards.map(c => html`
+            <div class="panel admin-card">
+              <h3>${c.title}</h3>
+              <p>${c.text}</p>
+              <a class="btn primary small" href="#${c.route}">Открыть</a>
+            </div>`).join('')}
         </div>
       </section>
     `;
-
-    $('#app').querySelectorAll('[data-route]')?.forEach(btn=>{
-      btn.addEventListener('click', (e)=>{
-        const route = e.currentTarget.getAttribute('data-route');
-        if (route) Router.go(route);
-      });
-    });
   },
 
   async viewAdminModeration(){
+    const seq = Router.seq;
     if (!(await this.ensureAdmin())) return;
-
-    let commenters = [];
-    try { const r = await API.adminCommenters(); if (r.ok) commenters = r.users || []; else console.warn('adminCommenters failed', r._status, r.error); } catch(e){ console.warn('adminCommenters error', e); }
+    const mode = (location.hash.split('?')[1] || '').includes('by=author') ? 'authors' : 'recent';
 
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Модерация комментариев</h2>
-          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        <div class="page-head">
+          <h2>Отзывы</h2>
+          <a class="link" href="#/admin">← Админ-панель</a>
         </div>
         ${this.adminTabs('moderation')}
-        <div class="admin-split">
-          <div class="kv admin-pane">
-            <h3 style="margin-top:0">Пользователи</h3>
-            <div id="commenterList" class="admin-list"></div>
-          </div>
-          <div class="kv admin-pane" id="commenterDetail">
-            <div class="empty">Выберите пользователя, чтобы увидеть комментарии.</div>
-          </div>
+        <div class="admin-toolbar">
+          <a class="btn small ${mode==='recent'?'primary':'outline'}" href="#/admin/moderation">Свежие</a>
+          <a class="btn small ${mode==='authors'?'primary':'outline'}" href="#/admin/moderation?by=author">По авторам</a>
         </div>
+        <div id="moderationBody"><div class="muted">Загрузка…</div></div>
       </section>
     `;
+    const body = $('#moderationBody');
+
+    const commentCard = (c, { showTeacher = true, showAuthor = true } = {}) => html`
+      <div class="comment" data-comment-id="${escAttr(c.id)}">
+        <div class="meta">
+          <span>${fmtDate(c.ts)}</span>
+          ${showTeacher ? html`<a class="link" href="#/teacher/${encodeURIComponent(c.teacherId)}">${esc(c.teacher_name || c.teacherId)}</a>` : ''}
+          ${showAuthor && c.author_email ? html`<span class="badge muted">${esc(c.author_email)}</span>` : ''}
+        </div>
+        <div class="ctext">${esc(c.text||'')}</div>
+        <div class="cactions"><span class="spacer"></span><button class="btn small danger" type="button" data-del-cid="${escAttr(c.id)}">Удалить</button></div>
+      </div>`;
+
+    const deleteComment = async (btn, cid, onDone) => {
+      const ok = await UI.confirm({ title:'Удалить отзыв?', text:'Отзыв будет удалён без возможности восстановления, монеты автора за него спишутся.', confirmText:'Удалить', danger:true });
+      if (!ok) return;
+      await withBusy(btn, async ()=>{
+        const resp = await API.adminDeleteComment(cid);
+        if (!resp.ok) { UI.toast(errorText(resp, 'Не удалось удалить отзыв.'), 'error'); return; }
+        UI.toast('Отзыв удалён', 'success', 2200);
+        onDone();
+      });
+    };
+
+    if (mode === 'recent') {
+      const r = await API.adminRecentComments(100);
+      if (Router.isStale(seq)) return;
+      if (!r.ok) { body.innerHTML = `<div class="empty">${esc(errorText(r, 'Не удалось загрузить отзывы.'))}</div>`; return; }
+      let comments = Array.isArray(r.comments) ? r.comments : [];
+      const render = () => {
+        body.innerHTML = comments.length
+          ? html`<div class="comments">${comments.map(c => commentCard(c)).join('')}</div>`
+          : '<div class="empty">Отзывов пока нет.</div>';
+      };
+      render();
+      body.addEventListener('click', (e)=>{
+        const btn = e.target.closest('[data-del-cid]');
+        if (!btn) return;
+        const cid = btn.getAttribute('data-del-cid');
+        deleteComment(btn, cid, ()=>{ comments = comments.filter(c => String(c.id) !== String(cid)); render(); });
+      });
+      return;
+    }
+
+    // Режим «по авторам».
+    const r = await API.adminCommenters();
+    if (Router.isStale(seq)) return;
+    let commenters = r.ok ? (r.users || []) : [];
+    body.innerHTML = html`
+      <div class="admin-split">
+        <div class="panel admin-pane">
+          <input id="commenterFilter" class="input" type="search" placeholder="Фильтр по почте" aria-label="Фильтр по почте">
+          <div id="commenterList" class="admin-list"></div>
+        </div>
+        <div class="panel admin-pane" id="commenterDetail">
+          <div class="empty">Выберите автора, чтобы увидеть его отзывы.</div>
+        </div>
+      </div>`;
+    if (!r.ok) $('#commenterList').innerHTML = `<div class="empty">${esc(errorText(r, 'Не удалось загрузить авторов.'))}</div>`;
 
     const listEl = $('#commenterList');
     const detailEl = $('#commenterDetail');
     const commentCache = new Map();
-    const userMeta = new Map();
     let activeUserId = null;
-    let loading = false;
+    let filter = '';
+    let loadSeq = 0;
 
-    function renderList(){
-      if (!commenters.length) {
-        listEl.innerHTML = '<div class="empty">Нет пользователей с комментариями</div>';
-        return;
-      }
-      listEl.innerHTML = commenters.map(u=>html`
+    const renderList = () => {
+      if (!r.ok) return;
+      const shown = commenters.filter(u => !filter || String(u.email || u.username || '').toLowerCase().includes(filter));
+      listEl.innerHTML = shown.length ? shown.map(u=>html`
         <button type="button" class="admin-list-item ${u.id===activeUserId?'active':''}" data-user="${escAttr(u.id)}">
           <span class="admin-list-primary">${esc(u.email || u.username || u.id)}</span>
-          <span class="admin-list-meta">Комментарии: ${u.comment_count}</span>
-          ${u.is_banned ? '<span class="badge danger">Забанен</span>' : ''}
-        </button>
-      `).join('');
-    }
-
-    function renderDetail(){
-      if (!activeUserId) {
-        detailEl.innerHTML = '<div class="empty">Выберите пользователя, чтобы увидеть комментарии.</div>';
-        return;
-      }
-      if (loading) {
-        detailEl.innerHTML = '<div class="muted">Загружаем комментарии…</div>';
-        return;
-      }
-      const comments = commentCache.get(activeUserId) || [];
+          <span class="admin-list-meta">${countLabel(u.comment_count, COMMENT_FORMS)}${u.is_banned ? ' · <span class="badge danger">заблокирован</span>' : ''}</span>
+        </button>`).join('') : '<div class="empty">Никого не найдено</div>';
+    };
+    const renderDetail = () => {
+      if (!activeUserId) { detailEl.innerHTML = '<div class="empty">Выберите автора, чтобы увидеть его отзывы.</div>'; return; }
+      const comments = commentCache.get(activeUserId);
       const selected = commenters.find(u=>u.id===activeUserId) || {};
-      const meta = userMeta.get(activeUserId) || {};
-      const identity = meta.email || selected.email || meta.username || selected.username || selected.id || '—';
-      const commentCount = selected.comment_count ?? comments.length;
-      const banned = meta.is_banned ?? selected.is_banned;
-      const fmtDate = (ts)=>{
-        const num = Number(ts||0);
-        if (!Number.isFinite(num)) return '';
-        try { return new Date(num).toLocaleString('ru-RU',{dateStyle:'medium', timeStyle:'short'}); }
-        catch { return new Date(num).toISOString(); }
-      };
+      if (!comments) { detailEl.innerHTML = '<div class="muted">Загружаем отзывы…</div>'; return; }
       detailEl.innerHTML = html`
         <div class="admin-detail-head">
           <div>
-            <div class="tname">${esc(identity)}</div>
-            <div class="muted">Комментариев: ${commentCount}</div>
-            ${banned ? '<div class="badge danger" style="margin-top:6px">Забанен</div>' : ''}
+            <div class="tname">${esc(selected.email || selected.username || selected.id || '—')}</div>
+            <div class="muted small">${countLabel(comments.length, COMMENT_FORMS)}</div>
           </div>
-          <button class="btn small outline" data-open-bans>Бан/разбан</button>
+          ${selected.is_banned ? '<span class="badge danger">заблокирован</span>' : '<a class="btn small outline" href="#/admin/bans">Блокировки</a>'}
         </div>
-        <div class="hr"></div>
-        <div id="userCommentsWrap" class="admin-comments">
-          ${comments.length ? comments.map(c=>html`
-            <div class="comment" data-comment-id="${escAttr(c.id)}">
-              <div class="meta">${fmtDate(c.ts)} · ${esc(c.teacher_name || ('teacherId: '+c.teacherId))}</div>
-              <div class="ctext" style="margin:6px 0">${esc(c.text||'')}</div>
-              <button class="btn small outline" data-del-cid="${escAttr(c.id)}">Удалить</button>
-            </div>
-          `).join('') : '<div class="empty">Нет комментариев</div>'}
-        </div>
-      `;
-    }
-
+        <div class="comments">
+          ${comments.length ? comments.map(c => commentCard(c, { showAuthor:false })).join('') : '<div class="empty">Отзывов нет</div>'}
+        </div>`;
+    };
     renderList();
 
+    $('#commenterFilter')?.addEventListener('input', (e)=>{ filter = e.target.value.trim().toLowerCase(); renderList(); });
     listEl.addEventListener('click', async (e)=>{
       const btn = e.target.closest('[data-user]');
       if (!btn) return;
       const uid = btn.getAttribute('data-user');
-      if (!uid) return;
-      if (uid !== activeUserId) {
-        activeUserId = uid;
-        renderList();
-      }
-      if (!commentCache.has(uid)) {
-        loading = true;
-        renderDetail();
-        try {
-          const resp = await API.adminCommentsByUser(uid);
-          if (resp.ok) {
-            commentCache.set(uid, resp.comments || []);
-            const entry = commenters.find(u=>u.id===uid);
-            if (entry) {
-              if (resp.user?.email) entry.email = resp.user.email;
-              if (resp.user?.username) entry.username = resp.user.username;
-              if (typeof resp.user?.is_banned === 'boolean') entry.is_banned = resp.user.is_banned;
-            }
-            userMeta.set(uid, { ...resp.user, comment_count: entry?.comment_count ?? (resp.comments?.length || 0) });
-          } else {
-            commentCache.set(uid, []);
-          }
-        } catch {
-          commentCache.set(uid, []);
-        }
-        loading = false;
-      }
-      renderDetail();
-    });
-
-    detailEl.addEventListener('click', async (e)=>{
-      if (e.target.closest('[data-open-bans]')) {
-        Router.go('/admin/bans');
-        return;
-      }
-      const delBtn = e.target.closest('[data-del-cid]');
-      if (!delBtn) return;
-      const cid = delBtn.getAttribute('data-del-cid');
-      if (!cid) return;
-      if (!confirm('Удалить комментарий?')) return;
-      delBtn.disabled = true;
-      const resp = await API.adminDeleteComment(cid);
-      delBtn.disabled = false;
-      if (!resp.ok) {
-        alert('Не удалось удалить комментарий');
-        return;
-      }
-      const arr = commentCache.get(activeUserId) || [];
-      const ix = arr.findIndex(c=>String(c.id)===String(cid));
-      if (ix>=0) arr.splice(ix,1);
-      commentCache.set(activeUserId, arr);
-      const entry = commenters.find(u=>u.id===activeUserId);
-      if (entry) {
-        entry.comment_count = Math.max(0, (entry.comment_count||0) - 1);
-        if (!entry.comment_count) {
-          commenters = commenters.filter(u=>u.id!==entry.id);
-          commentCache.delete(entry.id);
-          userMeta.delete(entry.id);
-          activeUserId = null;
-        }
-      }
-      if (activeUserId && userMeta.has(activeUserId)) {
-        userMeta.get(activeUserId).comment_count = arr.length;
-      }
+      activeUserId = uid;
       renderList();
       renderDetail();
+      if (commentCache.has(uid)) return;
+      const mySeq = ++loadSeq;
+      const resp = await API.adminCommentsByUser(uid);
+      commentCache.set(uid, resp.ok ? (resp.comments || []) : []);
+      if (mySeq === loadSeq && activeUserId === uid) renderDetail(); // быстрый клик по другому автору — не мигаем
+    });
+    detailEl.addEventListener('click', (e)=>{
+      const btn = e.target.closest('[data-del-cid]');
+      if (!btn) return;
+      const cid = btn.getAttribute('data-del-cid');
+      deleteComment(btn, cid, ()=>{
+        const arr = (commentCache.get(activeUserId) || []).filter(c => String(c.id) !== String(cid));
+        commentCache.set(activeUserId, arr);
+        const entry = commenters.find(u=>u.id===activeUserId);
+        if (entry) entry.comment_count = arr.length;
+        if (!arr.length) { commenters = commenters.filter(u => u.id !== activeUserId); activeUserId = null; }
+        renderList();
+        renderDetail();
+      });
     });
   },
 
-    async viewAdminBans(){
+  async viewAdminBans(){
+    const seq = Router.seq;
     if (!(await this.ensureAdmin())) return;
-
-    let users = [];
-    try { const r = await API.adminUsers(); if (r.ok) users = r.users || []; else console.warn('adminUsers failed', r._status, r.error); } catch(e){ console.warn('adminUsers error', e); }
+    const r = await API.adminUsers();
+    if (Router.isStale(seq)) return;
+    const users = r.ok ? (r.users || []) : [];
 
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Бан/Разбан комментирования</h2>
-          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        <div class="page-head">
+          <h2>Блокировки</h2>
+          <a class="link" href="#/admin">← Админ-панель</a>
         </div>
         ${this.adminTabs('bans')}
-        <div class="admin-split">
-          <div class="kv admin-pane">
-            <h3 style="margin-top:0">Могут комментировать</h3>
-            <div id="adminUsersAllowed" class="admin-user-column"></div>
+        <p class="page-sub">Заблокированный пользователь не может публиковать отзывы, ставить оценки и лайки.</p>
+        <div class="admin-toolbar">
+          <input id="userFilter" class="input" type="search" placeholder="Поиск по почте" aria-label="Поиск по почте">
+        </div>
+        ${r.ok ? '' : html`<div class="notice danger">${esc(errorText(r, 'Не удалось загрузить пользователей.'))}</div>`}
+        <div class="admin-columns">
+          <div class="panel admin-pane">
+            <h3 class="panel-title">Активные <span class="muted" id="allowedCount"></span></h3>
+            <div id="adminUsersAllowed" class="admin-list"></div>
           </div>
-          <div class="kv admin-pane">
-            <h3 style="margin-top:0">Заблокированы</h3>
-            <div id="adminUsersBanned" class="admin-user-column"></div>
+          <div class="panel admin-pane">
+            <h3 class="panel-title">Заблокированы <span class="muted" id="bannedCount"></span></h3>
+            <div id="adminUsersBanned" class="admin-list"></div>
           </div>
         </div>
       </section>
     `;
 
-    const allowedEl = $('#adminUsersAllowed');
-    const bannedEl = $('#adminUsersBanned');
-
-    function renderColumns(){
-      const allowed = users.filter(u=>!u.is_banned);
-      const banned = users.filter(u=>u.is_banned);
-      const renderList = (arr, action)=>{
-        if (!arr.length) return '<div class="empty">Нет пользователей</div>';
-        return arr.map(u=>html`
-          <div class="admin-user-card">
-            <div class="admin-list-primary">${esc(u.email || u.username || u.id)}</div>
-            <div class="admin-list-meta">Комментарии: ${u.comment_count}</div>
-            <button class="btn small outline" data-user="${escAttr(u.id)}" data-action="${action}">${action==='ban'?'Забанить':'Разбанить'}</button>
+    const myId = Auth._state.id;
+    let filter = '';
+    const renderColumns = () => {
+      const shown = users.filter(u => !filter || String(u.email || u.username || '').toLowerCase().includes(filter));
+      const allowed = shown.filter(u=>!u.is_banned);
+      const banned = shown.filter(u=>u.is_banned);
+      const card = (u, action) => html`
+        <div class="admin-user-card">
+          <div class="who">
+            <div class="admin-list-primary">${esc(u.email || u.username || u.id)}${u.id === myId ? ' <span class="badge">вы</span>' : ''}</div>
+            <div class="admin-list-meta">${countLabel(u.comment_count || 0, COMMENT_FORMS)} · ${countLabel(u.rating_count || 0, RATING_FORMS)}</div>
           </div>
-        `).join('');
-      };
-      allowedEl.innerHTML = renderList(allowed, 'ban');
-      bannedEl.innerHTML = renderList(banned, 'unban');
-    }
-
+          ${u.id === myId ? '' : html`<button class="btn small ${action==='ban'?'danger':'outline'}" type="button" data-user="${escAttr(u.id)}" data-action="${action}">${action==='ban'?'Заблокировать':'Разблокировать'}</button>`}
+        </div>`;
+      $('#adminUsersAllowed').innerHTML = allowed.length ? allowed.map(u => card(u, 'ban')).join('') : '<div class="empty">Нет пользователей</div>';
+      $('#adminUsersBanned').innerHTML = banned.length ? banned.map(u => card(u, 'unban')).join('') : '<div class="empty">Никто не заблокирован</div>';
+      $('#allowedCount').textContent = `(${allowed.length})`;
+      $('#bannedCount').textContent = `(${banned.length})`;
+    };
     renderColumns();
+    $('#userFilter')?.addEventListener('input', (e)=>{ filter = e.target.value.trim().toLowerCase(); renderColumns(); });
 
-    const bansWrap = $('#app').querySelector('.admin-split');
-    bansWrap?.addEventListener('click', async (e)=>{
+    $('#app').querySelector('.admin-columns')?.addEventListener('click', async (e)=>{
       const btn = e.target.closest('[data-user][data-action]');
       if (!btn) return;
       const id = btn.getAttribute('data-user');
-      const action = btn.getAttribute('data-action');
-      if (!id || !action) return;
-      const willBan = action === 'ban';
+      const willBan = btn.getAttribute('data-action') === 'ban';
+      const user = users.find(u=>u.id===id);
       let reason = '';
       if (willBan) {
-        reason = prompt('Причина бана (необязательно):','') || '';
+        // Отмена в диалоге = отмена блокировки (раньше Cancel всё равно банил).
+        const answer = await UI.prompt({
+          title: `Заблокировать ${user?.email || 'пользователя'}?`,
+          text: 'Причина увидят только администраторы (необязательно).',
+          placeholder: 'Например: оскорбления в отзывах', confirmText: 'Заблокировать', danger: true, maxLength: 300
+        });
+        if (answer === null) return;
+        reason = answer;
       }
-      btn.disabled = true;
-      const resp = await API.adminBanUser({ userId: id, banned: willBan, reason });
-      btn.disabled = false;
-      if (!resp.ok) {
-        alert('Не удалось обновить статус пользователя');
-        return;
-      }
-      const user = users.find(u=>u.id===id);
-      if (user) {
-        user.is_banned = willBan;
-      }
-      renderColumns();
+      await withBusy(btn, async ()=>{
+        const resp = await API.adminBanUser({ userId: id, banned: willBan, reason });
+        if (!resp.ok) {
+          const msg = {
+            cannot_ban_self: 'Нельзя заблокировать самого себя.',
+            cannot_ban_root: 'Главного администратора заблокировать нельзя.',
+            cannot_ban_admin: 'Администратора может заблокировать только главный администратор.',
+          }[resp.error];
+          UI.toast(msg || errorText(resp, 'Не удалось изменить статус пользователя.'), 'error');
+          return;
+        }
+        if (user) user.is_banned = willBan;
+        UI.toast(willBan ? 'Пользователь заблокирован' : 'Пользователь разблокирован', 'success', 2200);
+        renderColumns();
+      });
     });
   },
 
   async viewAdminAdmins(){
     if (!(await this.ensureAdmin())) return;
     if (!Auth._state._isSuperAdmin) {
-      $('#app').innerHTML = `<section class="section"><div class="empty">Доступ ограничен.</div></section>`;
+      $('#app').innerHTML = `<section class="section"><div class="empty-state"><p>Управлять администраторами может только главный администратор.</p><a class="btn outline" href="#/admin">Админ-панель</a></div></section>`;
       return;
     }
 
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Управление администраторами</h2>
-          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        <div class="page-head">
+          <h2>Администраторы</h2>
+          <a class="link" href="#/admin">← Админ-панель</a>
         </div>
         ${this.adminTabs('admins')}
-        <div class="card" style="padding:16px; margin-bottom:16px">
-          <h3 style="margin-top:0">Добавить администратора</h3>
-          <form id="adminAddForm" class="row wrap" style="gap:12px; align-items:center">
-            <input type="email" id="adminAddEmail" class="input" placeholder="email@student.letovo.ru" required style="flex:1; min-width:240px; padding:10px 12px; border-radius:12px; border:1px solid var(--border)" autocomplete="off" />
+        <div class="panel">
+          <h3 class="panel-title">Добавить администратора</h3>
+          <form id="adminAddForm" class="form-actions" novalidate>
+            <input type="email" id="adminAddEmail" class="input" placeholder="ivanov.ii${EMAIL_DOMAIN}" required autocomplete="off" style="flex:1;min-width:220px" aria-label="Почта нового администратора">
             <button class="btn primary" type="submit" id="adminAddBtn">Добавить</button>
           </form>
-          <p class="muted" style="margin:12px 0 0; font-size:13px">Добавлять можно только адреса домена ${EMAIL_DOMAIN}.</p>
-          <p class="muted" id="adminAdminsStatus" style="margin:8px 0 0; font-size:13px"></p>
+          <p class="muted small" style="margin:10px 0 0">Можно добавлять только адреса ${EMAIL_DOMAIN}. Администратор получает доступ к модерации, блокировкам и базе учителей.</p>
+          <div class="status-msg" id="adminAdminsStatus" role="status" style="margin-top:6px"></div>
         </div>
-        <div class="kv" style="padding:0; overflow:auto">
-          <table style="width:100%; border-collapse:collapse" id="adminAdminsTable">
-            <thead><tr><th>Email</th><th>Роль</th><th style="text-align:right">Действия</th></tr></thead>
+        <div class="panel flush" style="margin-top:16px">
+          <table class="table">
+            <thead><tr><th>Почта</th><th>Роль</th><th class="actions">Действия</th></tr></thead>
             <tbody id="adminAdminsBody"><tr><td colspan="3"><div class="empty">Загрузка…</div></td></tr></tbody>
           </table>
         </div>
@@ -2347,129 +2153,83 @@ async viewHome(){
 
     const statusEl = $('#adminAdminsStatus');
     const listBody = $('#adminAdminsBody');
-    const addForm = $('#adminAddForm');
     const addInput = $('#adminAddEmail');
-    const addBtn = $('#adminAddBtn');
-
     let admins = [];
-
-    function setStatus(message, type = 'info') {
-      if (!statusEl) return;
-      statusEl.textContent = message || '';
-      statusEl.style.color = type === 'error' ? '#c0392b' : 'var(--muted)';
-    }
-
-    function renderList() {
-      if (!listBody) return;
-      if (!admins.length) {
-        listBody.innerHTML = `<tr><td colspan="3"><div class="empty">Список администраторов пуст</div></td></tr>`;
-        return;
-      }
-      listBody.innerHTML = admins.map(a => html`
+    const setStatus = (message, tone = '') => { statusEl.textContent = message || ''; statusEl.className = `status-msg ${tone}`; };
+    const renderList = () => {
+      listBody.innerHTML = admins.length ? admins.map(a => html`
         <tr>
           <td>${esc(a.email)}</td>
           <td>${a.isRoot ? 'Главный администратор' : 'Администратор'}</td>
-          <td style="text-align:right">
-            ${a.isRoot ? '<span class="muted">Нельзя удалить</span>' : `<button class="btn small outline" data-email="${escAttr(a.email)}">Удалить</button>`}
-          </td>
-        </tr>
-      `).join('');
-    }
+          <td class="actions">${a.isRoot ? '<span class="muted small">Нельзя удалить</span>' : html`<button class="btn small danger" type="button" data-email="${escAttr(a.email)}">Снять права</button>`}</td>
+        </tr>`).join('') : '<tr><td colspan="3"><div class="empty">Список пуст</div></td></tr>';
+    };
 
-    async function refreshAdmins() {
-      try {
-        const resp = await API.adminListAdmins();
-        if (!resp.ok) throw resp;
-        admins = Array.isArray(resp.admins) ? resp.admins : [];
-        renderList();
-        setStatus('');
-      } catch (err) {
-        console.error('Не удалось загрузить администраторов', err);
-        setStatus('Не удалось загрузить список администраторов. Попробуйте позже.', 'error');
-        listBody.innerHTML = `<tr><td colspan="3"><div class="empty">Ошибка загрузки</div></td></tr>`;
-      }
-    }
+    const resp = await API.adminListAdmins();
+    if (resp.ok) { admins = Array.isArray(resp.admins) ? resp.admins : []; renderList(); }
+    else { setStatus(errorText(resp, 'Не удалось загрузить список администраторов.'), 'error'); listBody.innerHTML = '<tr><td colspan="3"><div class="empty">Ошибка загрузки</div></td></tr>'; }
 
-    addForm?.addEventListener('submit', async (e) => {
+    $('#adminAddForm')?.addEventListener('submit', (e) => {
       e.preventDefault();
       const email = (addInput?.value || '').trim().toLowerCase();
-      if (!email) {
-        setStatus('Введите email студента.', 'error');
-        return;
-      }
-      setStatus('Добавляем администратора…');
-      addBtn.disabled = true;
-      try {
-        const resp = await API.adminAddAdmin(email);
-        if (!resp.ok) {
-          const code = resp.error || 'unknown_error';
-          if (code === 'invalid_domain') setStatus('Можно добавлять только адреса @student.letovo.ru', 'error');
-          else if (code === 'invalid_email') setStatus('Неверный email.', 'error');
-          else setStatus('Не удалось добавить администратора.', 'error');
+      if (!email) { setStatus('Введите почту.', 'error'); addInput?.focus(); return; }
+      withBusy($('#adminAddBtn'), async ()=>{
+        setStatus('Добавляем…');
+        const r = await API.adminAddAdmin(email);
+        if (!r.ok) {
+          const msg = { invalid_domain: `Можно добавлять только адреса ${EMAIL_DOMAIN}.`, invalid_email: 'Неверный адрес почты.' }[r.error];
+          setStatus(msg || errorText(r, 'Не удалось добавить администратора.'), 'error');
           return;
         }
-        admins = Array.isArray(resp.admins) ? resp.admins : [];
+        admins = Array.isArray(r.admins) ? r.admins : [];
         renderList();
-        setStatus(`Администратор ${email} добавлен.`);
+        setStatus(`${email} теперь администратор.`, 'success');
         if (addInput) addInput.value = '';
-      } catch (err) {
-        console.error('Ошибка добавления администратора', err);
-        setStatus('Не удалось добавить администратора. Попробуйте позже.', 'error');
-      } finally {
-        addBtn.disabled = false;
-      }
+      });
     });
 
-    $('#adminAdminsTable')?.addEventListener('click', async (e) => {
+    listBody.addEventListener('click', async (e) => {
       const btn = e.target.closest('button[data-email]');
       if (!btn) return;
       const email = btn.getAttribute('data-email');
-      if (!email) return;
-      if (!confirm(`Удалить администратора ${email}?`)) return;
-      btn.disabled = true;
-      setStatus('Удаляем администратора…');
-      try {
-        const resp = await API.adminRemoveAdmin(email);
-        if (!resp.ok) {
-          const code = resp.error || 'unknown_error';
-          if (code === 'cannot_remove_root') setStatus('Главного администратора нельзя удалить.', 'error');
-          else setStatus('Не удалось удалить администратора.', 'error');
-          btn.disabled = false;
+      const ok = await UI.confirm({ title:'Снять права администратора?', text: email, confirmText:'Снять права', danger:true });
+      if (!ok) return;
+      await withBusy(btn, async ()=>{
+        const r = await API.adminRemoveAdmin(email);
+        if (!r.ok) {
+          setStatus(r.error === 'cannot_remove_root' ? 'Главного администратора удалить нельзя.' : errorText(r, 'Не удалось снять права.'), 'error');
           return;
         }
-        admins = Array.isArray(resp.admins) ? resp.admins : [];
+        admins = Array.isArray(r.admins) ? r.admins : [];
         renderList();
-        setStatus(`Права администратора для ${email} удалены.`);
-      } catch (err) {
-        console.error('Ошибка удаления администратора', err);
-        setStatus('Не удалось удалить администратора. Попробуйте позже.', 'error');
-      } finally {
-        btn.disabled = false;
-      }
+        setStatus(`Права администратора для ${email} сняты.`, 'success');
+      });
     });
-
-    await refreshAdmins();
   },
 
   async viewAdminTeachersList(){
+    const seq = Router.seq;
     if (!(await this.ensureAdmin())) return;
-
-    let teachers = [];
-    try { const r = await API.adminTeachers(); if (r.ok) teachers = r.teachers || []; else console.warn('adminTeachers failed', r._status, r.error); } catch(e){ console.warn('adminTeachers error', e); }
+    const r = await API.adminTeachers();
+    if (Router.isStale(seq)) return;
+    let teachers = r.ok ? (r.teachers || []) : [];
 
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>Изменения базы учителей</h2>
-          <div class="list-controls"><a class="link" href="#/admin">← Центр администрирования</a></div>
+        <div class="page-head">
+          <h2>Учителя</h2>
+          <a class="link" href="#/admin">← Админ-панель</a>
         </div>
         ${this.adminTabs('teachers')}
-        <div class="row wrap" style="margin:12px 0">
-          <button id="teacherAddBtn" class="btn primary">Добавить учителя</button>
+        <div class="admin-toolbar">
+          <input id="teacherFilter" class="input" type="search" placeholder="Поиск по ФИО, кафедре или ID" aria-label="Поиск учителя">
+          <a class="btn primary" href="#/admin/teachers/new">+ Добавить учителя</a>
+          <span class="muted small" id="teacherCount"></span>
         </div>
-        <div class="kv" style="padding:0; overflow:auto">
-          <table style="width:100%; border-collapse:collapse">
-            <thead><tr><th>ID</th><th>ФИО</th><th>Кафедра</th><th>Предметы</th><th></th></tr></thead>
+        ${r.ok ? '' : html`<div class="notice danger">${esc(errorText(r, 'Не удалось загрузить учителей.'))}</div>`}
+        <div class="panel flush">
+          <table class="table">
+            <thead><tr><th></th><th>ФИО</th><th>Кафедра</th><th>Предметы</th><th class="actions">Действия</th></tr></thead>
             <tbody id="teachersTableBody"></tbody>
           </table>
         </div>
@@ -2477,149 +2237,208 @@ async viewHome(){
     `;
 
     const tbody = $('#teachersTableBody');
-
-    function renderRows(){
-      if (!teachers.length) {
-        tbody.innerHTML = '<tr><td colspan="5"><div class="empty">Список учителей пуст</div></td></tr>';
-        return;
-      }
-      tbody.innerHTML = teachers.map(t=>html`
-        <tr data-teacher="${escAttr(t.id)}">
-          <td>${esc(t.id)}</td>
-          <td>${esc([t.lastName,t.firstName,t.patronymic].filter(Boolean).join(' '))}</td>
+    let filter = '';
+    const renderRows = () => {
+      const shown = teachers.filter(t => !filter || matchesQuery(t, filter) || normName(t.department).includes(normName(filter)) || String(t.id).includes(filter));
+      $('#teacherCount').textContent = countLabel(shown.length, ['учитель','учителя','учителей']);
+      tbody.innerHTML = shown.length ? shown.map(t=>html`
+        <tr>
+          <td style="width:52px"><div class="portrait" style="width:36px"><img src="${escAttr(t.photo || '')}" alt="" loading="lazy"></div></td>
+          <td><a class="link" href="#/teacher/${encodeURIComponent(t.id)}">${esc(fullName(t))}</a><div class="mono">${esc(t.id)}</div></td>
           <td>${esc(t.department||'')}</td>
           <td>${esc((t.subjects||[]).join(', '))}</td>
-          <td>
-            <button class="btn small outline" data-edit="${escAttr(t.id)}">Редактировать</button>
-            <button class="btn small outline" data-delete="${escAttr(t.id)}">Удалить</button>
+          <td class="actions">
+            <a class="btn small outline" href="#/admin/teachers/edit/${encodeURIComponent(t.id)}">Изменить</a>
+            <button class="btn small danger" type="button" data-delete="${escAttr(t.id)}">Удалить</button>
           </td>
-        </tr>
-      `).join('');
-    }
-
+        </tr>`).join('') : '<tr><td colspan="5"><div class="empty">Никого не найдено</div></td></tr>';
+    };
     renderRows();
-
-    $('#teacherAddBtn')?.addEventListener('click', ()=>Router.go('/admin/teachers/new'));
+    $('#teacherFilter')?.addEventListener('input', (e)=>{ filter = e.target.value.trim(); renderRows(); });
 
     tbody.addEventListener('click', async (e)=>{
-      const edit = e.target.closest('[data-edit]');
       const del = e.target.closest('[data-delete]');
-      if (edit) {
-        const id = edit.getAttribute('data-edit');
-        if (id) Router.go('/admin/teachers/edit/'+encodeURIComponent(id));
-        return;
-      }
-      if (del) {
-        const id = del.getAttribute('data-delete');
-        if (!id) return;
-        if (!confirm('Удалить карточку учителя? Все его комментарии и рейтинги тоже будут удалены.')) return;
-        del.disabled = true;
+      if (!del) return;
+      const id = del.getAttribute('data-delete');
+      const t = teachers.find(x => x.id === id);
+      const ok = await UI.confirm({
+        title: `Удалить карточку «${t ? fullName(t) : id}»?`,
+        text: 'Вместе с ней удалятся все отзывы и оценки этого учителя. Действие необратимо.',
+        confirmText: 'Удалить', danger: true
+      });
+      if (!ok) return;
+      await withBusy(del, async ()=>{
         const resp = await API.adminDeleteTeacher(id);
-        del.disabled = false;
-        if (!resp.ok) {
-          alert('Не удалось удалить учителя');
-          return;
-        }
-        App.invalidateTeachers();
-        App.getTeachers({ force:true }).catch(()=>{});
-        teachers = teachers.filter(t=>t.id!==id);
+        if (!resp.ok) { UI.toast(errorText(resp, 'Не удалось удалить учителя.'), 'error'); return; }
+        this.invalidateTeachers();
+        departmentsCache.list = null;
+        teachers = teachers.filter(x=>x.id!==id);
         renderRows();
-      }
+        UI.toast('Карточка удалена', 'success', 2200);
+      });
     });
   },
 
-  renderTeacherForm({ teacher={}, isNew=false }){
-    const escapeAttr = (v)=>String(v??'').replace(/"/g,'&quot;');
+  renderTeacherForm({ teacher={}, isNew=false, departments=[] }){
     const subjects = Array.isArray(teacher.subjects) ? teacher.subjects : [];
-    const photo = (teacher.photo||'').replace(/^\/?photo\//,'');
+    const photo = String(teacher.photo || '').replace(/^\/?photos?\//,'');
+    const photoValue = photo === 'default_photo.png' ? '' : photo;
     $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>${isNew ? 'Добавить учителя' : 'Редактировать учителя'}</h2>
-          <div class="list-controls"><a class="link" href="#/admin/teachers">← Назад к списку</a></div>
+        <div class="page-head">
+          <h2>${isNew ? 'Новый учитель' : 'Редактирование'}</h2>
+          <a class="link" href="#/admin/teachers">← К списку</a>
         </div>
         ${this.adminTabs('teachers')}
-        <div class="kv admin-form">
-          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
-            <div><div class="muted">ID</div><input id="teacherId" value="${escapeAttr(teacher.id||'')}" placeholder="t-ivanov-ivan" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Фамилия</div><input id="teacherLastName" value="${escapeAttr(teacher.lastName||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Имя</div><input id="teacherFirstName" value="${escapeAttr(teacher.firstName||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Отчество</div><input id="teacherPatronymic" value="${escapeAttr(teacher.patronymic||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Кафедра</div><input id="teacherDepartment" value="${escapeAttr(teacher.department||'')}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Предметы (через |)</div><input id="teacherSubjects" value="${escapeAttr(subjects.join('|'))}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
-            <div><div class="muted">Фото (имя файла в /photos)</div><input id="teacherPhoto" value="${escapeAttr(photo)}" placeholder="ivanov.jpg" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:10px"></div>
+        <form class="panel roomy form-stack" id="teacherForm" novalidate>
+          <div class="form-grid">
+            <div class="field">
+              <label for="teacherLastName">Фамилия*</label>
+              <input id="teacherLastName" class="input" required maxlength="120" value="${escAttr(teacher.lastName||'')}">
+            </div>
+            <div class="field">
+              <label for="teacherFirstName">Имя*</label>
+              <input id="teacherFirstName" class="input" required maxlength="120" value="${escAttr(teacher.firstName||'')}">
+            </div>
+            <div class="field">
+              <label for="teacherPatronymic">Отчество</label>
+              <input id="teacherPatronymic" class="input" maxlength="120" value="${escAttr(teacher.patronymic||'')}">
+            </div>
+            <div class="field">
+              <label for="teacherDepartment">Кафедра*</label>
+              <input id="teacherDepartment" class="input" required maxlength="160" list="departmentOptions" value="${escAttr(teacher.department||'')}" autocomplete="off">
+              <datalist id="departmentOptions">${departments.map(d => html`<option value="${escAttr(d)}"></option>`).join('')}</datalist>
+              <div class="field-hint">Выберите из списка; новое название создаст новую кафедру.</div>
+            </div>
+            <div class="field">
+              <label for="teacherSubjects">Предметы</label>
+              <input id="teacherSubjects" class="input" maxlength="240" value="${escAttr(subjects.join(', '))}" placeholder="Алгебра, геометрия">
+              <div class="field-hint">Через запятую.</div>
+            </div>
+            <div class="field">
+              <label for="teacherId">ID (адрес страницы)</label>
+              <input id="teacherId" class="input" maxlength="100" value="${escAttr(teacher.id||'')}" ${isNew ? 'placeholder="сгенерируется из ФИО"' : 'readonly'}>
+              <div class="field-hint">${isNew ? 'Можно оставить пустым. Формат: t-familiya-imya.' : 'ID существующего учителя не меняется.'}</div>
+            </div>
           </div>
-          <div class="row" style="margin-top:12px">
-            <button id="teacherFormSave" class="btn primary">Сохранить</button>
-            <button id="teacherFormCancel" class="btn outline">Отмена</button>
+          <div class="field">
+            <label for="teacherPhotoFile">Фото</label>
+            <div class="row" style="align-items:flex-start;flex-wrap:wrap">
+              <div class="portrait" style="width:90px"><img id="teacherPhotoPreview" src="${escAttr(teacher.photo || '/photo/default_photo.png')}" alt=""></div>
+              <div style="flex:1;min-width:220px" class="form-stack">
+                <input id="teacherPhotoFile" class="input" type="file" accept="image/jpeg,image/png,image/webp">
+                <input id="teacherPhoto" class="input" maxlength="300" value="${escAttr(photoValue)}" placeholder="или имя файла в папке photos / ссылка https://…" aria-label="Имя файла фото">
+                <div class="field-hint">JPG, PNG или WebP до 5 МБ. Пусто — стандартная заглушка.</div>
+              </div>
+            </div>
           </div>
-        </div>
+          <div class="form-actions">
+            <button id="teacherFormSave" class="btn primary" type="submit">${isNew ? 'Добавить' : 'Сохранить'}</button>
+            <a class="btn outline" href="#/admin/teachers">Отмена</a>
+          </div>
+          <div class="status-msg" id="teacherFormStatus" role="status"></div>
+        </form>
       </section>
     `;
 
-    $('#teacherFormCancel')?.addEventListener('click', ()=>Router.go('/admin/teachers'));
-    $('#teacherFormSave')?.addEventListener('click', async ()=>{
-      const payload = {
-        id: String($('#teacherId').value||'').trim() || (isNew ? undefined : teacher.id),
-        lastName: $('#teacherLastName').value||'',
-        firstName: $('#teacherFirstName').value||'',
-        patronymic: $('#teacherPatronymic').value||'',
-        department: $('#teacherDepartment').value||'',
-        subjects: String($('#teacherSubjects').value||'').split('|').map(s=>s.trim()).filter(Boolean),
-        photo: $('#teacherPhoto').value||''
-      };
-      const resp = await API.adminUpsertTeacher(payload);
-      if (resp.ok) {
-        App.invalidateTeachers();
-        App.getTeachers({ force:true }).catch(()=>{});
-        alert('Сохранено');
-        Router.go('/admin/teachers');
-      } else {
-        alert('Не удалось сохранить');
+    const statusEl = $('#teacherFormStatus');
+    const setStatus = (text, tone = '') => { statusEl.textContent = text || ''; statusEl.className = `status-msg ${tone}`; };
+    const photoInput = $('#teacherPhoto');
+    const preview = $('#teacherPhotoPreview');
+    const photoSrc = v => !v ? '/photo/default_photo.png' : (/^https?:\/\//i.test(v) ? v : `/photo/${encodeURIComponent(v)}`);
+    photoInput?.addEventListener('change', ()=>{ preview.src = photoSrc(photoInput.value.trim()); });
+
+    $('#teacherPhotoFile')?.addEventListener('change', async (e)=>{
+      const file = e.target.files?.[0];
+      if (!file) return;
+      if (!['image/jpeg','image/png','image/webp'].includes(file.type)) { setStatus('Фото должно быть JPG, PNG или WebP.', 'error'); return; }
+      if (file.size > 5 * 1024 * 1024) { setStatus('Фото больше 5 МБ.', 'error'); return; }
+      const fd = new FormData();
+      fd.append('photo', file, file.name);
+      setStatus('Загружаем фото…');
+      const res = await API.adminUploadTeacherPhoto(fd);
+      if (!res.ok || !res.file) {
+        const msg = { photo_too_large: 'Фото больше 5 МБ.', unsupported_photo_type: 'Фото должно быть JPG, PNG или WebP.' }[res.error];
+        setStatus(msg || errorText(res, 'Не удалось загрузить фото.'), 'error');
+        return;
       }
+      photoInput.value = res.file;
+      preview.src = photoSrc(res.file);
+      setStatus('Фото загружено — не забудьте сохранить карточку.', 'success');
+    });
+
+    $('#teacherForm')?.addEventListener('submit', (e)=>{
+      e.preventDefault();
+      const form = e.currentTarget;
+      if (!form.reportValidity()) return;
+      const payload = {
+        id: isNew ? String($('#teacherId').value||'').trim() : teacher.id,
+        lastName: $('#teacherLastName').value.trim(),
+        firstName: $('#teacherFirstName').value.trim(),
+        patronymic: $('#teacherPatronymic').value.trim(),
+        department: $('#teacherDepartment').value.trim(),
+        subjects: String($('#teacherSubjects').value||'').split(/[,|]/).map(s=>s.trim()).filter(Boolean),
+        photo: photoInput.value.trim()
+      };
+      withBusy($('#teacherFormSave'), async ()=>{
+        setStatus('Сохраняем…');
+        const resp = await API.adminUpsertTeacher(payload);
+        if (!resp.ok) {
+          const msg = {
+            missing_name: 'Укажите фамилию и имя.',
+            missing_department: 'Укажите кафедру.',
+            invalid_id: 'ID должен начинаться с «t» и содержать только латиницу, цифры, «-» и «_».',
+            photo_not_found: 'Файл фото не найден в папке photos. Загрузите фото кнопкой выше.',
+          }[resp.error];
+          setStatus(msg || errorText(resp, 'Не удалось сохранить.'), 'error');
+          return;
+        }
+        this.invalidateTeachers();
+        departmentsCache.list = null;
+        UI.toast(isNew ? 'Учитель добавлен' : 'Изменения сохранены', 'success');
+        Router.go('/admin/teachers');
+      });
     });
   },
 
   async viewAdminTeacherNew(){
+    const seq = Router.seq;
     if (!(await this.ensureAdmin())) return;
-    this.renderTeacherForm({ teacher:{}, isNew:true });
+    const departments = await this.getDepartments();
+    if (Router.isStale(seq)) return;
+    this.renderTeacherForm({ teacher:{}, isNew:true, departments });
   },
 
   async viewAdminTeacherEdit(_, encodedId){
+    const seq = Router.seq;
     if (!(await this.ensureAdmin())) return;
     let teacherId = '';
     try { teacherId = decodeURIComponent(encodedId); } catch { teacherId = String(encodedId || ''); }
-    let teacher = null;
-    try {
-      const r = await API.adminTeachers();
-      if (r.ok) teacher = (r.teachers || []).find(t=>t.id===teacherId) || null;
-    } catch {}
+    const [r, departments] = await Promise.all([API.adminTeachers(), this.getDepartments()]);
+    if (Router.isStale(seq)) return;
+    const teacher = r.ok ? ((r.teachers || []).find(t=>t.id===teacherId) || null) : null;
     if (!teacher) {
       $('#app').innerHTML = html`
         <section class="section">
-          <div class="row space-between wrap">
-            <h2>Изменения базы учителей</h2>
-            <div class="list-controls"><a class="link" href="#/admin/teachers">← Назад к списку</a></div>
+          <div class="page-head">
+            <h2>Учителя</h2>
+            <a class="link" href="#/admin/teachers">← К списку</a>
           </div>
           ${this.adminTabs('teachers')}
-          <div class="empty">Учитель с ID ${esc(teacherId)} не найден.</div>
-        </section>
-      `;
+          <div class="empty-state"><p>${r.ok ? html`Учитель с ID «${esc(teacherId)}» не найден.` : esc(errorText(r, 'Не удалось загрузить данные.'))}</p></div>
+        </section>`;
       return;
     }
-    this.renderTeacherForm({ teacher, isNew:false });
+    this.renderTeacherForm({ teacher, isNew:false, departments });
   },
 
+  /* --- магазин ников --- */
   normalizeShopState(raw) {
     const src = raw && typeof raw === 'object' ? (raw.shop ?? raw) : null;
-    if (!src) return null;
-    const toNum = (v, def = 0) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : def;
-    };
-    const items = Array.isArray(src.items) ? src.items : [];
+    if (!src || !Array.isArray(src.items)) return null;
+    const toNum = (v, def = 0) => { const n = Number(v); return Number.isFinite(n) ? n : def; };
     return {
-      items,
+      items: src.items,
       balance: toNum(src.balance ?? src.available_coins, toNum(Auth._state.available_coins, 0)),
       earnedCoins: toNum(src.earnedCoins ?? src.earned_coins, toNum(Auth._state.earned_coins, 0)),
       spentCoins: toNum(src.spentCoins ?? src.spent_coins, toNum(Auth._state.spent_coins, 0)),
@@ -2629,280 +2448,186 @@ async viewHome(){
 
   applyShopStateToAuth(shopState) {
     if (!shopState) return;
-    const baseDisplay = Auth._state.username || (Auth._state.email ? Auth._state.email.split('@')[0] : '') || Auth._state.display_name || 'Student';
-    const update = {
+    const baseDisplay = Auth._state.username || (Auth._state.email ? Auth._state.email.split('@')[0] : '') || 'Student';
+    Auth.set({
       available_coins: Number(shopState.balance ?? Auth._state.available_coins),
       earned_coins: Number(shopState.earnedCoins ?? Auth._state.earned_coins),
-      spent_coins: Number(shopState.spentCoins ?? Auth._state.spent_coins)
-    };
-    if (shopState.activeNickname) {
-      update.display_name = shopState.activeNickname;
-    } else {
-      update.display_name = baseDisplay;
-    }
-    Auth.set(update);
+      spent_coins: Number(shopState.spentCoins ?? Auth._state.spent_coins),
+      display_name: shopState.activeNickname || baseDisplay
+    });
   },
 
-  // --- Магазин ---
   async viewShop(options = {}) {
+    const seq = Router.seq;
     await this.mountNavbar();
+    if (Router.isStale(seq)) return;
 
-    if (!Auth.isLogged()) {
-      try { await Auth.me(); } catch {}
-    }
-    if (!Auth.isLogged()) {
-      Router.go('/login');
+    if (Auth._state._isBanned) {
+      $('#app').innerHTML = html`
+        <section class="section">
+          <div class="page-head"><h2>Магазин ников</h2><a class="link" href="#/">← На главную</a></div>
+          <div class="notice danger">Магазин недоступен: аккаунт заблокирован за нарушение правил.</div>
+        </section>`;
       return;
     }
 
-    const fromOptions = this.normalizeShopState(options.prefetched);
-    let shopData = fromOptions || {
-      items: [],
-      balance: coinsOf(Auth._state),
-      earnedCoins: Auth._state.earned_coins || 0,
-      spentCoins: Auth._state.spent_coins || 0,
-      activeNickname: Auth._state.display_name || null
+    let shopData = this.normalizeShopState(options.prefetched);
+    if (!shopData) {
+      const data = await apiFetch('/api/shop/items');
+      if (Router.isStale(seq)) return;
+      shopData = data.ok ? this.normalizeShopState(data) : null;
+      if (!shopData) { this.renderError(errorText(data, 'Не удалось загрузить магазин.'), ()=>this.viewShop()); return; }
+    }
+    this.applyShopStateToAuth(shopData);
+
+    const itemButton = (item) => {
+      if (item.purchased) {
+        return item.isActive
+          ? html`<button class="btn small outline block deactivate-btn" type="button" data-item="${escAttr(item.id)}">Снять ник</button>`
+          : html`<button class="btn small primary block activate-btn" type="button" data-item="${escAttr(item.id)}">Выбрать</button>`;
+      }
+      if (shopData.balance >= item.price) {
+        return html`<button class="btn small primary block buy-btn" type="button" data-item="${escAttr(item.id)}">Купить за ${Number(item.price)}</button>`;
+      }
+      return html`<button class="btn small outline block" type="button" disabled>Нужно ещё ${Number(item.price) - shopData.balance} coins</button>`;
     };
 
-    if (!fromOptions) {
-      try {
-        const response = await fetch('/api/shop/items');
-        const data = await response.json();
-        if (data && data.ok !== false) {
-          const normalized = this.normalizeShopState(data);
-          if (normalized) {
-            shopData = normalized;
-            this.applyShopStateToAuth(normalized);
-          }
-        }
-      } catch (error) {
-        console.error('Ошибка загрузки магазина:', error);
-      }
-    } else {
-      this.applyShopStateToAuth(shopData);
-    }
-
-    const purchasedItems = shopData.items.filter(item => item.purchased);
-    const appEl = $('#app');
-
-    appEl.innerHTML = html`
+    $('#app').innerHTML = html`
       <section class="section">
-        <div class="row space-between wrap">
-          <h2>🎁 Магазин ников</h2>
-          <div class="list-controls">
-            <a class="link" href="#/">← На главную</a>
-          </div>
+        <div class="page-head">
+          <h2>Магазин ников</h2>
+          <a class="link" href="#/">← На главную</a>
         </div>
 
-        <div class="card" style="margin-bottom: 20px;">
-          <div class="card-content">
-            <div class="row space-between" style="align-items: center;">
-              <div>
-                <h3 style="margin: 0 0 4px 0;">Ваш баланс</h3>
-                <div class="tname" style="font-size: 24px; color: var(--gold-500);">${shopData.balance} coins</div>
-                <div class="muted" style="font-size: 13px;">Заработано: ${shopData.earnedCoins} • Потрачено: ${shopData.spentCoins}</div>
-              </div>
-              <div class="muted" style="text-align: right;">
-                Токены начисляются за активность:<br>
-                💬 Комментарии: 5 coins<br>
-                ⭐ Оценки: 1 coin за критерий<br>
-                👍 Лайки: +1 coin за полученный лайк
-              </div>
-            </div>
+        <div class="panel balance-card">
+          <div>
+            <div class="muted small">Ваш баланс</div>
+            <div class="balance-value">${shopData.balance} coins</div>
+            <div class="muted small">Заработано ${shopData.earnedCoins} · потрачено ${shopData.spentCoins}</div>
           </div>
+          <ul class="earn-rules">
+            <li>💬 Отзыв — <b>+5</b></li>
+            <li>⭐ Оценка по критерию — <b>+1</b></li>
+            <li>👍 Лайк на ваш отзыв — <b>+1</b>, 👎 дизлайк — <b>−1</b></li>
+          </ul>
         </div>
+        <p class="page-sub" style="margin-top:12px">Выбранный ник показывается вместо «Аноним» у ваших отзывов. Ник можно сменить или снять в любой момент.</p>
 
-        ${shopData.items.length > 0 ? html`
-          <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px;">
+        ${shopData.items.length ? html`
+          <div class="shop-grid">
             ${shopData.items.map(item => html`
-              <div class="card shop-item ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
-                <div class="card-content">
-                  <div class="row space-between shop-item-header">
-                    <h3 style="margin: 0;">${esc(item.name)}</h3>
-                    ${item.purchased
-                      ? html`<div class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</div>`
-                      : html`<div class="badge price">${item.price} coins</div>`}
-                  </div>
-
+              <div class="shop-item ${item.purchased ? 'purchased' : ''} ${item.isActive ? 'active' : ''}">
+                <div class="shop-item-header">
+                  <h3>${esc(item.name)}</h3>
                   ${item.purchased
-                    ? (item.isActive
-                      ? html`<button class="btn small outline deactivate-btn" data-item="${escAttr(item.id)}">Сделать неактивным</button>`
-                      : html`<button class="btn small primary activate-btn" data-item="${escAttr(item.id)}">Сделать активным</button>`)
-                    : (shopData.balance >= item.price
-                      ? html`<button class="btn small primary buy-btn" data-item="${escAttr(item.id)}">Купить за ${esc(item.price)}</button>`
-                      : html`<button class="btn small outline" disabled>Не хватает coins</button>`)}
+                    ? html`<span class="badge lg ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Куплен'}</span>`
+                    : html`<span class="badge lg price">${Number(item.price)} coins</span>`}
                 </div>
-              </div>
-            `).join('')}
-          </div>
-        ` : html`
-          <div class="card">
-            <div class="card-content">
-              <div style="text-align: center; padding: 40px;">
-                <h3 style="color: var(--muted);">🛒 Товары временно отсутствуют</h3>
-                <p class="muted">Попробуйте обновить страницу или зайти позже.</p>
-                <button class="btn outline" id="shopReloadBtn">Обновить страницу</button>
-              </div>
-            </div>
-          </div>
-        `}
-
-        ${purchasedItems.length ? html`
-          <div class="shop-purchased-section">
-            <h3>Ваши купленные ники</h3>
-            <div class="list shop-purchased-list">
-              ${purchasedItems.map(item => html`
-                <div class="list-item purchased-nick">
-                  <div class="tname">${esc(item.name)}</div>
-                  <div class="nick-actions">
-                    <span class="badge status ${item.isActive ? 'success' : 'muted'}">${item.isActive ? 'Активен' : 'Не активен'}</span>
-                    ${item.isActive
-                      ? html`<button class="btn small outline deactivate-btn" data-item="${escAttr(item.id)}">Сделать неактивным</button>`
-                      : html`<button class="btn small primary activate-btn" data-item="${escAttr(item.id)}">Сделать активным</button>`}
-                  </div>
-                </div>
-              `).join('')}
-            </div>
-          </div>
-        ` : ''}
+                ${itemButton(item)}
+              </div>`).join('')}
+          </div>` : html`
+          <div class="empty-state">
+            <p>Товары временно отсутствуют. Загляните позже.</p>
+          </div>`}
       </section>
     `;
 
     if (!this._shopClickHandler) {
-      this._shopClickHandler = async (event) => {
-        if (event.target.closest('#shopReloadBtn')) { location.reload(); return; }
-        const targetBtn = event.target.closest('.buy-btn, .activate-btn, .deactivate-btn');
-        if (!targetBtn) return;
-        const itemId = targetBtn.dataset.item;
-        if (!itemId) return;
-
-        if (targetBtn.classList.contains('buy-btn')) {
-          await App.buyItem(itemId);
-        } else if (targetBtn.classList.contains('activate-btn')) {
-          await App.activateItem(itemId);
-        } else if (targetBtn.classList.contains('deactivate-btn')) {
-          await App.deactivateItem(itemId);
-        }
+      this._shopClickHandler = (event) => {
+        const btn = event.target.closest('.buy-btn, .activate-btn, .deactivate-btn');
+        if (!btn || !btn.dataset.item) return;
+        const itemId = btn.dataset.item;
+        if (btn.classList.contains('buy-btn')) withBusy(btn, ()=>App.buyItem(itemId));
+        else if (btn.classList.contains('activate-btn')) withBusy(btn, ()=>App.activateItem(itemId));
+        else withBusy(btn, ()=>App.deactivateItem(itemId));
       };
+      $('#app').addEventListener('click', this._shopClickHandler);
     }
-    appEl.removeEventListener('click', this._shopClickHandler);
-    appEl.addEventListener('click', this._shopClickHandler);
   },
 
-  // Общая логика покупки/активации/деактивации — раньше это были три почти
-  // идентичных метода. Отличаются только endpoint, словом действия и текстами ошибок.
-  async _shopAction(endpoint, itemId, { actionNoun, errorMap = {}, handleAlreadyPurchased = false }) {
-    if (!Auth.isLogged()) return;
-
-    const result = await apiFetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ itemId })
-    });
+  // Общая логика покупки/активации/деактивации.
+  async _shopAction(endpoint, itemId, { successText, errorMap = {} }) {
+    const result = await postJson(endpoint, { itemId });
     const shopState = this.normalizeShopState(result);
-
     if (result.ok) {
-      if (result.message) alert(result.message);
-      if (shopState) {
-        this.applyShopStateToAuth(shopState);
-      } else {
-        Auth.set({
-          available_coins: Number(result.balance ?? Auth._state.available_coins),
-          earned_coins: Number(result.earnedCoins ?? Auth._state.earned_coins),
-          spent_coins: Number(result.spentCoins ?? Auth._state.spent_coins)
-        });
-      }
-      await this.viewShop(shopState ? { prefetched: shopState } : undefined);
-      if (!shopState) await Auth.me();
+      UI.toast(successText, 'success', 2500);
+      if (location.hash === '#/shop') await this.viewShop(shopState ? { prefetched: shopState } : undefined);
+      Auth.refreshStatsAndPopover();
       return;
     }
-
-    if (handleAlreadyPurchased && result.error === 'already_purchased' && shopState) {
-      this.applyShopStateToAuth(shopState);
+    if (result.error === 'already_purchased' && shopState && location.hash === '#/shop') {
       await this.viewShop({ prefetched: shopState });
     }
-    const msg = result.error === 'network_error' ? 'Ошибка сети'
-      : (errorMap[result.error] || 'Ошибка сервера');
-    alert(`Ошибка при ${actionNoun}: ${msg}`);
+    if (result.error !== 'banned') UI.toast(errorMap[result.error] || errorText(result, 'Не удалось выполнить действие.'), 'error');
   },
 
-  async buyItem(itemId) {
+  buyItem(itemId) {
     return this._shopAction('/api/shop/buy', itemId, {
-      actionNoun: 'покупке',
-      handleAlreadyPurchased: true,
-      errorMap: { not_enough_coins: 'Недостаточно coins', already_purchased: 'Этот ник уже куплен' }
+      successText: 'Ник куплен и выбран!',
+      errorMap: { not_enough_coins: 'Не хватает coins.', already_purchased: 'Этот ник уже куплен.', item_not_found: 'Такого ника больше нет.' }
     });
   },
-
-  async activateItem(itemId) {
+  activateItem(itemId) {
     return this._shopAction('/api/shop/activate', itemId, {
-      actionNoun: 'активации',
-      errorMap: { item_not_owned: 'Этот ник не куплен' }
+      successText: 'Ник выбран — он появится у ваших отзывов.',
+      errorMap: { item_not_owned: 'Этот ник ещё не куплен.', item_not_found: 'Такого ника больше нет.' }
     });
   },
-
-  async deactivateItem(itemId) {
+  deactivateItem(itemId) {
     return this._shopAction('/api/shop/deactivate', itemId, {
-      actionNoun: 'отключении',
-      errorMap: { not_active: 'Этот ник уже отключен', item_not_found: 'Ник не найден' }
+      successText: 'Ник снят — отзывы снова подписаны «Аноним».',
+      errorMap: { not_active: 'Этот ник уже не выбран.' }
     });
   },
-
 };
 
-/* ---------- routes ---------- */
+/* ---------- маршруты ---------- */
 Router.add(/^\/$/, ()=>App.viewHome());
 Router.add(/^\/teachers$/, (...a)=>App.listAll(...a));
 Router.add(/^\/top\/([a-z]+)$/, (...a)=>App.listByCharacteristic(...a));
 Router.add(/^\/department\/(.+)$/, (...a)=>App.listByDepartment(...a));
 Router.add(/^\/search\?q=(.*)$/, (...a)=>App.listBySearch(...a));
-Router.add(/^\/teacher\/(t[\w\-]+)$/, (...a)=>App.teacherProfile(...a));
+Router.add(/^\/teacher\/(t[\w-]+)$/, (...a)=>App.teacherProfile(...a));
 Router.add(/^\/policy$/, (...a)=>App.viewPolicy(...a));
-Router.add(/^\/login$/, (...a)=>App.viewLogin(...a));
 Router.add(/^\/teacher-request$/, (...a)=>App.viewTeacherRequest(...a));
 Router.add(/^\/admin\/teachers\/edit\/(.+)$/, (...a)=>App.viewAdminTeacherEdit(...a));
 Router.add(/^\/admin\/teachers\/new$/, (...a)=>App.viewAdminTeacherNew(...a));
 Router.add(/^\/admin\/teachers$/, (...a)=>App.viewAdminTeachersList(...a));
 Router.add(/^\/admin\/admins$/, (...a)=>App.viewAdminAdmins(...a));
 Router.add(/^\/admin\/bans$/, (...a)=>App.viewAdminBans(...a));
-Router.add(/^\/admin\/moderation$/, (...a)=>App.viewAdminModeration(...a));
+Router.add(/^\/admin\/moderation(?:\?.*)?$/, (...a)=>App.viewAdminModeration(...a));
 Router.add(/^\/admin$/, (...a)=>App.viewAdminHome(...a));
 Router.add(/^\/shop$/, (...a)=>App.viewShop(...a));
 
-/* ---------- boot ---------- */
-window.App=App; window.Router=Router; window.Auth=Auth;
+/* ---------- запуск ---------- */
+window.App = App; window.Router = Router; window.Auth = Auth;
 
 addEventListener('DOMContentLoaded', ()=>{
   Auth.migrate();
-  $('#loginBtn')?.addEventListener('click', ()=>Router.go('/login'));
-  $('#searchBtn')?.addEventListener('click', ()=>App.search());
-  $('#searchInput')?.addEventListener('keydown', e=>{ if(e.key==='Enter') App.search(); });
+  $('#searchForm')?.addEventListener('submit', (e)=>{ e.preventDefault(); App.search(); });
   const searchInput = $('#searchInput');
   if (searchInput) {
     searchInput.setAttribute('maxlength', String(SEARCH_QUERY_MAX_LEN));
     searchInput.addEventListener('input', (e)=>{
-      const target = e.target;
-      const next = normalizeSearchQuery(target?.value);
-      if (target && target.value !== next) target.value = next;
+      const next = normalizeSearchQuery(e.target.value);
+      if (e.target.value !== next) e.target.value = next;
     });
   }
 
-  // Делегирование кликов по ссылкам вида href="#/..."
+  // Клик по ссылке на текущую же страницу (href совпадает с hash) — перерисовываем её.
   document.body.addEventListener('click', (e)=>{
     const a = e.target.closest('a[href^="#/"]');
-    if(a){ e.preventDefault(); Router.go(a.getAttribute('href').slice(1)); }
+    if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (a.getAttribute('href') === location.hash) { e.preventDefault(); Router.go(a.getAttribute('href').slice(1)); }
   });
 
   $('#year').textContent = new Date().getFullYear();
   Auth.render();
   Auth.ensure().finally(()=>{
     Router.init();
-    setInterval(()=>{ Auth.me().catch(()=>{}); }, AUTH_REFRESH_INTERVAL_MS);
+    setInterval(()=>{ if (Auth.isLogged()) Auth.me().catch(()=>{}); }, AUTH_REFRESH_INTERVAL_MS);
     document.addEventListener('visibilitychange', ()=>{
-      if (document.visibilityState === 'visible') {
-        Auth.me().catch(()=>{});
-      }
+      if (document.visibilityState === 'visible' && Auth.isLogged()) Auth.me().catch(()=>{});
     });
   });
-  
 });
