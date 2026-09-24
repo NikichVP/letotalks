@@ -1695,7 +1695,8 @@ const App = {
 
           <!-- Шаг 2: код -->
           <div id="stageCode" class="hidden">
-            <p class="muted">Код отправлен на <strong id="sentToEmail"></strong>. Письмо может прийти через минуту — проверьте и «Спам».</p>
+            <p class="muted" id="codeSentNote">Код отправлен на <strong id="sentToEmail"></strong>. Письмо может прийти через минуту — проверьте и «Спам».</p>
+            <p class="muted hidden" id="codeDevNote">Почта не настроена (режим разработки): код для входа выведен в консоль сервера.</p>
             <form id="codeForm" novalidate>
               <div class="field">
                 <label for="loginCode">Код из письма</label>
@@ -1762,7 +1763,9 @@ const App = {
         $('#sentToEmail').textContent = email;
         stageEmail.classList.add('hidden');
         stageCode.classList.remove('hidden');
-        setStatus($('#codeStatus'), r.email_sent ? '' : 'Почта не настроена — код выведен в консоль сервера (режим разработки).');
+        $('#codeSentNote').classList.toggle('hidden', !r.email_sent);
+        $('#codeDevNote').classList.toggle('hidden', !!r.email_sent);
+        setStatus($('#codeStatus'), '');
         startResendCountdown();
         codeInput?.focus();
         return;
