@@ -8,6 +8,7 @@ node_modules/
 
 # Runtime data
 data/
+.demo/
 letotalks.db
 *.db
 *.db-wal

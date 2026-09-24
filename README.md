@@ -1,53 +1,149 @@
 # LetoTalks
 
-A teacher feedback platform built for a school community: students sign in with their school email, rate teachers on four characteristics, leave anonymous reviews, like/dislike reviews and spend earned coins on display nicknames. Moderators work through an admin panel and a Telegram review chat.
+[![CI](https://github.com/NikichVP/letotalks/actions/workflows/ci.yml/badge.svg)](https://github.com/NikichVP/letotalks/actions/workflows/ci.yml)
+
+LetoTalks is a web platform where students of Letovo School rate their teachers and share anonymous reviews. A team of students built it, and it runs in production for the school community. Only school email addresses can sign in.
+
+> [!NOTE]
+> This is an independent student project. It is not affiliated with or endorsed by Letovo School. The repository contains no real teacher or student data. The screenshots and the demo use fictional data. The interface and the code comments are in Russian.
+
+![Home page: top teachers by characteristic and by department](docs/screenshots/home.png)
 
 ## Features
 
-- **Sign-in by email code** (Resend). Only allowed domains (`@student.letovo.ru` by default) can sign in; logged-out visitors see nothing but the login screen.
-- **Teacher catalog**: home carousels (top by characteristic and by department), full list, department pages, search by name in any word order.
-- **Ratings** are saved instantly per characteristic; each student has one rating per teacher and characteristic and can change it.
-- **Reviews** are anonymous to other students (shown as the bought nickname or «Аноним»). Every review passes a local profanity filter (shared with the browser in `public/profanity.js`) and an LLM check; unclear cases go to the Telegram moderation chat. Swearing is rejected; the 3rd attempt within 30 days blocks the account.
-- **Coins and shop**: +5 per review, +1 per rating, ±1 per like/dislike received; coins buy nicknames.
-- **Admin panel**: recent reviews and reviews by author, bans, teacher CRUD with photo upload, admin management (root admin only).
+<img src="docs/screenshots/mobile.png" alt="Teacher page on a phone" width="260" align="right">
 
-## Stack
+- **School-only sign-in.** Students sign in with a one-time code sent to their school email. Visitors who are not signed in see only the login screen.
+- **Teacher catalog.** The home page has carousels of top teachers for each characteristic and each department. There are also department pages and a name search that works in any word order.
+- **Ratings.** Students give each teacher 1–5 stars on four characteristics: explains clearly, sense of humour, strictness, and "has favourites". A rating saves on click and can be changed at any time.
+- **Anonymous reviews.** Other students see only the author's nickname or «Аноним». Reviews can be liked, disliked and reported.
+- **Moderation.** Every review goes through a profanity filter and an LLM check. Unclear cases go to moderators in Telegram ([details below](#review-moderation)).
+- **Coins and a nickname shop.** Students earn coins: +5 for a review, +1 for each rating, and ±1 for each like or dislike their reviews get. Coins buy nicknames in four rarity tiers, and a nickname shows next to the student's reviews in its tier's colour.
+- **Admin panel.** Admins can see recent reviews and reviews by author, ban users, and manage teachers (including photo upload). The root admin manages other admins.
+- **Mobile-friendly** layout.
 
-- Node.js 20+ / Express 5
-- SQLite via `better-sqlite3` (schema and migrations are created in code)
-- Helmet (CSP), rate limiting tuned for a school NAT (limits per user, not per IP)
-- Telegram bot for moderation, OpenAI-compatible LLM moderation, Resend for email
-- Vanilla HTML/CSS/JS single-page frontend (`public/`)
+<br clear="right">
 
-## Main components
+<table>
+  <tr>
+    <th width="50%">Teacher page</th>
+    <th width="50%">Nickname shop</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/teacher.png" alt="Teacher page: ratings by characteristic and anonymous reviews"></td>
+    <td><img src="docs/screenshots/shop.png" alt="Nickname shop with rarity tiers and coin balance"></td>
+  </tr>
+  <tr>
+    <th>Admin panel</th>
+    <th>Sign-in</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/admin.png" alt="Admin panel: recent reviews with authors"></td>
+    <td><img src="docs/screenshots/login.png" alt="Sign-in with a one-time email code"></td>
+  </tr>
+</table>
 
-- `server.js` — HTTP API: auth and sessions, catalog, reviews/ratings/votes, shop, admin, Telegram webhook
-- `db_processing.js` — SQLite schema, migrations and data access
-- `comment_moderation.js` — moderation pipeline (profanity filter + LLM)
-- `public/profanity.js` — profanity filter shared by server and browser
-- `outbound_proxy.js` — optional outbound HTTP(S) proxy for OpenAI/Telegram/Resend
-- `migrate.js` — creates the database schema (`npm run migrate`)
-- `tests/` — node:test suites (`npm test`)
+## Architecture
 
-## Local setup
+```mermaid
+flowchart LR
+    B["Browser<br/>single-page app"] -->|HTTPS| N[nginx]
+    N --> S["Node.js + Express<br/>server.js"]
+    S --> D[("SQLite<br/>WAL mode")]
+    S -->|login codes| R[Resend]
+    S -->|review check| O[OpenAI API]
+    S <-->|moderation chat| T[Telegram bot]
+```
+
+- **Server.** A single Express 5 process serves the API and the static frontend.
+- **Database.** SQLite through `better-sqlite3` in WAL mode. The schema and versioned migrations are created in code.
+- **Frontend.** Plain HTML, CSS and JavaScript with a hash router. There is no build step.
+- **Production.** nginx terminates TLS in front of the app. Calls to OpenAI, Telegram and Resend can go through an HTTP(S) proxy (`OUTBOUND_PROXY_URL`). Production uses this proxy because those services are blocked from the hosting network.
+
+### Review moderation
+
+```mermaid
+flowchart TD
+    A[New review] --> F{Profanity filter}
+    F -->|swearing| X["Rejected + strike<br/>3rd strike in 30 days blocks the account"]
+    F -->|clean| L{"LLM check<br/>gpt-5-nano"}
+    L -->|acceptable| P[Published]
+    L -->|breaks the rules| J[Rejected]
+    L -->|unsure, error or timeout| Q[Moderation queue]
+    Q --> T["Telegram chat<br/>Approve / Reject buttons"]
+    T -->|approve| P
+    T -->|reject| J
+```
+
+The server and the browser share one profanity filter (`public/profanity.js`). Before sending a review, the browser warns about exactly what the server would reject. The LLM receives the review inside tags as data, not as instructions, and must answer with a single digit. Any other answer, an error or a timeout sends the review to manual review. The moderation queue is stored in the database, so it survives restarts.
+
+## Security and privacy
+
+- **Login codes.** Six-digit one-time codes come from a CSPRNG. Each code is valid for 10 minutes and allows 5 attempts, and at most 3 codes per email can be active at once. Per-email and per-IP throttling is designed so that nobody can lock another student out.
+- **Sessions.** The session token is random and lives in an `HttpOnly`, `SameSite=Lax` cookie, which is `Secure` in production. The server stores only its SHA-256 hash. A session lasts 14 days. Each user can have one active session, bound to their browser.
+- **Access.** The API and teacher photos require a signed-in session.
+- **Rate limits.** Limits apply per user, because the whole school reaches the internet through one NAT address. A per-IP ceiling applies on top.
+- **Input and uploads.** All user content is escaped when rendered. Helmet sets a strict Content-Security-Policy. Uploaded photos are checked by file signature and size.
+- **Anonymity.** Review authors are hidden from other students. Only moderators can see them.
+- **Operations.** In production the moderation endpoint must be HTTPS on a public host. Email-provider errors are logged without addresses. Daily database backups keep 7 copies, readable by the owner only.
+- **Secrets.** Secrets live in `.env`, which is never committed.
+
+## Running locally
+
+You need Node.js 20 or newer.
 
 ```bash
+git clone https://github.com/NikichVP/letotalks.git
+cd letotalks
 npm install
-cp .env.example .env
+npm run demo
+```
+
+Open <http://localhost:3001>. Sign in as `demo-admin@student.letovo.ru` to get the admin panel, or as any `student1`…`student14@student.letovo.ru`. The demo sends no email: the one-time code is printed in the terminal.
+
+The demo uses a separate database (`.demo/`) with 12 fictional teachers and reviews, and it connects to no external service. A local stub approves new reviews in place of the LLM check. The profanity filter still runs.
+
+To run with your own configuration:
+
+```bash
+cp .env.example .env   # every option is documented in the file
 npm start
 ```
 
-Open http://localhost:3001. Without `RESEND_API_KEY` the sign-in code is printed to the server console. All settings are documented in `.env.example`.
+A new database starts empty. Set `ROOT_ADMIN_EMAIL` and add teachers in the admin panel. Without `RESEND_API_KEY`, sign-in codes are printed to the console (development mode only).
 
-## Production notes
+Tests and lint run in CI on every push:
 
-- Set `NODE_ENV=production` (Secure cookies; sign-in codes are never logged).
-- Behind nginx set `TRUST_PROXY` (e.g. `loopback`) so rate limits see real client IPs, and consider `HOST=127.0.0.1`.
-- Set `TELEGRAM_WEBHOOK_SECRET` and register it with Telegram (`setWebhook` with `secret_token`), otherwise moderation buttons don't work.
-- The database is backed up daily to `data/backups` (7 rotating copies) — copy them off the machine.
+```bash
+npm test
+npm run lint
+```
 
-Runtime databases, uploaded photos, environment files and installed dependencies are intentionally excluded from version control.
+## Project structure
 
-## Publication note
+```text
+server.js              HTTP API: auth and sessions, catalog, reviews, ratings, shop, admin, Telegram webhook
+db_processing.js       SQLite schema, versioned migrations, data access
+comment_moderation.js  review moderation: profanity filter + LLM check
+shop_items.js          nickname catalog: rarity, price, description
+outbound_proxy.js      optional outbound HTTP(S) proxy for OpenAI, Telegram and Resend
+migrate.js             creates or upgrades the database schema (npm run migrate)
+public/                frontend: index.html, app.js, styles.css, profanity.js
+scripts/               local demo: demo.js, seed-demo.js
+tests/                 node:test suites
+docs/screenshots/      images for this README (fictional demo data)
+```
 
-This repository originated as a live school-community project. Deployment credentials must be rotated before publishing, and any personally identifying production data should be reviewed separately from the source code.
+## Team
+
+| Contributor | Main contributions |
+| --- | --- |
+| [@NikichVP](https://github.com/NikichVP) | Project lead: first prototype, backend and API, caching, email sign-in, LLM moderation, Telegram integration, shop, deployment |
+| [@BeaverProg](https://github.com/BeaverProg) | Request cache, teacher loading and page updates, concurrent session handling |
+| [@cortexgod](https://github.com/cortexgod) | Migration from CSV files to SQLite, teacher directory data, shop pricing |
+| [@leenakwa](https://github.com/leenakwa) | Toxicity checks and reporting, client-side moderation flow, Telegram fixes, environment configuration |
+| [@lizakatul](https://github.com/lizakatul) | Visual design, top bar layout |
+
+## License
+
+No open-source license has been chosen yet. The code is published for reference, and all rights remain with the contributors.

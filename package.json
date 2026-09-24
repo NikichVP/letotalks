@@ -1,10 +1,12 @@
 {
   "name": "letotalks",
   "version": "1.0.0",
+  "private": true,
   "description": "Teacher rating platform for Letovo School",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "demo": "node scripts/demo.js",
     "migrate": "node migrate.js",
     "lint": "eslint .",
     "test": "node --test"
@@ -15,7 +17,7 @@
     "ratings"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "UNLICENSED",
   "dependencies": {
     "better-sqlite3": "^11.10.0",
     "compression": "^1.8.1",
