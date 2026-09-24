@@ -66,22 +66,28 @@ const DEFAULT_GPT_MODERATION_URL = (() => {
 const GPT_MODERATION_URL = process.env.GPT_MODERATION_URL || DEFAULT_GPT_MODERATION_URL;
 const GPT_MODERATION_MODEL = process.env.GPT_MODERATION_MODEL || 'gpt-5-nano';
 
-// Защита от утечки ключа/данных: endpoint модерации должен быть https и
-// не указывать на внутренний/приватный адрес (иначе текст и Bearer-ключ уйдут не туда).
-(() => {
+// Эндпоинт модерации получает текст отзывов и Bearer-ключ. В production
+// разрешаем только https на публичный адрес: ошибка в конфиге не должна
+// отправить их куда-то ещё. Иначе LLM-проверка отключается, и отзывы уходят
+// на ручную модерацию. В разработке (локальный мок) — только предупреждение.
+const GPT_MODERATION_URL_ALLOWED = (() => {
   try {
     const u = new URL(GPT_MODERATION_URL);
-    const host = u.hostname.toLowerCase();
-    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-    const isPrivate = /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
-    if (u.protocol !== 'https:' && !isLocal) {
-      console.warn(`⚠️  GPT_MODERATION_URL не https (${u.protocol}//${host}) — ключ и данные могут передаваться небезопасно.`);
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const isLocal = host === 'localhost' || host === '::1' || /^127\./.test(host) || host === '0.0.0.0';
+    const isPrivate = /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host) || /^(fc|fd|fe80)/.test(host);
+    const problem = u.protocol !== 'https:' ? `не https (${u.protocol}//${host})`
+      : (isLocal || isPrivate) ? `указывает на локальный/приватный адрес (${host})` : '';
+    if (!problem) return true;
+    if (IS_PRODUCTION) {
+      console.error(`❌ GPT_MODERATION_URL ${problem}: в production LLM-модерация отключена, отзывы пойдут на ручную проверку.`);
+      return false;
     }
-    if (isPrivate) {
-      console.warn(`⚠️  GPT_MODERATION_URL указывает на приватный адрес (${host}) — проверьте конфигурацию (возможный SSRF/утечка).`);
-    }
+    console.warn(`⚠️  GPT_MODERATION_URL ${problem} — допустимо только для разработки.`);
+    return true;
   } catch {
-    console.warn(`⚠️  GPT_MODERATION_URL некорректен: ${GPT_MODERATION_URL}`);
+    console.error('❌ GPT_MODERATION_URL некорректен — LLM-модерация отключена.');
+    return false;
   }
 })();
 
@@ -1623,8 +1629,10 @@ async function sendAuthCodeEmail(email, code) {
       signal: controller.signal
     });
     if (!resp.ok) {
-      const errText = await resp.text().catch(() => '');
-      console.error('Resend error', resp.status, errText);
+      // В лог — только код и тип ошибки провайдера, без адресов получателей.
+      let errName = '';
+      try { errName = (await resp.json())?.name || ''; } catch { /* не JSON */ }
+      console.error('Resend error', resp.status, errName);
       return false;
     }
     return true;
@@ -1781,7 +1789,7 @@ app.post('/api/comment-with-ratings', async (req, res) => {
 
     const moderationResult = textStr
       ? await moderateComment(textStr, {
-          gptApiKey: GPT_MODERATION_API_KEY,
+          gptApiKey: GPT_MODERATION_URL_ALLOWED ? GPT_MODERATION_API_KEY : '',
           gptApiUrl: GPT_MODERATION_URL,
           gptModel: GPT_MODERATION_MODEL
         })
